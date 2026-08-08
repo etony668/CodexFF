@@ -588,6 +588,227 @@ fn session_index_quarantine_root() -> std::path::PathBuf {
     vault::vault_dir().join("session-index-quarantine")
 }
 
+fn codex_global_state_path() -> std::path::PathBuf {
+    codex_config::codex_config_dir().join(".codex-global-state.json")
+}
+
+fn global_state_quarantine_root() -> std::path::PathBuf {
+    vault::vault_dir().join("global-state-quarantine")
+}
+
+/// 隔离时清理 Codex 桌面端全局状态里的项目/线程记录 (local-projects、
+/// thread-project-assignments、prompt-history、thread-descriptions 等),
+/// 否则侧边栏项目名/目录名仍会残留; 切回第三方时按备份恢复。
+fn sync_global_state(thread_id: &str, official: bool) -> Result<(), SessionError> {
+    let path = codex_global_state_path();
+    let backup_root = global_state_quarantine_root();
+    let backup = backup_root.join(format!("{thread_id}.json"));
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let mut root: Value = serde_json::from_str(&text)?;
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(());
+    };
+
+    if official {
+        let mut removed = serde_json::Map::new();
+        // 线程维度的嵌套索引 (key -> thread_id -> value)
+        for key in [
+            "thread-project-assignments",
+            "thread-workspace-root-hints",
+            "thread-writable-roots",
+            "prompt-history",
+            "heartbeat-thread-permissions-by-id",
+            "thread-descriptions-v1",
+        ] {
+            if let Some(map) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
+                if let Some(val) = map.remove(thread_id) {
+                    let entry = removed
+                        .entry(key.to_string())
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if let Some(e) = entry.as_object_mut() {
+                        e.insert(thread_id.to_string(), val);
+                    }
+                }
+            }
+        }
+        // unread-thread-ids-by-host-v1: 从各 host 数组移除 (派生数据, 无需备份)
+        if let Some(hosts) = obj
+            .get_mut("unread-thread-ids-by-host-v1")
+            .and_then(|v| v.as_object_mut())
+        {
+            for arr in hosts.values_mut() {
+                if let Some(a) = arr.as_array_mut() {
+                    a.retain(|x| x.as_str() != Some(thread_id));
+                }
+            }
+        }
+        // 顶层以线程 ID 为后缀的键
+        for prefix in [
+            format!("thread-client-id-v1:local%3A{thread_id}"),
+            format!("thread-reference-capability:{thread_id}"),
+            format!("thread-tab-routes-v1:{thread_id}"),
+            format!("thread-browser-tabs-v1:{thread_id}"),
+            format!("codex-writing-block-deleted-thread-v1:{thread_id}"),
+        ] {
+            if let Some(v) = obj.remove(&prefix) {
+                removed.insert(prefix, v);
+            }
+        }
+        // 项目注册表: 找到该线程 cwd 对应的 local-project, 若不再被任何
+        // 线程引用则连项目节点/排序/展开态一起移除 (侧边栏项目名消失的关键)
+        if let Some(cwd) = thread_cwd(thread_id) {
+            let project_id: Option<String> = obj
+                .get("local-projects")
+                .and_then(|v| v.as_object())
+                .and_then(|projects| {
+                    projects.iter().find_map(|(pid, pv)| {
+                        let has_root = pv
+                            .get("rootPaths")
+                            .and_then(|r| r.as_array())
+                            .map(|roots| roots.iter().any(|r| r.as_str() == Some(cwd.as_str())))
+                            .unwrap_or(false);
+                        has_root.then(|| pid.clone())
+                    })
+                });
+            if let Some(pid) = project_id {
+                let still_used = obj
+                    .get("thread-project-assignments")
+                    .and_then(|v| v.as_object())
+                    .map(|m| {
+                        m.values().any(|v| {
+                            v.get("projectId").and_then(|x| x.as_str()) == Some(pid.as_str())
+                        })
+                    })
+                    .unwrap_or(false);
+                if !still_used {
+                    if let Some(projects) = obj.get_mut("local-projects").and_then(|v| v.as_object_mut())
+                    {
+                        if let Some(pv) = projects.remove(&pid) {
+                            let entry = removed
+                                .entry("local-projects".to_string())
+                                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                            if let Some(e) = entry.as_object_mut() {
+                                e.insert(pid.clone(), pv);
+                            }
+                        }
+                    }
+                    if let Some(order) = obj.get_mut("project-order").and_then(|v| v.as_array_mut()) {
+                        order.retain(|x| x.as_str() != Some(pid.as_str()));
+                        removed
+                            .entry("project-order".to_string())
+                            .or_insert_with(|| Value::Array(Vec::new()))
+                            .as_array_mut()
+                            .map(|a| a.push(Value::String(pid.clone())));
+                    }
+                    let expanded_keys: Vec<String> = obj
+                        .keys()
+                        .filter(|k| {
+                            k.starts_with("sidebar-project-expanded-v1-codex:") && k.contains(&pid)
+                        })
+                        .cloned()
+                        .collect();
+                    for k in expanded_keys {
+                        if let Some(v) = obj.remove(&k) {
+                            removed.insert(k, v);
+                        }
+                    }
+                    if let Some(sel) = obj
+                        .get("selected-project")
+                        .and_then(|v| v.get("projectId"))
+                        .and_then(|x| x.as_str())
+                    {
+                        if sel == pid {
+                            if let Some(v) = obj.remove("selected-project") {
+                                removed.insert("selected-project".to_string(), v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !removed.is_empty() {
+            std::fs::create_dir_all(&backup_root)?;
+            std::fs::write(
+                &backup,
+                serde_json::to_vec_pretty(&Value::Object(removed))?,
+            )?;
+            vault::atomic_write_bytes(
+                &path,
+                serde_json::to_vec_pretty(&root)?.as_slice(),
+            )
+            .map_err(|e| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("写入 .codex-global-state.json 失败: {e}"),
+                ))
+            })?;
+            isolation_log(&format!("global-state cleaned thread={thread_id}"));
+        }
+    } else if backup.exists() {
+        let removed: Value = serde_json::from_str(&std::fs::read_to_string(&backup)?)?;
+        if let Some(removed_obj) = removed.as_object() {
+            for (k, v) in removed_obj {
+                match k.as_str() {
+                    "local-projects" => {
+                        let dst = obj
+                            .entry(k.clone())
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let (Some(d), Some(s)) = (dst.as_object_mut(), v.as_object()) {
+                            for (pid, pv) in s {
+                                d.insert(pid.clone(), pv.clone());
+                            }
+                        }
+                    }
+                    "project-order" => {
+                        let dst = obj
+                            .entry(k.clone())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        if let (Some(d), Some(s)) = (dst.as_array_mut(), v.as_array()) {
+                            for x in s {
+                                if !d.contains(x) {
+                                    d.push(x.clone());
+                                }
+                            }
+                        }
+                    }
+                    "selected-project" => {
+                        if !obj.contains_key(k) {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                    _ => {
+                        if let Some(existing) = obj.get_mut(k).and_then(|x| x.as_object_mut()) {
+                            if let Some(s) = v.as_object() {
+                                for (kk, vv) in s {
+                                    existing.insert(kk.clone(), vv.clone());
+                                }
+                            }
+                        } else {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            vault::atomic_write_bytes(
+                &path,
+                serde_json::to_vec_pretty(&root)?.as_slice(),
+            )
+            .map_err(|e| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("写入 .codex-global-state.json 失败: {e}"),
+                ))
+            })?;
+        }
+        std::fs::remove_file(&backup)?;
+        isolation_log(&format!("global-state restored thread={thread_id}"));
+    }
+    Ok(())
+}
+
 /// 隔离时把线程从 session_index.jsonl (桌面端最近会话/索引) 移走,
 /// 恢复时按原行加回, 避免官方订阅下仍能通过索引看到该会话。
 fn sync_session_index(thread_id: &str, official: bool) -> Result<(), SessionError> {
@@ -692,6 +913,7 @@ fn sync_local_aux(thread_id: &str, official: bool) -> Result<(), SessionError> {
     if official {
         purge_aux_db_rows(thread_id);
     }
+    sync_global_state(thread_id, official)?;
     sync_session_index(thread_id, official)?;
     if let Some(cwd) = thread_cwd(thread_id) {
         sync_ambient_suggestions(&cwd, official)?;

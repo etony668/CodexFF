@@ -222,6 +222,8 @@ pub fn write_official_config(
     // 切官方: 移除我们写过的模型目录字段 (DeepSeek catalog 只在 relay 态生效;
     // 只清 sentinel 值, 用户手写的 model_catalog_json 保留)
     set_codex_model_catalog_field(&mut doc, false);
+    // 模型下拉目录换成官方模型 (供高效工作流使用)
+    write_official_model_catalog()?;
 
     write_config_text(&doc.to_string())
 }
@@ -472,6 +474,25 @@ fn write_deepseek_model_catalog() -> Result<(), CodexConfigError> {
     vault::atomic_write_bytes(&path, content.as_bytes()).map_err(CodexConfigError::Vault)
 }
 
+/// 官方订阅模型目录 (供高效工作流模型下拉使用; 不注入 config 的
+/// model_catalog_json 字段, 官方 Codex 用内置模型列表, 我们只维护自己的下拉)
+fn write_official_model_catalog() -> Result<(), CodexConfigError> {
+    let path = codex_config_dir().join(CODEXFF_MODEL_CATALOG_FILENAME);
+    let content = r#"{"models":[{"slug":"gpt-5.6-luna"},{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.6-terra"},{"slug":"gpt-5.2-codex"},{"slug":"gpt-5.2-codex-mini"},{"slug":"gpt-5.1-codex"},{"slug":"gpt-5-codex"}]}"#;
+    vault::atomic_write_bytes(&path, content.as_bytes()).map_err(CodexConfigError::Vault)
+}
+
+/// 移除我们维护的模型目录文件 (切到非 DeepSeek 中转时, 避免模型下拉
+/// 残留上一个供应商的模型)
+fn remove_our_model_catalog() -> Result<(), CodexConfigError> {
+    let path = codex_config_dir().join(CODEXFF_MODEL_CATALOG_FILENAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(CodexConfigError::Io(e)),
+    }
+}
+
 /// 中转形态 custom 表 (含归属标记, 切换回官方时按标记清理)。
 /// 上下文窗口字段写在表内 (codex 读 provider 级属性, 与 cc-switch
 /// 手写类预设同位置); None = 不写, codex 用默认 128k。
@@ -584,6 +605,9 @@ pub fn write_relay_config(
     // DeepSeek 官方网关: 落盘模型目录文件 (字段已由 apply_relay_fields 注入)
     if is_deepseek_official_gateway(base_url, wire_api) {
         write_deepseek_model_catalog()?;
+    } else {
+        // 其它中转: 移除我们的目录文件, 避免下拉残留上一个供应商的模型
+        remove_our_model_catalog()?;
     }
     write_config_text(&doc.to_string())
 }

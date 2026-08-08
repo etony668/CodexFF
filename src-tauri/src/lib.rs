@@ -138,6 +138,7 @@ async fn activate_official(
     app: tauri::AppHandle,
     force: Option<bool>,
 ) -> Result<ActiveSelection, ApiError> {
+    use tauri::Emitter;
     // 封号主因 = 官方账号活跃 IP 变化。基线存在且不一致 → 拦截,
     // 提示用户先固定出口; 确认无误后 force 重试。
     if !force.unwrap_or(false) {
@@ -168,6 +169,7 @@ async fn activate_official(
     drop(handle);
     // 本地路由开启时, 官方模式无需改写 base_url (还原真实配置)
     local_router::sync_active();
+    let _ = app.emit("provider-changed", ());
     Ok(result)
 }
 
@@ -188,12 +190,14 @@ async fn activate_relay(
     app: tauri::AppHandle,
     profile_id: String,
 ) -> Result<ActiveSelection, ApiError> {
+    use tauri::Emitter;
     let result = profiles::activate_relay_with_progress(&profile_id, &|step| {
         use tauri::Emitter;
         let _ = app.emit("switch-progress", step);
     })?;
     // 本地路由开启时, 把激活供应商 base_url 改写为本地代理
     local_router::sync_active();
+    let _ = app.emit("provider-changed", ());
     Ok(result)
 }
 

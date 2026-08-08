@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   WorkflowAgentInfo,
   WorkflowAgentsResult,
@@ -90,6 +91,19 @@ export function WorkflowPage({ onToast }: Props) {
     listWorkflowModels()
       .then((m) => setModelOptions(m.filter(Boolean)))
       .catch(() => {});
+  }, []);
+
+  // 切换供应商后重新读取当前供应商的模型 (下拉不再残留上一个供应商)
+  useEffect(() => {
+    const unlisten = listen("provider-changed", () => {
+      void refresh();
+      listWorkflowModels()
+        .then((m) => setModelOptions(m.filter(Boolean)))
+        .catch(() => {});
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
   }, []);
 
   async function install(kind: string) {

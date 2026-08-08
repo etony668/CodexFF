@@ -291,6 +291,17 @@ export function ProfilesPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status?.active?.kind]);
 
+  // 官方额度自动刷新: 每 10 分钟一次 (wham/usage 是官方客户端同款轻量接口,
+  // 10 分钟间隔风险很低; 仅在官方模式且应用打开时轮询, 切走后自动停止)
+  useEffect(() => {
+    if (status?.active?.kind !== "official") return;
+    const timer = setInterval(() => {
+      void queryOfficialQuota();
+    }, 10 * 60 * 1000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status?.active?.kind]);
+
   // 自动查余额: 已保存 key 的 profile 加载即查询, 能取到直接显示; 按钮用于手动刷新
   useEffect(() => {
     (status?.relays ?? []).forEach((p) => {
