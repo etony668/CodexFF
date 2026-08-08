@@ -32,21 +32,21 @@ osascript -e 'quit app "CodexFF"' 2>/dev/null || true
 sleep 1
 
 echo "正在安装到 /Applications …"
-rm -rf /Applications/CodexFF.app
-ditto "$APP" /Applications/CodexFF.app
+rm -rf "/Applications/CodexFF.app"
+ditto "$APP" "/Applications/CodexFF.app"
 
 echo "正在清除隔离属性 (Gatekeeper)…"
-xattr -dr com.apple.quarantine /Applications/CodexFF.app 2>/dev/null || true
+xattr -dr com.apple.quarantine "/Applications/CodexFF.app" 2>/dev/null || true
 
 echo "正在校验签名…"
-if codesign --verify --strict /Applications/CodexFF.app; then
+if codesign --verify --strict "/Applications/CodexFF.app"; then
   echo "✅ 签名校验通过"
 else
   echo "⚠️ 签名校验未通过 (不影响本次运行, 但请重新下载安装包)"
 fi
 
 echo "正在启动 CodexFF…"
-open /Applications/CodexFF.app
+open "/Applications/CodexFF.app"
 echo ""
 echo "✅ 安装完成: /Applications/CodexFF.app"
 echo ""
