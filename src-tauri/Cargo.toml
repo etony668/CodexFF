@@ -1,0 +1,49 @@
+[package]
+name = "codexff"
+version = "1.0.151"
+description = "Codex profile switcher with credential vault, local proxy and session manager"
+authors = ["codexff"]
+edition = "2021"
+
+[lib]
+name = "codexff_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml_edit = "0.22"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["stream", "json", "socks"] }
+dirs = "6"
+chrono = "0.4"
+url = "2"
+keyring = { version = "3", features = ["apple-native"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+core-foundation-sys = "0.8"
+tauri-plugin-deep-link = "2.4.9"
+rquickjs = "0.12.2"
+libc = "0.2"
+
+[dev-dependencies]
+base64 = "0.22"
+tempfile = "3"
+
+# 发布加固: 剥离符号 + 全量 LTO, 提高逆向难度并减小体积
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1

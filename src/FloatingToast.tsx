@@ -1,0 +1,74 @@
+import { useEffect, useRef } from "react";
+
+export type FloatingToastKind = "info" | "warn" | "confirm";
+
+export interface FloatingToastProps {
+  title?: string;
+  message: string;
+  kind?: FloatingToastKind;
+  /** 非确认提示自动消失时间, 默认 5s */
+  durationMs?: number;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  onConfirm?: () => void;
+  onClose: () => void;
+}
+
+export function FloatingToast({
+  title,
+  message,
+  kind = "info",
+  durationMs = 5000,
+  confirmLabel = "确认",
+  cancelLabel = "取消",
+  onConfirm,
+  onClose,
+}: FloatingToastProps) {
+  const isConfirm = kind === "confirm";
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  // 需要用户确认时取消倒计时, 由用户点击确认/取消关闭;
+  // 普通提示按 durationMs 自动消失。
+  useEffect(() => {
+    if (isConfirm) return;
+    const timer = window.setTimeout(() => onCloseRef.current(), durationMs);
+    return () => window.clearTimeout(timer);
+  }, [isConfirm, durationMs]);
+
+  return (
+    <div
+      className={`floating-toast ${kind}`}
+      role={isConfirm ? "alertdialog" : "alert"}
+    >
+      {title && <span className="floating-toast-title">{title}</span>}
+      <span className="floating-toast-message">{message}</span>
+      {isConfirm ? (
+        <div className="floating-toast-actions">
+          <button className="primary" onClick={onConfirm}>
+            {confirmLabel}
+          </button>
+          <button onClick={onClose}>{cancelLabel}</button>
+        </div>
+      ) : (
+        <div
+          className="floating-toast-progress"
+          style={{ animationDuration: `${durationMs}ms` }}
+          aria-hidden="true"
+        />
+      )}
+    </div>
+  );
+}
+
+/** 子页面请求 App 统一弹出悬浮提示的载荷 */
+export interface ToastRequest {
+  title: string;
+  message: string;
+  kind?: FloatingToastKind;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  onConfirm?: () => void;
+}
