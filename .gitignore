@@ -1,0 +1,44 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+src-tauri/target
+*.local
+src-tauri/license-key/
+
+# 用户本地素材与敏感配置
+images/
+.claude/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.dmg
+*.ipa
+
+# 付费/内部基础设施不入库
+cloudflare/
+cloudflare-download/
+license-tool/
+license-tool-mac/
+pay/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
