@@ -4,11 +4,13 @@ import {
   SessionMeta,
   UnifySessionMeta,
   errMsg,
+  getCurrentModelInfo,
   hasUnifyBackup,
   isCodexRunning,
   listUnifiableSessions,
   listSessions,
   migrateSessionsToShared,
+  remapSingleThread,
   restoreUnifiedSessions,
   sessionDetail,
   setSessionIsolated,
@@ -32,6 +34,9 @@ export function SessionsPage({ onToast }: Props) {
   // 隔离进度 (Codex 必须完全退出; 过程显示进度)
   const [isolatingId, setIsolatingId] = useState<string | null>(null);
   const [isolateStep, setIsolateStep] = useState("");
+  // 当前供应商默认模型 + 可用模型列表（“用当前模型续聊”判断用）
+  const [currentModel, setCurrentModel] = useState<string | null>(null);
+  const [currentModels, setCurrentModels] = useState<string[]>([]);
   // 统一会话历史迁移 (旧官方 "openai" 桶 → 共享 "custom" 桶, 迁移前自动备份)
   const [unifyList, setUnifyList] = useState<UnifySessionMeta[] | null>(null);
   const [unifyBackup, setUnifyBackup] = useState(false);
@@ -47,6 +52,12 @@ export function SessionsPage({ onToast }: Props) {
     try {
       setSessions(await listSessions());
       setErr(null);
+      getCurrentModelInfo()
+        .then((info) => {
+          setCurrentModel(info.model);
+          setCurrentModels(info.supported_models);
+        })
+        .catch(() => {});
     } catch (e) {
       setErr(errMsg(e));
     } finally {
@@ -150,6 +161,51 @@ export function SessionsPage({ onToast }: Props) {
       setIsolatingId(null);
       setIsolateStep("");
       await load();
+    }
+  }
+
+  // 单个会话“用当前模型续聊”：改成当前供应商默认模型，原模型备份可恢复
+  function requestRemapModel(s: SessionMeta) {
+    if (!currentModel || s.model === currentModel) return;
+    onToast?.({
+      kind: "confirm",
+      title: "用当前模型续聊？",
+      message: `该会话当前绑定 ${s.model}，当前供应商不支持。改为 ${currentModel} 后可直接继续；原模型会自动备份，切回支持它的供应商时恢复。`,
+      confirmLabel: "改为当前模型",
+      cancelLabel: "取消",
+      onConfirm: () => {
+        void doRemapModel(s);
+      },
+    });
+  }
+
+  async function doRemapModel(s: SessionMeta) {
+    try {
+      if (await isCodexRunning()) {
+        onToast?.({
+          title: "无法迁移",
+          message: "Codex / ChatGPT 桌面端正在运行。请先完全退出后再迁移会话模型。",
+        });
+        return;
+      }
+    } catch {
+      // 预检失败不阻塞，后端还有强制检测
+    }
+    try {
+      const out = await remapSingleThread(s.thread_id);
+      await load();
+      onToast?.({
+        kind: "info",
+        title: "已迁移",
+        message: `${out.remapped + out.restored} 个会话已改用当前模型，可以直接继续。`,
+      });
+    } catch (e) {
+      const msg = errMsg(e);
+      if (msg.includes("Codex")) {
+        onToast?.({ title: "无法迁移", message: msg });
+      } else {
+        setErr(msg);
+      }
     }
   }
 
@@ -378,6 +434,21 @@ export function SessionsPage({ onToast }: Props) {
               </span>
             </div>
             <div className="row-card-actions">
+              {currentModel &&
+                s.model &&
+                s.model !== currentModel &&
+                !currentModels.includes(s.model) && (
+                  <button
+                    className="link-btn"
+                    title="把该会话的模型改为当前供应商默认模型，原模型会自动备份"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      requestRemapModel(s);
+                    }}
+                  >
+                    用当前模型续聊
+                  </button>
+                )}
               <label
                 className={`isolate-check${s.isolated ? " checked" : ""}`}
                 onClick={(e) => {

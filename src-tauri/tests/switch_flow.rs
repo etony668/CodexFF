@@ -86,6 +86,7 @@ fn relay_input(name: &str, base_url: &str, model: &str, key: &str) -> profiles::
         usage_access_token: None,
         usage_user_id: None,
         usage_timeout_secs: None,
+        supported_models: None,
     }
 }
 
@@ -118,6 +119,7 @@ fn relay_activation_seals_official_credentials() {
         usage_access_token: None,
         usage_user_id: None,
         usage_timeout_secs: None,
+        supported_models: None,
     })
     .expect("add relay");
 
@@ -324,6 +326,7 @@ fn relay_to_relay_keeps_official_snapshot() {
         usage_access_token: None,
         usage_user_id: None,
         usage_timeout_secs: None,
+        supported_models: None,
     })
     .unwrap();
     let b = profiles::add_relay_profile(profiles::RelayProfileInput {
@@ -348,6 +351,7 @@ fn relay_to_relay_keeps_official_snapshot() {
         usage_access_token: None,
         usage_user_id: None,
         usage_timeout_secs: None,
+        supported_models: None,
     })
     .unwrap();
 
@@ -427,6 +431,7 @@ fn update_active_relay_key_refreshes_auth() {
             usage_access_token: None,
             usage_user_id: None,
             usage_timeout_secs: None,
+            supported_models: None,
         },
     )
     .unwrap();

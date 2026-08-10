@@ -269,6 +269,10 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
         config_toml: form.configToml || null,
         anthropic_auth_field: form.anthropicAuthField || null,
         use_common_config: form.useCommonConfig,
+        supported_models:
+          testResult && testResult.ok && testResult.models.length > 0
+            ? testResult.models
+            : null,
       };
       await onSave(input);
       onSaved();
@@ -528,7 +532,13 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
                 {testResult && (
                   <span className={testResult.ok ? "ok" : "error"}>
                     {testResult.ok
-                      ? `✓ 连接成功, ${testResult.model_count ?? 0} 个模型${testResult.models.length ? `: ${testResult.models.join(", ")}` : ""}`
+                      ? `✓ 连接成功, ${testResult.model_count ?? 0} 个模型${
+                          testResult.models.length
+                            ? `: ${testResult.models.slice(0, 10).join(", ")}${
+                                testResult.models.length > 10 ? " …" : ""
+                              }`
+                            : ""
+                        }`
                       : `✗ ${testResult.error}`}
                   </span>
                 )}

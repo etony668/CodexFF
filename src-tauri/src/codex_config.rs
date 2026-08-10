@@ -251,6 +251,10 @@ pub fn write_official_config(
 /// 以底稿为底, 只强制 model_provider="custom" (统一会话桶必需) +
 /// 维护 [model_providers.custom] 中转形态表; 其余字段 (任意用户配置)
 /// 用户全控 — reasoning effort 等高级配置由用户在 TOML 编辑器里自行管理。
+/// 通用段 (notify/marketplaces/plugins/features/mcp_servers/desktop/
+/// shell_environment_policy) 例外: 始终以磁盘实时状态为准, 防止底稿里的
+/// 旧快照把 Codex 桌面端运行时写入的设置回退 (如 [desktop] 的
+/// selected-avatar-id 宠物选择、插件与市场更新)。
 ///
 /// 顶层字段规则 (表单字段是 config.toml 顶层的视图, 同 cc-switch 单文档语义):
 /// - model: 表单非空 → 覆盖 (含底稿); 空 → 程序化路径清残留, 底稿不动
@@ -271,10 +275,11 @@ pub fn build_relay_config(
 ) -> Result<DocumentMut, CodexConfigError> {
     let mut doc = match custom_config {
         Some(text) if !text.trim().is_empty() => {
-            // 底稿 = provider 视图: 通用段缺失时从磁盘补 (白名单)。
-            // 用户手写完整底稿时通用段以底稿为准; 旧底稿 (机制前的快照)
-            // 只有 provider 段 — 激活时补回, 否则 notify/mcp_servers/plugins
-            // 等通用段会随整份替换丢失, 后续添加面板 merge 也读不到。
+            // 底稿 = provider 视图: 通用段始终以磁盘实时状态为准 (白名单)。
+            // 底稿里的通用段只是添加供应商时的旧快照, Codex 桌面端会在
+            // 运行中写入 [desktop] 的 selected-avatar-id (宠物选择) 并更新
+            // 插件/市场/MCP, 以旧快照为准会把运行时设置回退 (宠物变默认)。
+            // 磁盘缺失时才保留底稿里的通用段 (全新目录/用户手写补充)。
             let mut merged = parse_or_default(text)?;
             let disk = parse_or_default(&read_config_text()?)?;
             const COMMON: &[&str] = &[
@@ -287,10 +292,8 @@ pub fn build_relay_config(
                 "shell_environment_policy",
             ];
             for key in COMMON {
-                if !merged.contains_key(key) {
-                    if let Some(item) = disk.get(key) {
-                        merged[key] = item.clone();
-                    }
+                if let Some(item) = disk.get(key) {
+                    merged[key] = item.clone();
                 }
             }
             // model_providers: 保留磁盘上的非 custom 表 (用户自定义 provider)
@@ -493,6 +496,75 @@ fn remove_our_model_catalog() -> Result<(), CodexConfigError> {
     }
 }
 
+/// 为任意中转写模型目录（桌面端模型选择器只显示该中转真实支持的模型）。
+/// 以 DeepSeek 官方目录的模型条目为模板，覆盖 slug / 名称 / 上下文窗口 /
+/// 思考档位，避免桌面端因为缺字段而解析失败。
+pub fn write_relay_model_catalog(
+    models: &[String],
+    context_window: Option<u64>,
+) -> Result<(), CodexConfigError> {
+    let template_text = include_str!("resources/codex_deepseek_catalog_template.json");
+    let mut root: Value = serde_json::from_str(template_text)?;
+    let Some(template) = root
+        .get_mut("models")
+        .and_then(|m| m.as_array_mut())
+        .and_then(|arr| arr.first().cloned())
+    else {
+        return Err(CodexConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "模型目录模板为空",
+        )));
+    };
+    let ctx = context_window.unwrap_or(128_000);
+    let mut entries = Vec::new();
+    for (idx, slug) in models.iter().enumerate() {
+        if slug.trim().is_empty() {
+            continue;
+        }
+        let mut m = template.clone();
+        let obj = m.as_object_mut().ok_or_else(|| {
+            CodexConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "模型模板不是对象",
+            ))
+        })?;
+        obj.insert("slug".to_string(), Value::String(slug.trim().to_string()));
+        obj.insert(
+            "display_name".to_string(),
+            Value::String(slug.trim().to_string()),
+        );
+        obj.insert(
+            "description".to_string(),
+            Value::String(format!("{slug}（第三方网关）")),
+        );
+        obj.insert("context_window".to_string(), Value::from(ctx));
+        obj.insert("max_context_window".to_string(), Value::from(ctx));
+        obj.insert(
+            "auto_compact_token_limit".to_string(),
+            Value::from(ctx.saturating_mul(90) / 100),
+        );
+        obj.insert(
+            "supported_reasoning_levels".to_string(),
+            serde_json::json!([
+                {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                {"effort": "medium", "description": "Balanced reasoning depth"},
+                {"effort": "high", "description": "Extra high reasoning depth for complex problems"}
+            ]),
+        );
+        obj.insert(
+            "default_reasoning_level".to_string(),
+            Value::String("high".into()),
+        );
+        obj.insert("priority".to_string(), Value::from(idx + 1));
+        obj.insert("visibility".to_string(), Value::String("list".into()));
+        entries.push(m);
+    }
+    root["models"] = Value::Array(entries);
+    let content = serde_json::to_string_pretty(&root)?;
+    let path = codex_config_dir().join(CODEXFF_MODEL_CATALOG_FILENAME);
+    vault::atomic_write_bytes(&path, content.as_bytes()).map_err(CodexConfigError::Vault)
+}
+
 /// 中转形态 custom 表 (含归属标记, 切换回官方时按标记清理)。
 /// 上下文窗口字段写在表内 (codex 读 provider 级属性, 与 cc-switch
 /// 手写类预设同位置); None = 不写, codex 用默认 128k。
@@ -590,8 +662,9 @@ pub fn write_relay_config(
     model_context_window: Option<u64>,
     model_auto_compact_token_limit: Option<u64>,
     custom_config: Option<&str>,
+    supported_models: Option<&[String]>,
 ) -> Result<(), CodexConfigError> {
-    let doc = build_relay_config(
+    let mut doc = build_relay_config(
         display_name,
         base_url,
         model,
@@ -602,12 +675,19 @@ pub fn write_relay_config(
         model_auto_compact_token_limit,
         custom_config,
     )?;
+    let has_supported = supported_models.map(|m| !m.is_empty()).unwrap_or(false);
     // DeepSeek 官方网关: 落盘模型目录文件 (字段已由 apply_relay_fields 注入)
     if is_deepseek_official_gateway(base_url, wire_api) {
         write_deepseek_model_catalog()?;
+        set_codex_model_catalog_field(&mut doc, true);
+    } else if has_supported {
+        // 任意中转: 只显示它真实支持的模型, 避免选了不支持的模型提交才报错
+        write_relay_model_catalog(supported_models.unwrap_or_default(), model_context_window)?;
+        set_codex_model_catalog_field(&mut doc, true);
     } else {
-        // 其它中转: 移除我们的目录文件, 避免下拉残留上一个供应商的模型
+        // 未知模型清单: 移除我们的目录文件, 避免下拉残留上一个供应商的模型
         remove_our_model_catalog()?;
+        set_codex_model_catalog_field(&mut doc, false);
     }
     write_config_text(&doc.to_string())
 }
@@ -685,4 +765,85 @@ pub enum CurrentProfile {
     Official,
     /// 中转 (共享 custom 桶中转形态; 具体 profile 由 profiles.json 解析)
     Relay,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_switch_preserves_live_common_sections() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("codexff-config-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        // 磁盘实时状态: 用户选了自定义宠物 + 安装了新插件
+        let disk = r#"
+model_provider = "custom"
+model = "deepseek-v4-flash"
+
+[model_providers.custom]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+requires_openai_auth = true
+codexff_relay = true
+
+[desktop]
+conversationDetailMode = "STEPS_COMMANDS"
+selected-avatar-id = "custom:susuta--xiangzi529"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+
+[plugins."visualize@openai-bundled"]
+enabled = true
+"#;
+        std::fs::write(home.join("config.toml"), disk).expect("write disk config");
+
+        // 底稿是添加供应商时的旧快照: desktop 没有宠物字段, 插件也不全
+        let stale_draft = r#"
+model_provider = "custom"
+model = "deepseek-v4-flash"
+
+[model_providers.custom]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+
+[desktop]
+conversationDetailMode = "STEPS_COMMANDS"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#;
+
+        let doc = build_relay_config(
+            "DeepSeek",
+            "https://api.deepseek.com",
+            "deepseek-v4-flash",
+            Some("responses"),
+            Some("high"),
+            true,
+            None,
+            None,
+            Some(stale_draft),
+        )
+        .expect("build relay config");
+
+        let text = doc.to_string();
+        assert!(
+            text.contains("selected-avatar-id = \"custom:susuta--xiangzi529\""),
+            "宠物选择应来自磁盘实时状态: {text}"
+        );
+        assert!(
+            text.contains("[plugins.\"visualize@openai-bundled\"]"),
+            "新插件应来自磁盘实时状态: {text}"
+        );
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

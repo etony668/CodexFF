@@ -11,6 +11,7 @@ pub mod official_quota;
 pub mod pet_manager;
 pub mod profiles;
 pub mod session_manager;
+pub mod session_model;
 pub mod session_usage;
 pub mod session_unify;
 #[cfg(test)]
@@ -37,8 +38,22 @@ impl From<ProfilesError> for ApiError {
         }
     }
 }
+impl From<codex_config::CodexConfigError> for ApiError {
+    fn from(e: codex_config::CodexConfigError) -> Self {
+        ApiError {
+            message: e.to_string(),
+        }
+    }
+}
 impl From<session_manager::SessionError> for ApiError {
     fn from(e: session_manager::SessionError) -> Self {
+        ApiError {
+            message: e.to_string(),
+        }
+    }
+}
+impl From<session_model::ModelRemapError> for ApiError {
+    fn from(e: session_model::ModelRemapError) -> Self {
         ApiError {
             message: e.to_string(),
         }
@@ -232,13 +247,10 @@ fn set_session_isolated(
             message: "请先完全退出 Codex / ChatGPT 桌面端与命令行后再隔离会话".into(),
         });
     }
-    let result = session_manager::set_session_isolated_with_progress(
-        &thread_id,
-        isolated,
-        &|step| {
+    let result =
+        session_manager::set_session_isolated_with_progress(&thread_id, isolated, &|step| {
             let _ = app.emit("session-isolate-progress", step);
-        },
-    );
+        });
     let _ = app.emit("session-isolate-progress", "完成");
     result.map_err(ApiError::from)
 }
@@ -299,7 +311,9 @@ fn import_pet_zip(
 
 /// 导入宠物文件夹 (webkitdirectory 逐个文件 base64 上传)
 #[tauri::command]
-fn import_pet_folder(files: Vec<pet_manager::PetFileInput>) -> Result<pet_manager::PetMeta, ApiError> {
+fn import_pet_folder(
+    files: Vec<pet_manager::PetFileInput>,
+) -> Result<pet_manager::PetMeta, ApiError> {
     Ok(pet_manager::import_folder(files)?)
 }
 
@@ -360,7 +374,11 @@ fn update_workflow_preset(
     model: String,
     reasoning_effort: String,
 ) -> Result<workflow::WorkflowAgentInfo, ApiError> {
-    Ok(workflow::update_workflow_preset(&kind, &model, &reasoning_effort)?)
+    Ok(workflow::update_workflow_preset(
+        &kind,
+        &model,
+        &reasoning_effort,
+    )?)
 }
 
 #[tauri::command]
@@ -433,39 +451,25 @@ struct RelayTestResult {
     status_code: Option<u16>,
 }
 
-#[tauri::command]
-async fn test_relay(
-    base_url: String,
-    key: String,
-    wire_api: Option<String>,
-) -> Result<RelayTestResult, ApiError> {
+/// 拉取中转的 /models 列表（OpenAI 兼容格式）。
+/// 与 test_relay 同源对齐：base_url 无 /v1 后缀时自动补 /v1。
+async fn fetch_relay_models(base_url: &str, key: &str) -> Result<Vec<String>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()
-        .map_err(|e| ApiError {
-            message: e.to_string(),
-        })?;
+        .map_err(|e| e.to_string())?;
     // 只允许 http(s), 防 key 被发给任意本地服务/非 HTTP 端点
-    let parsed = url::Url::parse(base_url.trim_end_matches('/')).map_err(|e| ApiError {
-        message: format!("无效 Base URL: {e}"),
-    })?;
+    let parsed = url::Url::parse(base_url.trim_end_matches('/'))
+        .map_err(|e| format!("无效 Base URL: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(ApiError {
-            message: "Base URL 必须是 http(s) 地址".to_string(),
-        });
+        return Err("Base URL 必须是 http(s) 地址".to_string());
     }
     let endpoint_base = parsed.to_string();
-    let _ = wire_api;
-
-    // codex 语义: base_url 无 /v1 后缀时客户端自动补 /v1 (cc-switch 无 v1 配置
-    // 能工作即因此)。测试同源对齐 — 否则 {base}/models 可能被站点前端路由
-    // 吞掉返回 SPA 首页 (200 HTML), 误报"响应不是 JSON"。
-    // 两个候选都试, 取第一个 2xx + JSON; 全失败报最后错误 (带 URL 便于定位)。
     let candidates = balance::candidate_bases(&endpoint_base);
     let mut last_err: Option<String> = None;
     for base in &candidates {
         let endpoint = format!("{base}/models");
-        let resp = match client.get(&endpoint).bearer_auth(&key).send().await {
+        let resp = match client.get(&endpoint).bearer_auth(key).send().await {
             Ok(r) => r,
             Err(e) => {
                 last_err = Some(format!("GET {endpoint} 网络错误: {e}"));
@@ -489,7 +493,6 @@ async fn test_relay(
                 continue;
             }
         };
-
         // OpenAI 兼容: {"data": [{"id": "model-1"}, ...]}
         let models: Vec<String> = body
             .get("data")
@@ -501,17 +504,183 @@ async fn test_relay(
                     .collect()
             })
             .unwrap_or_default();
+        return Ok(models);
+    }
+    Err(last_err.unwrap_or_else(|| "获取模型列表失败".to_string()))
+}
 
-        return Ok(RelayTestResult {
+#[tauri::command]
+async fn test_relay(
+    base_url: String,
+    key: String,
+    wire_api: Option<String>,
+) -> Result<RelayTestResult, ApiError> {
+    let _ = wire_api;
+    match fetch_relay_models(&base_url, &key).await {
+        Ok(models) => Ok(RelayTestResult {
             ok: true,
             model_count: Some(models.len()),
-            models: models.into_iter().take(10).collect(),
+            models,
             error: None,
-            status_code: Some(status.as_u16()),
-        });
+            status_code: None,
+        }),
+        Err(message) => Err(ApiError { message }),
     }
-    Err(ApiError {
-        message: last_err.unwrap_or_else(|| "测试失败".to_string()),
+}
+
+/// 当前配置的默认模型 + 思考档位 + 可用模型清单（会话页“用当前模型续聊”用）
+#[derive(Serialize)]
+struct CurrentModelInfo {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    supported_models: Vec<String>,
+}
+
+/// 计算切换目标（官方或中转）的默认模型/档位与可用模型清单。
+/// 中转没有保存模型清单时在线拉取并回填。
+async fn current_remap_target() -> Result<(String, Option<String>, Vec<String>), ApiError> {
+    let active = profiles::current_active()?;
+    let (model, effort, _) = codex_config::top_level_fields()?;
+    match active {
+        ActiveSelection::Official => {
+            let supported = if session_model::list_catalog_slugs().is_empty() {
+                session_model::OFFICIAL_MODELS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                session_model::list_catalog_slugs()
+            };
+            Ok((
+                model.unwrap_or_else(|| "gpt-5.6-sol".to_string()),
+                effort,
+                supported,
+            ))
+        }
+        ActiveSelection::Relay { profile_id } => {
+            let relays = profiles::list_relay_profiles()?;
+            let profile = relays
+                .iter()
+                .find(|p| p.id == profile_id)
+                .cloned()
+                .ok_or_else(|| ApiError {
+                    message: format!("供应商不存在: {profile_id}"),
+                })?;
+            let mut supported = profile.supported_models.clone();
+            if supported.is_empty() {
+                if let Ok(Some(key)) = vault::get_relay_key(&profile_id) {
+                    if let Ok(models) = fetch_relay_models(&profile.base_url, &key).await {
+                        supported = models.clone();
+                        let _ = profiles::update_relay_supported_models(&profile_id, models);
+                    }
+                }
+            }
+            Ok((
+                model.unwrap_or(profile.model),
+                effort.or(profile.model_reasoning_effort),
+                supported,
+            ))
+        }
+    }
+}
+
+/// 切换前预览：目标供应商不支持的旧会话模型清单。
+/// profile_id = None 表示官方订阅。
+#[tauri::command]
+async fn preview_session_model_remap(
+    profile_id: Option<String>,
+) -> Result<session_model::ModelRemapPreview, ApiError> {
+    let (target_model, target_effort, supported, models_unknown) = match profile_id {
+        None => {
+            let state = vault::load_relay_state();
+            let model = state
+                .prev_model
+                .clone()
+                .unwrap_or_else(|| "gpt-5.6-sol".to_string());
+            let supported = if session_model::list_catalog_slugs().is_empty() {
+                session_model::OFFICIAL_MODELS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                session_model::list_catalog_slugs()
+            };
+            (model, state.prev_effort.clone(), supported, false)
+        }
+        Some(id) => {
+            let relays = profiles::list_relay_profiles()?;
+            let profile = relays
+                .iter()
+                .find(|p| p.id == id)
+                .cloned()
+                .ok_or_else(|| ApiError {
+                    message: format!("供应商不存在: {id}"),
+                })?;
+            let mut supported = profile.supported_models.clone();
+            let mut unknown = supported.is_empty();
+            if supported.is_empty() {
+                if let Ok(Some(key)) = vault::get_relay_key(&id) {
+                    if let Ok(models) = fetch_relay_models(&profile.base_url, &key).await {
+                        supported = models.clone();
+                        unknown = false;
+                        let _ = profiles::update_relay_supported_models(&id, models);
+                    }
+                }
+            }
+            (
+                profile.model,
+                profile.model_reasoning_effort,
+                supported,
+                unknown,
+            )
+        }
+    };
+    let threads = session_model::incompatible_threads(&supported)?;
+    Ok(session_model::ModelRemapPreview {
+        threads,
+        target_model,
+        target_effort,
+        supported_models: supported,
+        models_unknown,
+    })
+}
+
+/// 切换完成后执行模型迁移（thread_ids = None 表示迁移全部不兼容会话）。
+#[tauri::command]
+async fn apply_session_model_remap(
+    thread_ids: Option<Vec<String>>,
+) -> Result<session_model::ModelRemapOutcome, ApiError> {
+    let (model, effort, supported) = current_remap_target().await?;
+    Ok(session_model::apply_remap(
+        thread_ids.as_deref(),
+        &model,
+        effort.as_deref(),
+        &supported,
+    )?)
+}
+
+/// 会话管理页：把单个会话改为当前供应商默认模型（原模型备份，切回自动恢复）。
+#[tauri::command]
+async fn remap_single_thread(
+    thread_id: String,
+) -> Result<session_model::ModelRemapOutcome, ApiError> {
+    let (model, effort, supported) = current_remap_target().await?;
+    Ok(session_model::remap_single_thread(
+        &thread_id,
+        &model,
+        effort.as_deref(),
+        &supported,
+    )?)
+}
+
+/// 当前配置默认模型 / 思考档位 / 可用模型列表
+#[tauri::command]
+fn get_current_model_info() -> Result<CurrentModelInfo, ApiError> {
+    let (model, effort, _) = codex_config::top_level_fields()?;
+    Ok(CurrentModelInfo {
+        model,
+        reasoning_effort: effort,
+        supported_models: session_model::list_catalog_slugs(),
     })
 }
 
@@ -597,9 +766,9 @@ async fn list_usage_stats() -> usage_stats::UsageOverview {
 /// 本地路由开关 (启动/停止 127.0.0.1 代理)
 #[tauri::command]
 async fn set_local_router(enabled: bool) -> Result<local_router::RouterStatus, ApiError> {
-    Ok(local_router::set_enabled(enabled).await.map_err(|e| ApiError {
-        message: e,
-    })?)
+    Ok(local_router::set_enabled(enabled)
+        .await
+        .map_err(|e| ApiError { message: e })?)
 }
 
 /// 本地路由状态
@@ -724,6 +893,10 @@ pub fn run() {
             set_local_router,
             local_router_status,
             get_relay_key,
+            preview_session_model_remap,
+            apply_session_model_remap,
+            remap_single_thread,
+            get_current_model_info,
             take_pending_deeplink,
             get_common_config,
             set_common_config,

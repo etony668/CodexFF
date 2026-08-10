@@ -79,6 +79,10 @@ pub struct RelayProfile {
     /// 脚本请求超时秒数
     #[serde(default)]
     pub usage_timeout_secs: Option<u64>,
+    /// 该中转 /models 返回的真实模型列表（写入桌面端模型目录用）。
+    /// 空 = 未获取/未知，切换时尝试在线拉取。
+    #[serde(default)]
+    pub supported_models: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -233,6 +237,24 @@ pub fn list_relay_profiles() -> Result<Vec<RelayProfile>, ProfilesError> {
     Ok(load_profiles()?.relays)
 }
 
+/// 回填某个中转的模型清单（切换/预览时在线拉取成功后保存，
+/// 下次切换不用再拉）。
+pub fn update_relay_supported_models(
+    profile_id: &str,
+    models: Vec<String>,
+) -> Result<(), ProfilesError> {
+    let mut profiles = load_profiles()?;
+    let Some(profile) = profiles.relays.iter_mut().find(|p| p.id == profile_id) else {
+        return Err(ProfilesError::NotFound(profile_id.to_string()));
+    };
+    profile.supported_models = models
+        .into_iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    save_profiles(&profiles)
+}
+
 /// 当前激活状态 (按磁盘实际状态推断, 不信任 profiles.json)
 pub fn current_active() -> Result<ActiveSelection, ProfilesError> {
     let saved = load_profiles()?.active;
@@ -288,6 +310,8 @@ pub struct RelayProfileInput {
     pub usage_access_token: Option<String>,
     pub usage_user_id: Option<String>,
     pub usage_timeout_secs: Option<u64>,
+    /// add 保存测试到的模型列表; update None = 不修改
+    pub supported_models: Option<Vec<String>>,
 }
 
 /// 归一化 + 校验供应商输入 (add/update 共用):
@@ -416,6 +440,7 @@ pub fn import_from_text(text: &str) -> Result<RelayProfile, ProfilesError> {
         usage_access_token: req.usage_access_token,
         usage_user_id: req.usage_user_id,
         usage_timeout_secs: req.usage_auto_interval,
+        supported_models: None,
     })
 }
 
@@ -509,6 +534,13 @@ pub fn add_relay_profile(input: RelayProfileInput) -> Result<RelayProfile, Profi
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         usage_timeout_secs: input.usage_timeout_secs,
+        supported_models: input
+            .supported_models
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect(),
     };
 
     // key 先落 keyring, 失败则 profile 不创建
@@ -634,6 +666,13 @@ pub fn update_relay_profile(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     profiles.relays[index].usage_timeout_secs = input.usage_timeout_secs;
+    if let Some(models) = input.supported_models {
+        profiles.relays[index].supported_models = models
+            .into_iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect();
+    }
     profiles.relays[index].use_common_config = input.use_common_config;
     let profile = profiles.relays[index].clone();
     save_profiles(&profiles)?;
@@ -649,6 +688,7 @@ pub fn update_relay_profile(
             profile.model_context_window,
             profile.model_auto_compact_token_limit,
             profile.config_toml.as_deref(),
+            Some(profile.supported_models.as_slice()),
         )?;
         // 改了 key 或 auth_json → auth.json 同步换新, 否则 codex 拿旧 key 请求
         if key_updated || input.auth_json.is_some() {
@@ -736,11 +776,10 @@ pub fn activate_official_with_progress(
 
     // 0. 有标记隔离的会话需要迁移时, Codex 必须完全退出 —
     //    移动正在写入的 GB 级会话文件会造成会话分裂/损坏。
-    if crate::session_manager::has_isolated_sessions()
-        && crate::session_manager::codex_running()
-    {
+    if crate::session_manager::has_isolated_sessions() && crate::session_manager::codex_running() {
         return Err(ProfilesError::Blocked(
-            "有标记隔离的会话需要迁移，请先完全退出 Codex / ChatGPT 桌面端与命令行再切换官方订阅".into(),
+            "有标记隔离的会话需要迁移，请先完全退出 Codex / ChatGPT 桌面端与命令行再切换官方订阅"
+                .into(),
         ));
     }
 
@@ -808,11 +847,10 @@ pub fn activate_relay_with_progress(
         ));
     }
     // 0. 有标记隔离的会话需要从金库移回时, Codex 必须完全退出 (防止写坏会话文件)
-    if crate::session_manager::has_isolated_sessions()
-        && crate::session_manager::codex_running()
-    {
+    if crate::session_manager::has_isolated_sessions() && crate::session_manager::codex_running() {
         return Err(ProfilesError::Blocked(
-            "有标记隔离的会话需要恢复，请先完全退出 Codex / ChatGPT 桌面端与命令行再切换第三方".into(),
+            "有标记隔离的会话需要恢复，请先完全退出 Codex / ChatGPT 桌面端与命令行再切换第三方"
+                .into(),
         ));
     }
     // 切换前状态 — 回滚时按它恢复 auth.json (relay→relay 失败要重写旧中转 key)
@@ -861,6 +899,7 @@ pub fn activate_relay_with_progress(
         profile.model_context_window,
         profile.model_auto_compact_token_limit,
         profile.config_toml.as_deref(),
+        Some(profile.supported_models.as_slice()),
     ) {
         // 回滚: 恢复 config + auth.json 按切换前状态归位 (官方凭证或旧中转 key)
         restore_config_or_remove(&backup);

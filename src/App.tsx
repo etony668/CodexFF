@@ -5,10 +5,13 @@ import {
   DnsLeakResult,
   activateOfficial,
   activateRelay,
+  applySessionModelRemap,
   checkDnsLeak,
   checkIp,
   errMsg,
   getStatus,
+  isCodexRunning,
+  previewSessionModelRemap,
   takePendingDeeplink,
 } from "./api";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -130,16 +133,63 @@ function App() {
   // 切换检测进度 (官方模式: 出口 IP → 基线比对 → 写入配置)
   const [switchStep, setSwitchStep] = useState<string | null>(null);
 
-  // 官方切换实际执行 (force=true 跳过 IP 基线检查; 前端确认后调用)
-  async function finishOfficialSwitch(force: boolean) {
-    setConfirmState(null);
+  // 切换实际执行：自动把不兼容旧会话迁移到当前供应商模型（无需手动操作）
+  async function performSwitch(sel: "official" | string, force: boolean) {
+    if (switching) return; // 防双击并发切换 (config 读写非原子, 会互相覆盖)
     setSwitching(true);
     try {
-      setSwitchStep("写入官方配置与凭证…");
-      await activateOfficial(force);
-      setSwitchStep(null);
-      await refresh();
-      setNotice("已切换到官方订阅");
+      // 1. 先检查旧会话模型兼容性（不兼容时需要 Codex 完全退出才能迁移）
+      setSwitchStep("检查旧会话模型…");
+      const preview = await previewSessionModelRemap(sel === "official" ? null : sel);
+      const needMigrate = preview.threads.length > 0 && !preview.models_unknown;
+      if (needMigrate) {
+        const running = await isCodexRunning().catch(() => false);
+        if (running) {
+          setSwitching(false);
+          setSwitchStep(null);
+          setNotice(
+            `检测到 ${preview.threads.length} 个旧会话需要迁移模型。请先完全退出 Codex / ChatGPT 再切换，切换时会自动迁移，无需手动操作。`
+          );
+          return;
+        }
+      }
+
+      // 2. 写配置
+      if (sel === "official") {
+        setSwitchStep("写入官方配置与凭证…");
+        await activateOfficial(force);
+      } else {
+        setSwitchStep("写入中转配置与凭证…");
+        await activateRelay(sel);
+      }
+      const relayName =
+        sel === "official"
+          ? "官方订阅"
+          : status?.relays.find((r) => r.id === sel)?.name ?? sel;
+
+      // 3. 自动迁移全部不兼容旧会话
+      if (needMigrate) {
+        setSwitchStep("迁移旧会话模型…");
+        const ids = preview.threads.map((t) => t.thread_id);
+        try {
+          const out = await applySessionModelRemap(ids);
+          setSwitchStep(null);
+          await refresh();
+          setNotice(
+            `已切换到 ${relayName}，${out.remapped + out.restored} 个旧会话已自动改用当前模型，可以直接接续。`
+          );
+        } catch (e) {
+          setSwitchStep(null);
+          await refresh();
+          setNotice(
+            `已切换到 ${relayName}，但旧会话模型迁移失败：${errMsg(e)}。`
+          );
+        }
+      } else {
+        setSwitchStep(null);
+        await refresh();
+        setNotice(`已切换到 ${relayName}。`);
+      }
     } catch (e) {
       setError(errMsg(e));
     } finally {
@@ -149,43 +199,42 @@ function App() {
   }
 
   async function switchTo(sel: "official" | string) {
-    if (switching) return; // 防双击并发切换 (config 读写非原子, 会互相覆盖)
+    if (switching) return;
+    if (sel !== "official") {
+      await performSwitch(sel, false);
+      return;
+    }
     setSwitching(true);
     try {
-      if (sel === "official") {
-        // IP 硬检查分步: 前端先跑检测并显示进度, 比对不一致 → 自定义悬浮
-        // 确认提示 (不自动消失), 用户确认后 force 调用。
-        setSwitchStep("检测出口 IP…");
-        const ip = await checkIp();
-        if (ip.current_ip) {
-          setSwitchStep("比对官方激活基线…");
-          if (ip.changed && ip.last_official_ip) {
-            const msg = `出口 IP 已变: 上次官方基线 ${ip.last_official_ip} → 当前 ${ip.current_ip}。官方账号从新 IP 访问有封号风险。`;
-            setSwitching(false);
-            setSwitchStep(null);
-            setConfirmState({
-              title: "出口 IP 已变",
-              message: `${msg} 确定要继续切换到官方吗?`,
-              onConfirm: () => finishOfficialSwitch(true),
-            });
-            return;
-          }
+      // IP 硬检查分步: 前端先跑检测并显示进度, 比对不一致 → 自定义悬浮
+      // 确认提示 (不自动消失), 用户确认后 force 调用。
+      setSwitchStep("检测出口 IP…");
+      const ip = await checkIp();
+      if (ip.current_ip) {
+        setSwitchStep("比对官方激活基线…");
+        if (ip.changed && ip.last_official_ip) {
+          const msg = `出口 IP 已变: 上次官方基线 ${ip.last_official_ip} → 当前 ${ip.current_ip}。官方账号从新 IP 访问有封号风险。`;
+          setSwitching(false);
+          setSwitchStep(null);
+          setConfirmState({
+            title: "出口 IP 已变",
+            message: `${msg} 确定要继续切换到官方吗?`,
+            confirmLabel: "仍然切换",
+            onConfirm: () => {
+              setConfirmState(null);
+              void performSwitch("official", true);
+            },
+          });
+          return;
         }
-        await finishOfficialSwitch(false);
-      } else {
-        setSwitchStep("写入中转配置与凭证…");
-        await activateRelay(sel);
-        setSwitchStep(null);
-        await refresh();
-        setNotice(
-          `已切换到中转 ${status?.relays.find((r) => r.id === sel)?.name ?? sel}。续聊旧会话会用旧模型, 建议开新会话`
-        );
       }
-    } catch (e) {
-      setError(errMsg(e));
-    } finally {
       setSwitching(false);
       setSwitchStep(null);
+      await performSwitch("official", false);
+    } catch (e) {
+      setSwitching(false);
+      setSwitchStep(null);
+      setError(errMsg(e));
     }
   }
 
@@ -207,6 +256,9 @@ function App() {
   const [confirmState, setConfirmState] = useState<{
     title: string;
     message: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    extraActions?: { label: string; onClick: () => void }[];
     onConfirm: () => void;
   } | null>(null);
   // 子页面请求的通用悬浮提示 (统一在 App 的提示容器里, 避免多个容器重叠)
@@ -488,8 +540,9 @@ function App() {
               kind="confirm"
               title={confirmState.title}
               message={confirmState.message}
-              confirmLabel="仍然切换"
-              cancelLabel="取消"
+              confirmLabel={confirmState.confirmLabel ?? "仍然切换"}
+              cancelLabel={confirmState.cancelLabel ?? "取消"}
+              extraActions={confirmState.extraActions}
               onConfirm={confirmState.onConfirm}
               onClose={() => setConfirmState(null)}
             />

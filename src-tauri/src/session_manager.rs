@@ -88,7 +88,7 @@ fn isolation_log(msg: &str) {
     }
 }
 
-fn normal_root(archived: bool) -> std::path::PathBuf {
+pub(crate) fn normal_root(archived: bool) -> std::path::PathBuf {
     let paths = codex_config::codex_sessions_paths();
     if archived {
         paths[1].clone()
@@ -97,7 +97,7 @@ fn normal_root(archived: bool) -> std::path::PathBuf {
     }
 }
 
-fn quarantine_root(archived: bool) -> std::path::PathBuf {
+pub(crate) fn quarantine_root(archived: bool) -> std::path::PathBuf {
     vault::vault_dir().join("session-quarantine").join(if archived {
         "archived_sessions"
     } else {
@@ -304,7 +304,7 @@ const THREADS_ISOLATED_TABLE: &str = "threads_codexff_isolated";
 const SECTIONS_ISOLATED_TABLE: &str = "thread_sections_codexff_isolated";
 const TOOLS_ISOLATED_TABLE: &str = "thread_dynamic_tools_codexff_isolated";
 
-fn state_db_conn_rw() -> Result<Connection, SessionError> {
+pub(crate) fn state_db_conn_rw() -> Result<Connection, SessionError> {
     let conn = Connection::open(codex_config::codex_state_db_path())?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
@@ -1198,6 +1198,7 @@ pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
     // 自愈: 按当前激活模式把标记会话放到正确位置 (官方 ↔ 金库隔离区)
     let _ = sync_session_isolation();
     let titles = load_thread_titles();
+    let models = load_thread_models();
     let mut sessions = Vec::new();
 
     let roots: [(std::path::PathBuf, bool, bool); 4] = [
@@ -1210,7 +1211,15 @@ pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
         if !root.exists() {
             continue;
         }
-        collect_jsonl(&root, &root, &titles, archived, isolated, &mut sessions)?;
+        collect_jsonl(
+            &root,
+            &root,
+            &titles,
+            &models,
+            archived,
+            isolated,
+            &mut sessions,
+        )?;
     }
 
     // 按线程合并: 同一 thread_id 的多个 rollout (续聊/子任务) 只保留最新一条,
@@ -1246,6 +1255,7 @@ fn collect_jsonl(
     root: &Path,
     dir: &Path,
     titles: &HashMap<String, String>,
+    models: &HashMap<String, String>,
     archived: bool,
     isolated: bool,
     out: &mut Vec<SessionMeta>,
@@ -1259,9 +1269,11 @@ fn collect_jsonl(
         let path = entry.path();
         let meta = entry.metadata()?;
         if meta.is_dir() {
-            collect_jsonl(root, &path, titles, archived, isolated, out)?;
+            collect_jsonl(root, &path, titles, models, archived, isolated, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Some(session) = parse_session(&path, root, titles, archived, isolated)? {
+            if let Some(session) =
+                parse_session(&path, root, titles, models, archived, isolated)?
+            {
                 out.push(session);
             }
         }
@@ -1273,6 +1285,7 @@ fn parse_session(
     path: &Path,
     root: &Path,
     titles: &HashMap<String, String>,
+    models: &HashMap<String, String>,
     archived: bool,
     isolated: bool,
 ) -> Result<Option<SessionMeta>, SessionError> {
@@ -1380,6 +1393,12 @@ fn parse_session(
     } else {
         thread_id
     };
+    // 模型以 state DB 的 threads.model 为准（rollout 里的 payload.model 可能
+    // 残留早期/瞬时设置，不代表当前线程绑定）。
+    let model = models
+        .get(&thread_id)
+        .cloned()
+        .unwrap_or(model);
 
     Ok(Some(SessionMeta {
         id,
@@ -1427,6 +1446,39 @@ pub(crate) fn load_thread_titles() -> HashMap<String, String> {
         titles.insert(row.0, row.1);
     }
     titles
+}
+
+/// 从 state_5.sqlite 读线程当前绑定模型（会话列表“用当前模型续聊”判断用）。
+pub(crate) fn load_thread_models() -> HashMap<String, String> {
+    let mut models = HashMap::new();
+    let db_path = codex_config::codex_state_db_path();
+    if !db_path.exists() {
+        return models;
+    }
+
+    let Ok(conn) = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return models;
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, model FROM threads \
+         WHERE model IS NOT NULL AND model <> ''",
+    ) else {
+        return models;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return models;
+    };
+    for row in rows.flatten() {
+        models.insert(row.0, row.1);
+    }
+    models
 }
 
 /// 会话详情: 返回原始 JSONL 行 (前端渲染)。限流防止大文件炸内存。

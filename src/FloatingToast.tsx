@@ -10,6 +10,8 @@ export interface FloatingToastProps {
   durationMs?: number;
   confirmLabel?: string;
   cancelLabel?: string;
+  /** 确认框里的额外选项按钮（渲染在主确认按钮之后、取消之前） */
+  extraActions?: { label: string; onClick: () => void }[];
   onConfirm?: () => void;
   onClose: () => void;
 }
@@ -21,6 +23,7 @@ export function FloatingToast({
   durationMs = 5000,
   confirmLabel = "确认",
   cancelLabel = "取消",
+  extraActions,
   onConfirm,
   onClose,
 }: FloatingToastProps) {
@@ -50,6 +53,11 @@ export function FloatingToast({
           <button className="primary" onClick={onConfirm}>
             {confirmLabel}
           </button>
+          {extraActions?.map((a) => (
+            <button key={a.label} onClick={a.onClick}>
+              {a.label}
+            </button>
+          ))}
           <button onClick={onClose}>{cancelLabel}</button>
         </div>
       ) : (
@@ -70,5 +78,6 @@ export interface ToastRequest {
   kind?: FloatingToastKind;
   confirmLabel?: string;
   cancelLabel?: string;
+  extraActions?: { label: string; onClick: () => void }[];
   onConfirm?: () => void;
 }

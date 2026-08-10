@@ -27,6 +27,8 @@ export interface RelayProfile {
   anthropic_auth_field: string | null;
   /** 保存时合并全局公共配置片段 */
   use_common_config: boolean;
+  /** 该中转 /models 返回的真实模型列表（空 = 未知/未获取） */
+  supported_models: string[];
 }
 
 /** 供应商表单全量入参 (add/update 共用) */
@@ -49,6 +51,8 @@ export interface RelayProfileInput {
   config_toml: string | null;
   anthropic_auth_field: string | null;
   use_common_config: boolean;
+  /** add 保存测试到的模型列表; update null = 不修改 */
+  supported_models: string[] | null;
 }
 
 export interface RelayTestResult {
@@ -57,6 +61,35 @@ export interface RelayTestResult {
   models: string[];
   error: string | null;
   status_code: number | null;
+}
+
+export interface ModelRemapThread {
+  thread_id: string;
+  title: string;
+  model: string;
+  reasoning_effort: string | null;
+  last_active_ms: number;
+}
+
+export interface ModelRemapPreview {
+  threads: ModelRemapThread[];
+  target_model: string;
+  target_effort: string | null;
+  supported_models: string[];
+  /** true = 拿不到目标供应商模型清单，无法判断不兼容会话 */
+  models_unknown: boolean;
+}
+
+export interface ModelRemapOutcome {
+  remapped: number;
+  restored: number;
+  thread_ids: string[];
+}
+
+export interface CurrentModelInfo {
+  model: string | null;
+  reasoning_effort: string | null;
+  supported_models: string[];
 }
 
 export interface IpCheckResult {
@@ -304,6 +337,30 @@ export function getSwitchStats(): Promise<number> {
 
 export function activateRelay(profileId: string): Promise<ActiveSelection> {
   return invoke("activate_relay", { profileId });
+}
+
+/** 切换前预览：目标供应商不支持的旧会话模型清单（null = 官方） */
+export function previewSessionModelRemap(
+  profileId: string | null,
+): Promise<ModelRemapPreview> {
+  return invoke("preview_session_model_remap", { profileId });
+}
+
+/** 切换完成后迁移旧会话模型（null = 全部不兼容会话） */
+export function applySessionModelRemap(
+  threadIds: string[] | null,
+): Promise<ModelRemapOutcome> {
+  return invoke("apply_session_model_remap", { threadIds });
+}
+
+/** 会话管理页：单个会话改为当前供应商默认模型 */
+export function remapSingleThread(threadId: string): Promise<ModelRemapOutcome> {
+  return invoke("remap_single_thread", { threadId });
+}
+
+/** 当前配置默认模型 / 思考档位 / 可用模型列表 */
+export function getCurrentModelInfo(): Promise<CurrentModelInfo> {
+  return invoke("get_current_model_info");
 }
 
 export function listSessions(): Promise<SessionMeta[]> {
