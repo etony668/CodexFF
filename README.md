@@ -16,7 +16,7 @@ Codex 供应商切换与本地安全小工具（macOS · Tauri 2 + React + Rust�
 
 ## 与 CodexFF Pro 的关系
 
-免费版是 CodexFF Pro 的功能子集，不含 DNS 守护（加密解析/防污染）、激活码/彩蛋等付费功能。
+免费版是 CodexFF Pro 的功能子集，不含 DNS 守护（加密解析/防污染）等付费功能。
 体验完整版 CodexFF Pro：https://code.etony.ccwu.cc/
 
 | 开启 DNS 守护 | 开启后第三方权威检测（无泄露） |
