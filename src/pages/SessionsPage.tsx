@@ -490,17 +490,31 @@ export function SessionsPage({ onToast }: Props) {
                   aria-label={isCollapsed ? "展开项目" : "收起项目"}
                 >
                   <span className="group-plus">
-                    <svg
-                      width="12"
-                      height="12"
-                      viewBox="0 0 12 12"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                      strokeLinecap="round"
-                    >
-                      <path d="M6 1v10M1 6h10" />
-                    </svg>
+                    {isCollapsed ? (
+                      <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 12 12"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.6"
+                        strokeLinecap="round"
+                      >
+                        <path d="M6 1v10M1 6h10" />
+                      </svg>
+                    ) : (
+                      <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 12 12"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.6"
+                        strokeLinecap="round"
+                      >
+                        <path d="M1 6h10" />
+                      </svg>
+                    )}
                   </span>
                 </button>
                 <div className="group-title" onClick={() => toggleGroup(g.key)}>
