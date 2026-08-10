@@ -394,18 +394,22 @@ button.danger.armed:hover:not(:disabled) {
   overflow-y: auto;
 }
 
-.session-group { margin-bottom: 10px; }
+.session-group {
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-card);
+  overflow: hidden;
+}
 .session-group-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-card);
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
   cursor: pointer;
 }
-.session-group-head:hover { border-color: var(--accent); }
+.session-group-head:hover .group-title strong { color: var(--accent); }
 .group-toggle {
   display: inline-flex;
   align-items: center;
@@ -422,12 +426,12 @@ button.danger.armed:hover:not(:disabled) {
   min-height: 0;
 }
 .group-toggle .group-plus {
-  display: inline-block;
-  font-size: 14px;
-  line-height: 1;
-  transition: transform 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
 }
-.group-toggle.open .group-plus { transform: rotate(45deg); }
 .group-title {
   display: flex;
   flex-direction: column;
@@ -439,10 +443,23 @@ button.danger.armed:hover:not(:disabled) {
 .group-title strong { font-size: 13px; }
 .group-title .mono { font-size: 11px; }
 .session-group-body {
-  margin: 6px 0 0 28px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+}
+.session-group-body .row-card {
+  border: none;
+  border-radius: 0;
+  margin: 0;
+  padding-left: 26px;
+  background: transparent;
+  border-bottom: 1px dashed var(--border);
+}
+.session-group-body .row-card:last-child {
+  border-bottom: none;
+}
+.session-group-body .row-card:hover,
+.session-group-body .row-card.selected {
+  background: var(--bg-hover);
 }
 
 .session-lines { display: flex; flex-direction: column; gap: 8px; }

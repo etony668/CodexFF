@@ -1,7 +1,7 @@
 {
   "name": "codexff",
   "private": true,
-  "version": "1.0.162",
+  "version": "1.0.163",
   "type": "module",
   "scripts": {
     "dev": "vite",
