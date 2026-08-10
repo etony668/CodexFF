@@ -326,6 +326,23 @@ function App() {
     };
   }, []);
 
+  // 会话模型迁移进度（并发改写大文件时逐文件上报）
+  useEffect(() => {
+    const unlisten = listen<{
+      done: number;
+      total: number;
+      current: string | null;
+    }>("session-model-remap-progress", (e) => {
+      const p = e.payload;
+      setSwitchStep(
+        `迁移旧会话模型（${p.done}/${p.total}）${p.current ? ` · ${p.current}` : ""}…`
+      );
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   return (
     <div className="app">
       <header className="app-header">

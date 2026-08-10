@@ -8,8 +8,12 @@
 //! 切换供应商只改 config.toml 时，旧会话仍绑定旧模型 → 新供应商不支持就
 //! 无法续聊。本模块负责把这两个绑定一起迁移，并持久化原模型用于切回恢复。
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::collections::{HashSet, VecDeque};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use chrono::Utc;
 use rusqlite::Connection;
@@ -54,6 +58,14 @@ pub struct ModelRemapOutcome {
     pub remapped: usize,
     pub restored: usize,
     pub thread_ids: Vec<String>,
+}
+
+/// 迁移进度（前端展示 "迁移旧会话模型 (x/y) …"）。
+#[derive(Debug, Clone, Serialize)]
+pub struct RemapProgress {
+    pub done: usize,
+    pub total: usize,
+    pub current: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -233,6 +245,38 @@ fn resolve_rollout_files(rollout_path: &str) -> Vec<PathBuf> {
     out
 }
 
+/// 快速字节预扫描：文件里是否出现 `"model":"<old>"`（serde_json 紧凑格式）。
+/// GB 级 JSONL 大部分其实不包含目标模型名，先做一次廉价扫描，命中才整份重写，
+/// 避免每次切换都把所有会话文件读+写一遍（几十 GB 变成几秒）。
+fn file_contains_model_binding(path: &Path, old_model: &str) -> std::io::Result<bool> {
+    if old_model.is_empty() {
+        return Ok(true);
+    }
+    let needle = format!("\"model\":\"{old_model}\"");
+    let needle = needle.as_bytes();
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 256 * 1024];
+    let mut carry: Vec<u8> = Vec::with_capacity(needle.len() + 64);
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        if carry.len() >= needle.len()
+            && carry.windows(needle.len()).any(|w| w == needle)
+        {
+            return Ok(true);
+        }
+        // 保留末尾 needle.len()-1 字节，覆盖跨块边界
+        let keep = needle.len().saturating_sub(1);
+        if carry.len() > keep {
+            carry.drain(..carry.len() - keep);
+        }
+    }
+    Ok(false)
+}
+
 /// 把 rollout 里所有 `thread_settings_applied` 的模型绑定从 old 改为 new。
 /// 流式改写（GB 级文件不会整体载入内存），失败时删除临时文件、原文件不动。
 fn rewrite_rollout_models(
@@ -326,6 +370,7 @@ pub fn apply_remap(
     target_model: &str,
     target_effort: Option<&str>,
     supported: &[String],
+    progress: &(dyn Fn(RemapProgress) + Sync),
 ) -> Result<ModelRemapOutcome, ModelRemapError> {
     if target_model.trim().is_empty() {
         return Err(ModelRemapError::Blocked(
@@ -448,11 +493,47 @@ pub fn apply_remap(
     save_remaps(&remaps)?;
     // rollout 里的 thread_settings 是次要绑定（桌面端续聊以 state DB 为准）。
     // 改写失败只告警不阻断，避免单个文件异常导致整个切换回滚。
-    for (path, old_model, new_model, new_effort) in file_jobs {
-        if let Err(e) = rewrite_rollout_models(&path, &old_model, &new_model, new_effort.as_deref())
-        {
-            log::warn!("改写会话模型绑定失败 {}: {e}", path.display());
-        }
+    // 去重后并发处理：预扫描跳过未命中的大文件，命中才整份流式重写。
+    let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
+    file_jobs.retain(|(p, old, _, _)| seen.insert((p.clone(), old.clone())));
+    let total = file_jobs.len();
+    if total > 0 {
+        let done = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(Mutex::new(VecDeque::from(file_jobs)));
+        let workers = 4.min(total);
+        thread::scope(|s| {
+            for _ in 0..workers {
+                let queue = Arc::clone(&queue);
+                let done = Arc::clone(&done);
+                s.spawn(move || loop {
+                    let job = {
+                        let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                        q.pop_front()
+                    };
+                    let Some((path, old_model, new_model, new_effort)) = job else {
+                        break;
+                    };
+                    // 预扫描：模型绑定字符串不存在就直接跳过（大文件无谓读写的主因）
+                    let matched = file_contains_model_binding(&path, &old_model)
+                        .unwrap_or(true); // 读失败保守按命中走，交给原逻辑告警
+                    if matched {
+                        if let Err(e) =
+                            rewrite_rollout_models(&path, &old_model, &new_model, new_effort.as_deref())
+                        {
+                            log::warn!("改写会话模型绑定失败 {}: {e}", path.display());
+                        }
+                    }
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    progress(RemapProgress {
+                        done: d,
+                        total,
+                        current: path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned()),
+                    });
+                });
+            }
+        });
     }
     Ok(ModelRemapOutcome {
         remapped,
@@ -467,6 +548,7 @@ pub fn remap_single_thread(
     target_model: &str,
     target_effort: Option<&str>,
     supported: &[String],
+    progress: &(dyn Fn(RemapProgress) + Sync),
 ) -> Result<ModelRemapOutcome, ModelRemapError> {
     let id = thread_id.to_string();
     apply_remap(
@@ -474,6 +556,7 @@ pub fn remap_single_thread(
         target_model,
         target_effort,
         supported,
+        progress,
     )
 }
 
@@ -507,6 +590,24 @@ mod tests {
         assert_eq!(choose_effort(None).as_deref(), Some("high"));
         assert_eq!(choose_effort(Some("max")).as_deref(), Some("max"));
         assert_eq!(choose_effort(Some("  ")).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn contains_model_binding_detects_hits_and_skips_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let hit = dir.path().join("hit.jsonl");
+        let miss = dir.path().join("miss.jsonl");
+        std::fs::write(&hit, "{\"payload\":{\"model\":\"gpt-5.6-luna\"}}\n").unwrap();
+        std::fs::write(&miss, "{\"payload\":{\"model\":\"gpt-5.6-sol\"}}\n").unwrap();
+        assert!(file_contains_model_binding(&hit, "gpt-5.6-luna").unwrap());
+        assert!(!file_contains_model_binding(&miss, "gpt-5.6-luna").unwrap());
+        assert!(file_contains_model_binding(&dir.path().join("nope.jsonl"), "x").is_err());
+
+        // 跨块边界：needle 起点在 256KB 缓冲末尾，横跨下一个块
+        let big = dir.path().join("big.jsonl");
+        let prefix = "a".repeat((256 * 1024) - 10);
+        std::fs::write(&big, format!("{prefix}\"model\":\"gpt-5.6-luna\"")).unwrap();
+        assert!(file_contains_model_binding(&big, "gpt-5.6-luna").unwrap());
     }
 
     #[test]

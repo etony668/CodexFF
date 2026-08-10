@@ -648,28 +648,42 @@ async fn preview_session_model_remap(
 /// 切换完成后执行模型迁移（thread_ids = None 表示迁移全部不兼容会话）。
 #[tauri::command]
 async fn apply_session_model_remap(
+    app: tauri::AppHandle,
     thread_ids: Option<Vec<String>>,
 ) -> Result<session_model::ModelRemapOutcome, ApiError> {
     let (model, effort, supported) = current_remap_target().await?;
+    use tauri::Emitter;
+    let handle = app.clone();
+    let progress = move |p: session_model::RemapProgress| {
+        let _ = handle.emit("session-model-remap-progress", p);
+    };
     Ok(session_model::apply_remap(
         thread_ids.as_deref(),
         &model,
         effort.as_deref(),
         &supported,
+        &progress,
     )?)
 }
 
 /// 会话管理页：把单个会话改为当前供应商默认模型（原模型备份，切回自动恢复）。
 #[tauri::command]
 async fn remap_single_thread(
+    app: tauri::AppHandle,
     thread_id: String,
 ) -> Result<session_model::ModelRemapOutcome, ApiError> {
     let (model, effort, supported) = current_remap_target().await?;
+    use tauri::Emitter;
+    let handle = app.clone();
+    let progress = move |p: session_model::RemapProgress| {
+        let _ = handle.emit("session-model-remap-progress", p);
+    };
     Ok(session_model::remap_single_thread(
         &thread_id,
         &model,
         effort.as_deref(),
         &supported,
+        &progress,
     )?)
 }
 
