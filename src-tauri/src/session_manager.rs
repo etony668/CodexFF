@@ -35,6 +35,12 @@ pub struct SessionMeta {
     /// 该线程包含的 rollout 文件数 (续聊/子任务合并显示用)
     #[serde(default)]
     pub rollups: usize,
+    /// 线程工作目录 (项目目录, 官方侧边栏按它分组)
+    #[serde(default)]
+    pub cwd: String,
+    /// 注册项目名 (local-projects 里匹配到 cwd 的名称; 空 = 未注册项目)
+    #[serde(default)]
+    pub project: String,
 }
 
 /// 隔离标记 (持久化在 vault/isolated-sessions.json)。
@@ -1194,11 +1200,89 @@ pub enum SessionError {
 }
 
 /// 扫描所有会话, 按最后活动时间倒序
+/// 读取 ~/.codex/.codex-global-state.json 的 local-projects (root → 项目名)。
+/// 官方侧边栏按它给线程分组, 会话管理保持一致的分类。
+fn load_registered_projects() -> Vec<(String, String)> {
+    let path = codex_config::codex_config_dir().join(".codex-global-state.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(projects) = v.get("local-projects").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for p in projects.values() {
+        let name = p
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(roots) = p.get("rootPaths").and_then(|x| x.as_array()) {
+            for r in roots {
+                if let Some(root) = r.as_str() {
+                    out.push((root.trim_end_matches('/').to_string(), name.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 从 state_5.sqlite 读线程工作目录 (项目分组用)。
+pub(crate) fn load_thread_cwds() -> HashMap<String, String> {
+    let mut cwds = HashMap::new();
+    let db_path = codex_config::codex_state_db_path();
+    if !db_path.exists() {
+        return cwds;
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return cwds;
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let Ok(mut stmt) = conn.prepare("SELECT id, cwd FROM threads WHERE cwd <> ''") else {
+        return cwds;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return cwds;
+    };
+    for row in rows.flatten() {
+        cwds.insert(row.0, row.1);
+    }
+    cwds
+}
+
+/// cwd 是否属于某个注册项目根目录 (路径边界匹配)。
+fn project_name_for_cwd(cwd: &str, projects: &[(String, String)]) -> String {
+    if cwd.is_empty() {
+        return String::new();
+    }
+    for (root, name) in projects {
+        if cwd == root || cwd.starts_with(&format!("{root}/")) {
+            return name.clone();
+        }
+    }
+    String::new()
+}
+
 pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
     // 自愈: 按当前激活模式把标记会话放到正确位置 (官方 ↔ 金库隔离区)
     let _ = sync_session_isolation();
     let titles = load_thread_titles();
     let models = load_thread_models();
+    let cwds = load_thread_cwds();
+    let projects = load_registered_projects();
     let mut sessions = Vec::new();
 
     let roots: [(std::path::PathBuf, bool, bool); 4] = [
@@ -1216,6 +1300,8 @@ pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
             &root,
             &titles,
             &models,
+            &cwds,
+            &projects,
             archived,
             isolated,
             &mut sessions,
@@ -1256,6 +1342,8 @@ fn collect_jsonl(
     dir: &Path,
     titles: &HashMap<String, String>,
     models: &HashMap<String, String>,
+    cwds: &HashMap<String, String>,
+    projects: &[(String, String)],
     archived: bool,
     isolated: bool,
     out: &mut Vec<SessionMeta>,
@@ -1269,11 +1357,18 @@ fn collect_jsonl(
         let path = entry.path();
         let meta = entry.metadata()?;
         if meta.is_dir() {
-            collect_jsonl(root, &path, titles, models, archived, isolated, out)?;
+            collect_jsonl(root, &path, titles, models, cwds, projects, archived, isolated, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Some(session) =
-                parse_session(&path, root, titles, models, archived, isolated)?
-            {
+            if let Some(session) = parse_session(
+                &path,
+                root,
+                titles,
+                models,
+                cwds,
+                projects,
+                archived,
+                isolated,
+            )? {
                 out.push(session);
             }
         }
@@ -1286,6 +1381,8 @@ fn parse_session(
     root: &Path,
     titles: &HashMap<String, String>,
     models: &HashMap<String, String>,
+    cwds: &HashMap<String, String>,
+    projects: &[(String, String)],
     archived: bool,
     isolated: bool,
 ) -> Result<Option<SessionMeta>, SessionError> {
@@ -1399,6 +1496,8 @@ fn parse_session(
         .get(&thread_id)
         .cloned()
         .unwrap_or(model);
+    let cwd = cwds.get(&thread_id).cloned().unwrap_or_default();
+    let project = project_name_for_cwd(&cwd, projects);
 
     Ok(Some(SessionMeta {
         id,
@@ -1412,6 +1511,8 @@ fn parse_session(
         isolated,
         preview,
         rollups: 1,
+        cwd,
+        project,
     }))
 }
 

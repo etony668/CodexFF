@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   SessionMeta,
@@ -22,6 +22,13 @@ interface Props {
   onToast?: (t: ToastRequest) => void;
 }
 
+interface SessionGroup {
+  key: string;
+  name: string;
+  dir: string;
+  sessions: SessionMeta[];
+}
+
 export function SessionsPage({ onToast }: Props) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [loading, setLoading] = useState(true);
@@ -32,8 +39,10 @@ export function SessionsPage({ onToast }: Props) {
   const [detailErr, setDetailErr] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   // 隔离进度 (Codex 必须完全退出; 过程显示进度)
-  const [isolatingId, setIsolatingId] = useState<string | null>(null);
+  const [isolatingGroup, setIsolatingGroup] = useState<string | null>(null);
   const [isolateStep, setIsolateStep] = useState("");
+  // 项目分组折叠状态 (默认展开)
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // 当前供应商默认模型 + 可用模型列表（“用当前模型续聊”判断用）
   const [currentModel, setCurrentModel] = useState<string | null>(null);
   const [currentModels, setCurrentModels] = useState<string[]>([]);
@@ -106,30 +115,33 @@ export function SessionsPage({ onToast }: Props) {
     }
   }
 
-  // 勾选隔离: 先弹确认悬浮提示说明隔离作用, 确认后才开始隔离;
-  // 取消勾选不弹确认, 直接执行。
-  function requestToggleIsolation(s: SessionMeta, checked: boolean) {
-    if (isolatingId) return;
+  // 项目级隔离: 勾选后该项目下所有线程在官方订阅下不可见。
+  // 确认流程与单会话一致, 取消勾选不弹确认, 直接执行。
+  function requestToggleGroupIsolation(
+    g: SessionGroup,
+    checked: boolean,
+  ) {
+    if (isolatingGroup) return;
     if (!checked) {
-      void doToggleIsolation(s, false);
+      void doToggleGroupIsolation(g, false);
       return;
     }
     onToast?.({
       kind: "confirm",
-      title: "确认隔离会话？",
-      message: "勾选后官方订阅将看不到该线程的全部会话（含侧边栏的项目/目录与标题）；切回第三方后自动恢复。",
+      title: "确认隔离该项目会话？",
+      message: `勾选后官方订阅将看不到该项目下 ${g.sessions.length} 个线程的全部会话（含侧边栏的项目/目录与标题）；切回第三方后自动恢复。`,
       confirmLabel: "确认隔离",
       cancelLabel: "取消",
       onConfirm: () => {
-        void doToggleIsolation(s, true);
+        void doToggleGroupIsolation(g, true);
       },
     });
   }
 
-  // 隔离: 官方订阅激活时该线程全部文件移入金库, 官方 CLI 不可见;
+  // 隔离: 官方订阅激活时线程文件移入金库, 官方 CLI 不可见;
   // 隔离前要求 Codex (桌面/CLI) 完全退出, 防止移动正在写入的会话文件。
-  async function doToggleIsolation(s: SessionMeta, isolated: boolean) {
-    if (isolatingId) return;
+  async function doToggleGroupIsolation(g: SessionGroup, isolated: boolean) {
+    if (isolatingGroup) return;
     if (isolated) {
       try {
         if (await isCodexRunning()) {
@@ -143,10 +155,14 @@ export function SessionsPage({ onToast }: Props) {
         // 预检失败不阻塞, 后端命令还有一层强制检测
       }
     }
-    setIsolatingId(s.thread_id);
-    setIsolateStep("准备隔离…");
+    setIsolatingGroup(g.key);
     try {
-      await setSessionIsolated(s.thread_id, isolated);
+      for (const s of g.sessions) {
+        setIsolateStep(
+          `${isolated ? "正在隔离" : "正在恢复"} ${truncate(s.title, 40)}…`,
+        );
+        await setSessionIsolated(s.thread_id, isolated);
+      }
     } catch (e) {
       const msg = errMsg(e);
       if (msg.includes("Codex")) {
@@ -158,10 +174,19 @@ export function SessionsPage({ onToast }: Props) {
         setErr(msg);
       }
     } finally {
-      setIsolatingId(null);
+      setIsolatingGroup(null);
       setIsolateStep("");
       await load();
     }
+  }
+
+  function toggleGroup(key: string) {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
   }
 
   // 单个会话“用当前模型续聊”：改成当前供应商默认模型，原模型备份可恢复
@@ -310,10 +335,42 @@ export function SessionsPage({ onToast }: Props) {
   }
 
   const filtered = sessions.filter((s) =>
-    (s.title + " " + s.id + " " + s.thread_id + " " + s.model + " " + s.preview)
+    (s.title +
+      " " +
+      s.id +
+      " " +
+      s.thread_id +
+      " " +
+      s.model +
+      " " +
+      s.preview +
+      " " +
+      s.cwd +
+      " " +
+      s.project)
       .toLowerCase()
       .includes(search.toLowerCase()),
   );
+
+  // 与官方侧边栏一致: 按项目分组 (注册项目名优先, 否则用目录名; 无目录归入“未分类”)。
+  const groups: SessionGroup[] = useMemo(() => {
+    const map = new Map<string, SessionGroup>();
+    for (const s of filtered) {
+      const dir = s.cwd || "";
+      const key = s.project || dir || "__none__";
+      const name =
+        s.project || dir.split("/").filter(Boolean).pop() || "未分类";
+      let g = map.get(key);
+      if (!g) {
+        g = { key, name, dir, sessions: [] };
+        map.set(key, g);
+      }
+      g.sessions.push(s);
+    }
+    return [...map.values()].sort((a, b) =>
+      a.name.localeCompare(b.name, "zh-Hans-CN"),
+    );
+  }, [filtered]);
 
   return (
     <div className="page">
@@ -403,12 +460,13 @@ export function SessionsPage({ onToast }: Props) {
       <section className="card session-list">
         <h2>会话 ({sessions.length})</h2>
         <p className="hint">
-          勾选 = 该线程的全部会话与侧边栏项目/目录在官方订阅下不可见；
-          切换官方时自动迁移，切回第三方后自动恢复。同线程已合并为一条，点击查看最新一条。
+          与官方一致按项目目录/名称分组，默认展开可收起；勾选 = 该项目下所有
+          线程在官方订阅下不可见，切换官方时自动迁移，切回第三方后自动恢复。
+          同线程已合并为一条，点击查看最新一条。
         </p>
         <input
           className="search"
-          placeholder="搜索标题 / 内容 / ID / 模型…"
+          placeholder="搜索标题 / 内容 / ID / 模型 / 项目…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
@@ -418,68 +476,98 @@ export function SessionsPage({ onToast }: Props) {
         {!loading && filtered.length === 0 && (
           <p className="hint">没有会话 (在 codex 里用过之后才会生成)。</p>
         )}
-        {filtered.map((s) => (
-          <div
-            key={s.id}
-            className={`row-card clickable ${selected?.id === s.id ? "selected" : ""}`}
-            onClick={() => open(s)}
-          >
-            <div className="row-card-main">
-              <strong>{truncate(s.title, 60)}</strong>
-              <span className="mono dim">
-                {s.id} · {s.model || "—"} · {fmt(s.last_active_ms)}
-                {s.rollups > 1 ? ` · ${s.rollups} 条` : ""}
-                {s.archived ? " · 归档" : ""}
-                {s.isolated ? " · 已隔离 (官方不可见)" : ""}
-              </span>
-            </div>
-            <div className="row-card-actions">
-              {currentModel &&
-                s.model &&
-                s.model !== currentModel &&
-                !currentModels.includes(s.model) && (
-                  <button
-                    className="link-btn"
-                    title="把该会话的模型改为当前供应商默认模型，原模型会自动备份"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      requestRemapModel(s);
+        {groups.map((g) => {
+          const allIsolated = g.sessions.every((s) => s.isolated);
+          const anyIsolated = g.sessions.some((s) => s.isolated);
+          const isCollapsed = collapsed.has(g.key);
+          return (
+            <div key={g.key} className="session-group">
+              <div className="session-group-head">
+                <button
+                  type="button"
+                  className={`group-toggle${isCollapsed ? "" : " open"}`}
+                  onClick={() => toggleGroup(g.key)}
+                  aria-label={isCollapsed ? "展开项目" : "收起项目"}
+                >
+                  <span className="group-plus">+</span>
+                </button>
+                <div className="group-title" onClick={() => toggleGroup(g.key)}>
+                  <strong>{g.name}</strong>
+                  {g.dir && <span className="mono dim">{g.dir}</span>}
+                </div>
+                <label
+                  className={`isolate-check${allIsolated ? " checked" : ""}`}
+                  onClick={(e) => e.stopPropagation()}
+                  title={
+                    allIsolated
+                      ? "取消隔离：官方订阅将可看到该项目下的全部会话"
+                      : "隔离：官方订阅不可见该项目下的全部会话"
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={allIsolated}
+                    disabled={isolatingGroup === g.key}
+                    ref={(el) => {
+                      if (el) el.indeterminate = anyIsolated && !allIsolated;
                     }}
-                  >
-                    用当前模型续聊
-                  </button>
-                )}
-              <label
-                className={`isolate-check${s.isolated ? " checked" : ""}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                }}
-                title={
-                  s.isolated
-                    ? "取消隔离：官方订阅将可看到此线程的全部会话"
-                    : "隔离：官方订阅不可见此线程的全部会话"
-                }
-              >
-                <input
-                  type="checkbox"
-                  checked={s.isolated}
-                  disabled={isolatingId === s.thread_id}
-                  onChange={(e) => {
-                    e.stopPropagation();
-                    requestToggleIsolation(s, e.target.checked);
-                  }}
-                />
-                <span>
-                  {isolatingId === s.thread_id
-                    ? "隔离中…"
-                    : s.isolated
-                      ? "已隔离"
-                      : "隔离"}
-                </span>
-              </label>
+                    onChange={(e) => {
+                      e.stopPropagation();
+                      requestToggleGroupIsolation(g, e.target.checked);
+                    }}
+                  />
+                  <span>
+                    {isolatingGroup === g.key
+                      ? "隔离中…"
+                      : allIsolated
+                        ? "已隔离"
+                        : anyIsolated
+                          ? "部分隔离"
+                          : "隔离"}
+                  </span>
+                </label>
+              </div>
+              {!isCollapsed && (
+                <div className="session-group-body">
+                  {g.sessions.map((s) => (
+                    <div
+                      key={s.id}
+                      className={`row-card clickable ${selected?.id === s.id ? "selected" : ""}`}
+                      onClick={() => open(s)}
+                    >
+                      <div className="row-card-main">
+                        <strong>{truncate(s.title, 60)}</strong>
+                        <span className="mono dim">
+                          {s.id} · {s.model || "—"} · {fmt(s.last_active_ms)}
+                          {s.rollups > 1 ? ` · ${s.rollups} 条` : ""}
+                          {s.archived ? " · 归档" : ""}
+                          {s.isolated ? " · 已隔离 (官方不可见)" : ""}
+                        </span>
+                      </div>
+                      <div className="row-card-actions">
+                        {currentModel &&
+                          s.model &&
+                          s.model !== currentModel &&
+                          !currentModels.includes(s.model) && (
+                            <button
+                              className="link-btn"
+                              title="把该会话的模型改为当前供应商默认模型，原模型会自动备份"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                requestRemapModel(s);
+                              }}
+                            >
+                              用当前模型续聊
+                            </button>
+                          )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
-          </div>
-        ))}
+          );
+        })}
       </section>
 
       <section className="card session-detail">

@@ -115,6 +115,10 @@ export interface SessionMeta {
   preview: string;
   /** 该线程包含的 rollout 文件数 (续聊/子任务已合并) */
   rollups: number;
+  /** 线程工作目录 (项目目录, 官方侧边栏按它分组) */
+  cwd: string;
+  /** 注册项目名 (local-projects 匹配到 cwd 的名称; 空 = 未注册项目) */
+  project: string;
 }
 
 /** 统一历史迁移候选 (仍停留在 "openai" 桶的旧官方会话) */

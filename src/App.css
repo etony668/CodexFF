@@ -394,6 +394,57 @@ button.danger.armed:hover:not(:disabled) {
   overflow-y: auto;
 }
 
+.session-group { margin-bottom: 10px; }
+.session-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-card);
+  cursor: pointer;
+}
+.session-group-head:hover { border-color: var(--accent); }
+.group-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  flex-shrink: 0;
+  min-height: 0;
+}
+.group-toggle .group-plus {
+  display: inline-block;
+  font-size: 14px;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+.group-toggle.open .group-plus { transform: rotate(45deg); }
+.group-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+  text-align: left;
+}
+.group-title strong { font-size: 13px; }
+.group-title .mono { font-size: 11px; }
+.session-group-body {
+  margin: 6px 0 0 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .session-lines { display: flex; flex-direction: column; gap: 8px; }
 .session-line {
   border: 1px solid var(--border);
