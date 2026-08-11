@@ -363,6 +363,12 @@ fn list_workflow_models() -> Result<Vec<String>, ApiError> {
     Ok(workflow::list_catalog_models())
 }
 
+/// 高效工作流可选模型来源 (各供应商已保存模型 + 官方订阅)
+#[tauri::command]
+fn list_workflow_model_sources() -> Result<Vec<workflow::WorkflowModelSource>, ApiError> {
+    Ok(workflow::list_model_sources())
+}
+
 #[tauri::command]
 fn install_workflow_preset(kind: String) -> Result<workflow::WorkflowAgentInfo, ApiError> {
     Ok(workflow::install_workflow_preset(&kind)?)
@@ -890,6 +896,7 @@ pub fn run() {
             cancel_pet_command_install,
             list_workflow_agents,
             list_workflow_models,
+            list_workflow_model_sources,
             install_workflow_preset,
             update_workflow_preset,
             reset_workflow_presets,

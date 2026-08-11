@@ -9,7 +9,7 @@
 //! 无法续聊。本模块负责把这两个绑定一起迁移，并持久化原模型用于切回恢复。
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,45 +245,60 @@ fn resolve_rollout_files(rollout_path: &str) -> Vec<PathBuf> {
     out
 }
 
-/// 快速字节预扫描：文件里是否出现 `"model":"<old>"`（serde_json 紧凑格式）。
-/// GB 级 JSONL 大部分其实不包含目标模型名，先做一次廉价扫描，命中才整份重写，
-/// 避免每次切换都把所有会话文件读+写一遍（几十 GB 变成几秒）。
-fn file_contains_model_binding(path: &Path, old_model: &str) -> std::io::Result<bool> {
-    if old_model.is_empty() {
-        return Ok(true);
-    }
-    let needle = format!("\"model\":\"{old_model}\"");
-    let needle = needle.as_bytes();
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = [0u8; 256 * 1024];
-    let mut carry: Vec<u8> = Vec::with_capacity(needle.len() + 64);
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        carry.extend_from_slice(&buf[..n]);
-        if carry.len() >= needle.len()
-            && carry.windows(needle.len()).any(|w| w == needle)
-        {
-            return Ok(true);
-        }
-        // 保留末尾 needle.len()-1 字节，覆盖跨块边界
-        let keep = needle.len().saturating_sub(1);
-        if carry.len() > keep {
-            carry.drain(..carry.len() - keep);
-        }
-    }
-    Ok(false)
+fn is_special_model(model: &str) -> bool {
+    model == "codex-auto-review"
 }
 
-/// 把 rollout 里所有 `thread_settings_applied` 的模型绑定从 old 改为 new。
+/// 递归修正 thread_settings 内的模型绑定。Codex 新版会把当前协作代理模型
+/// 放在 collaboration_mode.settings 中，不能只改最外层 model。
+fn rewrite_settings_models(
+    value: &mut Value,
+    new_model: &str,
+    new_effort: Option<&str>,
+    supported: &[String],
+) -> bool {
+    let mut changed = false;
+    match value {
+        Value::Object(obj) => {
+            let replace_here = obj
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|model| {
+                    !model.is_empty()
+                        && !is_special_model(model)
+                        && !supported.iter().any(|m| m == model)
+                })
+                .unwrap_or(false);
+            if replace_here {
+                obj.insert("model".into(), Value::String(new_model.to_string()));
+                if let Some(effort) = new_effort {
+                    obj.insert("reasoning_effort".into(), Value::String(effort.to_string()));
+                } else {
+                    obj.remove("reasoning_effort");
+                }
+                changed = true;
+            }
+            for child in obj.values_mut() {
+                changed |= rewrite_settings_models(child, new_model, new_effort, supported);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                changed |= rewrite_settings_models(child, new_model, new_effort, supported);
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+/// 把 rollout 里所有 `thread_settings_applied` 的不兼容模型绑定改为目标模型。
 /// 流式改写（GB 级文件不会整体载入内存），失败时删除临时文件、原文件不动。
 fn rewrite_rollout_models(
     path: &Path,
-    old_model: &str,
     new_model: &str,
     new_effort: Option<&str>,
+    supported: &[String],
 ) -> Result<(), ModelRemapError> {
     if !path.is_file() {
         return Ok(());
@@ -312,19 +327,9 @@ fn rewrite_rollout_models(
                     let settings = v
                         .get_mut("payload")
                         .and_then(|p| p.get_mut("thread_settings"))
-                        .and_then(|s| s.as_object_mut());
+                        .filter(|s| s.is_object());
                     if let Some(s) = settings {
-                        let m = s.get("model").and_then(|x| x.as_str()).unwrap_or("");
-                        if m == old_model {
-                            s.insert("model".to_string(), Value::String(new_model.to_string()));
-                            if let Some(e) = new_effort {
-                                s.insert(
-                                    "reasoning_effort".to_string(),
-                                    Value::String(e.to_string()),
-                                );
-                            } else if s.contains_key("reasoning_effort") {
-                                s.remove("reasoning_effort");
-                            }
+                        if rewrite_settings_models(s, new_model, new_effort, supported) {
                             changed = serde_json::to_string(&v)
                                 .map_err(|e| ModelRemapError::Other(e.to_string()))?;
                             changed.push('\n');
@@ -438,12 +443,7 @@ pub fn apply_remap(
                 }
                 if let Some(rel) = &st.rollout_path {
                     for f in resolve_rollout_files(rel) {
-                        file_jobs.push((
-                            f,
-                            st.model.clone(),
-                            new_model.clone(),
-                            new_effort.clone(),
-                        ));
+                        file_jobs.push((f, new_model.clone(), new_effort.clone()));
                     }
                 }
                 restored += 1;
@@ -481,7 +481,7 @@ pub fn apply_remap(
             }
             if let Some(rel) = &st.rollout_path {
                 for f in resolve_rollout_files(rel) {
-                    file_jobs.push((f, st.model.clone(), new_model.clone(), new_effort.clone()));
+                    file_jobs.push((f, new_model.clone(), new_effort.clone()));
                 }
             }
             remapped += 1;
@@ -493,9 +493,9 @@ pub fn apply_remap(
     save_remaps(&remaps)?;
     // rollout 里的 thread_settings 是次要绑定（桌面端续聊以 state DB 为准）。
     // 改写失败只告警不阻断，避免单个文件异常导致整个切换回滚。
-    // 去重后并发处理：预扫描跳过未命中的大文件，命中才整份流式重写。
-    let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
-    file_jobs.retain(|(p, old, _, _)| seen.insert((p.clone(), old.clone())));
+    // 去重后并发、单次流式处理。旧实现先预扫描再重写，命中文件会完整读取两遍。
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    file_jobs.retain(|(p, _, _)| seen.insert(p.clone()));
     let total = file_jobs.len();
     if total > 0 {
         let done = Arc::new(AtomicUsize::new(0));
@@ -510,26 +510,19 @@ pub fn apply_remap(
                         let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         q.pop_front()
                     };
-                    let Some((path, old_model, new_model, new_effort)) = job else {
+                    let Some((path, new_model, new_effort)) = job else {
                         break;
                     };
-                    // 预扫描：模型绑定字符串不存在就直接跳过（大文件无谓读写的主因）
-                    let matched = file_contains_model_binding(&path, &old_model)
-                        .unwrap_or(true); // 读失败保守按命中走，交给原逻辑告警
-                    if matched {
-                        if let Err(e) =
-                            rewrite_rollout_models(&path, &old_model, &new_model, new_effort.as_deref())
-                        {
-                            log::warn!("改写会话模型绑定失败 {}: {e}", path.display());
-                        }
+                    if let Err(e) =
+                        rewrite_rollout_models(&path, &new_model, new_effort.as_deref(), supported)
+                    {
+                        log::warn!("改写会话模型绑定失败 {}: {e}", path.display());
                     }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     progress(RemapProgress {
                         done: d,
                         total,
-                        current: path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned()),
+                        current: path.file_name().map(|n| n.to_string_lossy().into_owned()),
                     });
                 });
             }
@@ -577,12 +570,18 @@ mod tests {
             ),
         )
         .unwrap();
-        rewrite_rollout_models(&p, "gpt-5.6-luna", "deepseek-v4-flash", Some("high")).unwrap();
+        rewrite_rollout_models(
+            &p,
+            "deepseek-v4-flash",
+            Some("high"),
+            &["deepseek-v4-flash".into(), "deepseek-v4-pro".into()],
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("\"model\":\"deepseek-v4-flash\""));
         assert!(text.contains("\"reasoning_effort\":\"high\""));
-        assert!(text.contains("\"model\":\"gpt-5.6-sol\""));
         assert!(!text.contains("gpt-5.6-luna"));
+        assert!(!text.contains("gpt-5.6-sol"));
     }
 
     #[test]
@@ -593,21 +592,27 @@ mod tests {
     }
 
     #[test]
-    fn contains_model_binding_detects_hits_and_skips_misses() {
+    fn rollout_nested_collaboration_model_rewritten() {
         let dir = tempfile::tempdir().unwrap();
-        let hit = dir.path().join("hit.jsonl");
-        let miss = dir.path().join("miss.jsonl");
-        std::fs::write(&hit, "{\"payload\":{\"model\":\"gpt-5.6-luna\"}}\n").unwrap();
-        std::fs::write(&miss, "{\"payload\":{\"model\":\"gpt-5.6-sol\"}}\n").unwrap();
-        assert!(file_contains_model_binding(&hit, "gpt-5.6-luna").unwrap());
-        assert!(!file_contains_model_binding(&miss, "gpt-5.6-luna").unwrap());
-        assert!(file_contains_model_binding(&dir.path().join("nope.jsonl"), "x").is_err());
-
-        // 跨块边界：needle 起点在 256KB 缓冲末尾，横跨下一个块
-        let big = dir.path().join("big.jsonl");
-        let prefix = "a".repeat((256 * 1024) - 10);
-        std::fs::write(&big, format!("{prefix}\"model\":\"gpt-5.6-luna\"")).unwrap();
-        assert!(file_contains_model_binding(&big, "gpt-5.6-luna").unwrap());
+        let p = dir.path().join("nested.jsonl");
+        std::fs::write(
+            &p,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_settings\":{\"model\":\"gpt-5.5\",\"reasoning_effort\":\"high\",\"collaboration_mode\":{\"settings\":{\"model\":\"deepseek-v4-flash\",\"reasoning_effort\":\"low\"}},\"review\":{\"model\":\"codex-auto-review\"}}}}\n",
+        )
+        .unwrap();
+        rewrite_rollout_models(
+            &p,
+            "gpt-5.6-luna",
+            Some("max"),
+            &["gpt-5.5".into(), "gpt-5.6-luna".into()],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("\"model\":\"gpt-5.5\""));
+        assert!(text.contains("\"model\":\"gpt-5.6-luna\""));
+        assert!(text.contains("\"reasoning_effort\":\"max\""));
+        assert!(text.contains("\"model\":\"codex-auto-review\""));
+        assert!(!text.contains("deepseek-v4-flash"));
     }
 
     #[test]

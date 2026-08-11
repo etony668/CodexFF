@@ -242,8 +242,8 @@ pub fn write_official_config(
 /// base_url = "<中转地址>"
 /// wire_api = "responses"                    # chat | responses | anthropic
 /// requires_openai_auth = true               # 认证走 auth.json 的 OPENAI_API_KEY
-/// model_context_window = 400000             # 可选 — 上下文窗口 (默认 128k, 官方模型 400k)
-/// model_auto_compact_token_limit = 360000   # 可选 — 超限自动压缩阈值
+/// model_context_window = 1000000            # 可选 — 上下文窗口 (显式值优先)
+/// model_auto_compact_token_limit = 800000   # 可选 — 超限自动压缩阈值
 /// codexff_relay = true                      # 归属标记, 切换回官方时清理
 /// ```
 ///
@@ -471,17 +471,53 @@ fn set_codex_model_catalog_field(doc: &mut DocumentMut, enable: bool) {
 
 /// 落盘 DeepSeek 官方模型目录 (models.json 拷贝, 与官方一键脚本同源)。
 /// 没有它 Codex 不认识 deepseek-v4-flash, 桌面端模型选择器回退显示内置 gpt-5.6。
-fn write_deepseek_model_catalog() -> Result<(), CodexConfigError> {
+fn write_deepseek_model_catalog(
+    context_window: Option<u64>,
+    auto_compact_limit: Option<u64>,
+) -> Result<(), CodexConfigError> {
     let path = codex_config_dir().join(CODEXFF_MODEL_CATALOG_FILENAME);
-    let content = include_str!("resources/codex_deepseek_catalog_template.json");
+    let mut root: Value = serde_json::from_str(include_str!(
+        "resources/codex_deepseek_catalog_template.json"
+    ))?;
+    if let Some(models) = root.get_mut("models").and_then(Value::as_array_mut) {
+        for model in models {
+            let Some(obj) = model.as_object_mut() else {
+                continue;
+            };
+            let template_window = obj
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .unwrap_or(1_048_576);
+            let window = context_window.unwrap_or(template_window);
+            let compact = auto_compact_limit.unwrap_or(window.saturating_mul(80) / 100);
+            obj.insert("context_window".into(), Value::from(window));
+            obj.insert("max_context_window".into(), Value::from(window));
+            obj.insert("auto_compact_token_limit".into(), Value::from(compact));
+        }
+    }
+    let content = serde_json::to_string_pretty(&root)?;
     vault::atomic_write_bytes(&path, content.as_bytes()).map_err(CodexConfigError::Vault)
 }
 
 /// 官方订阅模型目录 (供高效工作流模型下拉使用; 不注入 config 的
 /// model_catalog_json 字段, 官方 Codex 用内置模型列表, 我们只维护自己的下拉)
+pub const OFFICIAL_MODEL_SLUGS: [&str; 7] = [
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.2-codex",
+    "gpt-5.2-codex-mini",
+    "gpt-5.1-codex",
+    "gpt-5-codex",
+];
+
 fn write_official_model_catalog() -> Result<(), CodexConfigError> {
     let path = codex_config_dir().join(CODEXFF_MODEL_CATALOG_FILENAME);
-    let content = r#"{"models":[{"slug":"gpt-5.6-luna"},{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.6-terra"},{"slug":"gpt-5.2-codex"},{"slug":"gpt-5.2-codex-mini"},{"slug":"gpt-5.1-codex"},{"slug":"gpt-5-codex"}]}"#;
+    let models: Vec<Value> = OFFICIAL_MODEL_SLUGS
+        .iter()
+        .map(|s| serde_json::json!({ "slug": s }))
+        .collect();
+    let content = serde_json::to_string(&serde_json::json!({ "models": models }))?;
     vault::atomic_write_bytes(&path, content.as_bytes()).map_err(CodexConfigError::Vault)
 }
 
@@ -502,6 +538,7 @@ fn remove_our_model_catalog() -> Result<(), CodexConfigError> {
 pub fn write_relay_model_catalog(
     models: &[String],
     context_window: Option<u64>,
+    auto_compact_limit: Option<u64>,
 ) -> Result<(), CodexConfigError> {
     let template_text = include_str!("resources/codex_deepseek_catalog_template.json");
     let mut root: Value = serde_json::from_str(template_text)?;
@@ -515,12 +552,22 @@ pub fn write_relay_model_catalog(
             "模型目录模板为空",
         )));
     };
-    let ctx = context_window.unwrap_or(128_000);
     let mut entries = Vec::new();
     for (idx, slug) in models.iter().enumerate() {
         if slug.trim().is_empty() {
             continue;
         }
+        let normalized = slug.trim().to_ascii_lowercase();
+        let inferred_window =
+            if normalized.starts_with("gpt-5.6") || normalized.starts_with("gpt-5.5") {
+                1_000_000
+            } else if normalized.starts_with("deepseek-v4") {
+                1_048_576
+            } else {
+                128_000
+            };
+        let ctx = context_window.unwrap_or(inferred_window);
+        let compact = auto_compact_limit.unwrap_or_else(|| ctx.saturating_mul(80) / 100);
         let mut m = template.clone();
         let obj = m.as_object_mut().ok_or_else(|| {
             CodexConfigError::Io(std::io::Error::new(
@@ -539,17 +586,36 @@ pub fn write_relay_model_catalog(
         );
         obj.insert("context_window".to_string(), Value::from(ctx));
         obj.insert("max_context_window".to_string(), Value::from(ctx));
-        obj.insert(
-            "auto_compact_token_limit".to_string(),
-            Value::from(ctx.saturating_mul(90) / 100),
-        );
+        obj.insert("auto_compact_token_limit".to_string(), Value::from(compact));
+        let is_gpt_reasoning =
+            normalized.starts_with("gpt-5.") && !normalized.starts_with("gpt-image-");
+        if is_gpt_reasoning {
+            obj.insert(
+                "input_modalities".to_string(),
+                serde_json::json!(["text", "image"]),
+            );
+            obj.insert(
+                "supports_image_detail_original".to_string(),
+                Value::Bool(true),
+            );
+        }
         obj.insert(
             "supported_reasoning_levels".to_string(),
-            serde_json::json!([
-                {"effort": "low", "description": "Fast responses with lighter reasoning"},
-                {"effort": "medium", "description": "Balanced reasoning depth"},
-                {"effort": "high", "description": "Extra high reasoning depth for complex problems"}
-            ]),
+            if is_gpt_reasoning {
+                serde_json::json!([
+                    {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                    {"effort": "medium", "description": "Balanced reasoning depth"},
+                    {"effort": "high", "description": "Deep reasoning for complex problems"},
+                    {"effort": "xhigh", "description": "Extra high reasoning depth"},
+                    {"effort": "max", "description": "Maximum reasoning depth"}
+                ])
+            } else {
+                serde_json::json!([
+                    {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                    {"effort": "medium", "description": "Balanced reasoning depth"},
+                    {"effort": "high", "description": "Extra high reasoning depth for complex problems"}
+                ])
+            },
         );
         obj.insert(
             "default_reasoning_level".to_string(),
@@ -567,7 +633,7 @@ pub fn write_relay_model_catalog(
 
 /// 中转形态 custom 表 (含归属标记, 切换回官方时按标记清理)。
 /// 上下文窗口字段写在表内 (codex 读 provider 级属性, 与 cc-switch
-/// 手写类预设同位置); None = 不写, codex 用默认 128k。
+/// 手写类预设同位置); None = 不写, 模型目录按模型名称推断。
 fn relay_table(
     display_name: &str,
     base_url: &str,
@@ -678,11 +744,15 @@ pub fn write_relay_config(
     let has_supported = supported_models.map(|m| !m.is_empty()).unwrap_or(false);
     // DeepSeek 官方网关: 落盘模型目录文件 (字段已由 apply_relay_fields 注入)
     if is_deepseek_official_gateway(base_url, wire_api) {
-        write_deepseek_model_catalog()?;
+        write_deepseek_model_catalog(model_context_window, model_auto_compact_token_limit)?;
         set_codex_model_catalog_field(&mut doc, true);
     } else if has_supported {
         // 任意中转: 只显示它真实支持的模型, 避免选了不支持的模型提交才报错
-        write_relay_model_catalog(supported_models.unwrap_or_default(), model_context_window)?;
+        write_relay_model_catalog(
+            supported_models.unwrap_or_default(),
+            model_context_window,
+            model_auto_compact_token_limit,
+        )?;
         set_codex_model_catalog_field(&mut doc, true);
     } else {
         // 未知模型清单: 移除我们的目录文件, 避免下拉残留上一个供应商的模型
@@ -841,6 +911,108 @@ enabled = true
         assert!(
             text.contains("[plugins.\"visualize@openai-bundled\"]"),
             "新插件应来自磁盘实时状态: {text}"
+        );
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn relay_gpt5_catalog_exposes_image_and_full_reasoning() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("codexff-model-catalog-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        write_relay_model_catalog(
+            &["gpt-5.6-luna".into(), "deepseek-v4-flash".into()],
+            Some(200_000),
+            Some(160_000),
+        )
+        .expect("write catalog");
+        let root: Value = serde_json::from_slice(
+            &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
+        )
+        .expect("parse catalog");
+        let models = root["models"].as_array().expect("models");
+        let gpt = models
+            .iter()
+            .find(|m| m["slug"] == "gpt-5.6-luna")
+            .expect("gpt model");
+        assert_eq!(
+            gpt["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(gpt["supports_image_detail_original"], Value::Bool(true));
+        let efforts = gpt["supported_reasoning_levels"]
+            .as_array()
+            .expect("reasoning levels");
+        assert!(efforts.iter().any(|e| e["effort"] == "xhigh"));
+        assert!(efforts.iter().any(|e| e["effort"] == "max"));
+        assert_eq!(gpt["context_window"], Value::from(200_000));
+        assert_eq!(gpt["auto_compact_token_limit"], Value::from(160_000));
+
+        let deepseek = models
+            .iter()
+            .find(|m| m["slug"] == "deepseek-v4-flash")
+            .expect("deepseek model");
+        assert_eq!(deepseek["input_modalities"], serde_json::json!(["text"]));
+        assert_eq!(deepseek["context_window"], Value::from(200_000));
+        assert_eq!(deepseek["auto_compact_token_limit"], Value::from(160_000));
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn relay_catalog_infers_large_context_per_model() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("codexff-model-context-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        write_relay_model_catalog(
+            &[
+                "gpt-5.6-luna".into(),
+                "gpt-5.5".into(),
+                "deepseek-v4-flash".into(),
+                "unknown-model".into(),
+            ],
+            None,
+            None,
+        )
+        .expect("write catalog");
+        let root: Value = serde_json::from_slice(
+            &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
+        )
+        .expect("parse catalog");
+        let models = root["models"].as_array().expect("models");
+        let by_slug = |slug: &str| {
+            models
+                .iter()
+                .find(|m| m["slug"] == slug)
+                .unwrap_or_else(|| panic!("missing {slug}"))
+        };
+        assert_eq!(by_slug("gpt-5.6-luna")["context_window"], 1_000_000);
+        assert_eq!(by_slug("gpt-5.6-luna")["auto_compact_token_limit"], 800_000);
+        assert_eq!(by_slug("gpt-5.5")["context_window"], 1_000_000);
+        assert_eq!(by_slug("deepseek-v4-flash")["context_window"], 1_048_576);
+        assert_eq!(
+            by_slug("deepseek-v4-flash")["auto_compact_token_limit"],
+            838_860
+        );
+        assert_eq!(by_slug("unknown-model")["context_window"], 128_000);
+        assert_eq!(
+            by_slug("unknown-model")["auto_compact_token_limit"],
+            102_400
         );
 
         std::env::remove_var("CODEX_HOME");

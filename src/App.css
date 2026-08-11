@@ -184,6 +184,12 @@ button.danger.armed:hover:not(:disabled) {
 .row-card.clickable { cursor: pointer; }
 .row-card.clickable:hover, .row-card.selected { background: var(--bg-hover); }
 .row-card-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.session-list .row-card-main strong,
+.unify-row .row-card-main strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .row-card-actions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; }
 
 .isolate-check {
@@ -899,6 +905,19 @@ button.danger.armed:hover:not(:disabled) {
   outline: none;
   border-color: var(--accent);
 }
+.wf-source-input {
+  max-width: 180px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+.wf-source-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
 .wf-effort-select {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -1008,7 +1027,7 @@ button .btn-icon {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: var(--text);
+  background: #fff;
   transition: left 0.2s ease;
 }
 .switch.on {

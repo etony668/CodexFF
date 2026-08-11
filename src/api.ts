@@ -468,6 +468,18 @@ export function listWorkflowModels(): Promise<string[]> {
   return invoke("list_workflow_models");
 }
 
+/** 高效工作流可选模型来源 (供应商或官方订阅) */
+export interface WorkflowModelSource {
+  id: string;
+  name: string;
+  models: string[];
+}
+
+/** 高效工作流可选模型来源列表 (各供应商已保存模型 + 官方订阅) */
+export function listWorkflowModelSources(): Promise<WorkflowModelSource[]> {
+  return invoke("list_workflow_model_sources");
+}
+
 /** 安装工作流预设 (覆盖前自动备份) */
 export function installWorkflowPreset(kind: string): Promise<WorkflowAgentInfo> {
   return invoke("install_workflow_preset", { kind });

@@ -35,6 +35,40 @@ pub fn list_catalog_models() -> Vec<String> {
         .collect()
 }
 
+/// 高效工作流可选模型的来源: 已保存供应商的模型清单 + 官方订阅内置模型。
+/// 解决"为即将切换的目标供应商/官方订阅配置 Agent"时读不到目标模型的问题。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowModelSource {
+    pub id: String,
+    pub name: String,
+    pub models: Vec<String>,
+}
+
+pub fn list_model_sources() -> Vec<WorkflowModelSource> {
+    let mut sources = Vec::new();
+    if let Ok(relays) = crate::profiles::list_relay_profiles() {
+        for relay in relays {
+            if relay.supported_models.is_empty() {
+                continue;
+            }
+            sources.push(WorkflowModelSource {
+                id: relay.id,
+                name: relay.name,
+                models: relay.supported_models,
+            });
+        }
+    }
+    sources.push(WorkflowModelSource {
+        id: "official".to_string(),
+        name: "官方订阅".to_string(),
+        models: codex_config::OFFICIAL_MODEL_SLUGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    });
+    sources
+}
+
 /// Codex 支持的思考档位 (含社区常见的 minimal)
 pub const ALLOWED_EFFORTS: [&str; 7] = [
     "minimal", "low", "medium", "high", "xhigh", "max", "ultra",

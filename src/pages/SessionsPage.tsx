@@ -157,11 +157,22 @@ export function SessionsPage({ onToast }: Props) {
     }
     setIsolatingGroup(g.key);
     try {
-      for (const s of g.sessions) {
+      const pending = g.sessions.filter((s) => s.isolated !== isolated);
+      const failures: string[] = [];
+      for (const s of pending) {
         setIsolateStep(
           `${isolated ? "正在隔离" : "正在恢复"} ${truncate(s.title, 40)}…`,
         );
-        await setSessionIsolated(s.thread_id, isolated);
+        try {
+          await setSessionIsolated(s.thread_id, isolated);
+        } catch (e) {
+          failures.push(`${truncate(s.title, 32)}：${errMsg(e)}`);
+        }
+      }
+      if (failures.length > 0) {
+        setErr(
+          `${pending.length - failures.length}/${pending.length} 个会话处理完成；${failures.length} 个失败。${failures[0]}`,
+        );
       }
     } catch (e) {
       const msg = errMsg(e);
@@ -612,14 +623,22 @@ export function SessionsPage({ onToast }: Props) {
         )}
         <div className="session-lines">
           {detail.map((line, i) => {
-            const item = line as { type?: string; payload?: Record<string, unknown> };
-            const text =
-              (item.payload?.text as string) ??
-              (item.payload?.content as unknown) ??
-              "";
+            const item = line as {
+              type?: string;
+              role?: string;
+              text?: string;
+              payload?: Record<string, unknown>;
+            };
+            const text = item.text ?? (item.payload?.text as string) ?? "";
             return (
               <div key={i} className="session-line">
-                <span className="mono dim">{item.type ?? "?"}</span>
+                <span className="mono dim">
+                  {item.role === "user"
+                    ? "用户"
+                    : item.role === "assistant"
+                      ? "模型"
+                      : item.type ?? "?"}
+                </span>
                 <pre>{typeof text === "string" ? truncate(text, 2000) : JSON.stringify(text).slice(0, 2000)}</pre>
               </div>
             );

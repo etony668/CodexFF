@@ -764,7 +764,7 @@ export const codexffPresets: CodexffPreset[] = [
     "category": "third_party",
     "icon": "eflowcode",
     "iconColor": "#000000",
-    "config": "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\npersonality = \"pragmatic\"\n\n[model_providers.custom]\nname = \"E-FlowCode\"\nbase_url = \"https://e-flowcode.cc/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 9000000",
+    "config": "model_provider = \"custom\"\nmodel = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\npersonality = \"pragmatic\"\n\n[model_providers.custom]\nname = \"E-FlowCode\"\nbase_url = \"https://e-flowcode.cc/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 900000",
     "baseUrl": "https://e-flowcode.cc/v1",
     "model": "gpt-5.6-sol",
     "reasoningEffort": "high"

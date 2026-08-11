@@ -6,12 +6,14 @@ import {
   errMsg,
   installWorkflowPreset,
   listWorkflowAgents,
+  listWorkflowModelSources,
   listWorkflowModels,
   resetWorkflowPresets,
   restoreWorkflowPreset,
   uninstallWorkflowPreset,
   updateWorkflowPreset,
 } from "../api";
+import type { WorkflowModelSource } from "../api";
 import type { ToastRequest } from "../FloatingToast";
 
 interface Props {
@@ -72,6 +74,9 @@ export function WorkflowPage({ onToast }: Props) {
   const [editModel, setEditModel] = useState("");
   const [editEffort, setEditEffort] = useState("high");
   const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [modelSources, setModelSources] = useState<WorkflowModelSource[]>([]);
+  /** 编辑时模型来源: "current" = 当前供应商, 否则为供应商/官方 id */
+  const [editSource, setEditSource] = useState("current");
 
   async function refresh() {
     try {
@@ -90,6 +95,9 @@ export function WorkflowPage({ onToast }: Props) {
   useEffect(() => {
     listWorkflowModels()
       .then((m) => setModelOptions(m.filter(Boolean)))
+      .catch(() => {});
+    listWorkflowModelSources()
+      .then(setModelSources)
       .catch(() => {});
   }, []);
 
@@ -176,6 +184,7 @@ export function WorkflowPage({ onToast }: Props) {
     setEditing(a.id);
     setEditModel(a.model ?? DEFAULT_CONFIG[a.id]?.model ?? "");
     setEditEffort(a.reasoning_effort ?? DEFAULT_CONFIG[a.id]?.effort ?? "high");
+    setEditSource("current");
   }
 
   async function saveEdit(kind: string) {
@@ -363,10 +372,14 @@ export function WorkflowPage({ onToast }: Props) {
                 ? `${a.model} · ${EFFORT_LABELS[a.reasoning_effort] ?? a.reasoning_effort}`
                 : meta?.model ?? "";
             const isEditing = editing === a.id;
+            const sourceModels =
+              editSource === "current"
+                ? modelOptions
+                : (modelSources.find((s) => s.id === editSource)?.models ?? []);
             const modelSelectOptions = Array.from(
               new Set(
                 [
-                  ...(modelOptions.length > 0 ? modelOptions : FALLBACK_MODELS),
+                  ...(sourceModels.length > 0 ? sourceModels : FALLBACK_MODELS),
                   editModel,
                   DEFAULT_CONFIG[a.id]?.model,
                 ].filter((m): m is string => !!m),
@@ -390,6 +403,20 @@ export function WorkflowPage({ onToast }: Props) {
                   <span className="hint">{meta?.role ?? a.description}</span>
                   {isEditing ? (
                     <div className="wf-edit-row">
+                      <select
+                        className="wf-source-input"
+                        value={editSource}
+                        onChange={(e) => setEditSource(e.target.value)}
+                        disabled={busy}
+                        title="模型来源：选择即将切换的目标供应商或官方订阅"
+                      >
+                        <option value="current">当前供应商</option>
+                        {modelSources.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.name}
+                          </option>
+                        ))}
+                      </select>
                       <select
                         className="wf-model-input"
                         value={editModel}

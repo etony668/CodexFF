@@ -305,6 +305,25 @@ fn walk_jsonl(
     }
 }
 
+/// 与 Codex 侧边栏一致: 标题折叠为单行 (换行/连续空白 → 单个空格)。
+/// 避免 state DB 里未生成短标题的线程直接把首条消息原样展示成多行内容。
+pub(crate) fn normalize_title(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            pending_ws = true;
+        } else {
+            if pending_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_ws = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Codex 状态库中隔离线程的备份表名 (隔离时把线程索引搬到这里, 恢复时搬回)
 const THREADS_ISOLATED_TABLE: &str = "threads_codexff_isolated";
 const SECTIONS_ISOLATED_TABLE: &str = "thread_sections_codexff_isolated";
@@ -1085,9 +1104,12 @@ pub fn set_session_isolated_with_progress(
             "非法线程 ID",
         )));
     }
+    let previous_items = load_isolated();
+    let already_marked = previous_items.iter().any(|i| i.thread_id == thread_id);
     // 保护: 正在写入的活跃线程不允许隔离 — 会话文件被移动会导致
-    // 续聊失败或 Codex 原子重写时线程分裂。
-    if isolated {
+    // 续聊失败或 Codex 原子重写时线程分裂。已标记的会话允许幂等同步，
+    // 避免项目批量隔离被第一个已隔离会话的近期写入时间中断。
+    if isolated && !already_marked {
         progress("检查会话状态…");
         for (src, _, _) in thread_files(thread_id) {
             if let Ok(meta) = std::fs::metadata(&src) {
@@ -1106,7 +1128,6 @@ pub fn set_session_isolated_with_progress(
             }
         }
     }
-    let previous_items = load_isolated();
     let mut items = previous_items.clone();
     items.retain(|i| i.thread_id != thread_id);
     if isolated {
@@ -1285,11 +1306,10 @@ pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
     let projects = load_registered_projects();
     let mut sessions = Vec::new();
 
-    let roots: [(std::path::PathBuf, bool, bool); 4] = [
+    // 只扫活跃会话: 归档会话 (archived_sessions / 金库归档区) 不展示在会话管理。
+    let roots: [(std::path::PathBuf, bool, bool); 2] = [
         (codex_config::codex_sessions_paths()[0].clone(), false, false),
-        (codex_config::codex_sessions_paths()[1].clone(), true, false),
         (quarantine_root(false), false, true),
-        (quarantine_root(true), true, true),
     ];
     for (root, archived, isolated) in roots {
         if !root.exists() {
@@ -1480,6 +1500,7 @@ fn parse_session(
             }
         })
         .unwrap_or_else(|| id.clone());
+    let title = normalize_title(&title);
 
     let rel = path
         .strip_prefix(root)
@@ -1587,6 +1608,10 @@ pub(crate) fn load_thread_models() -> HashMap<String, String> {
 /// 路径安全: 仅允许 sessions/ 或 archived_sessions/ 内的相对路径 —
 /// canonicalize 后校验前缀, 拒绝 `..`/绝对路径/符号链接逃逸。
 /// 同时修复 archived 会话 (相对路径按归档根解析) 找不到文件的问题。
+///
+/// 返回内容已过滤: 只保留真实用户提问与模型回复 (response_item.message 的
+/// user/assistant 消息 + event_msg.user_message), 过滤 session_meta、状态
+/// event_msg、工具调用、推理过程与系统注入上下文。
 pub fn session_detail(path: &str, max_lines: usize) -> Result<Vec<Value>, SessionError> {
     if path.contains("..") {
         return Err(SessionError::Io(std::io::Error::new(
@@ -1638,10 +1663,118 @@ pub fn session_detail(path: &str, max_lines: usize) -> Result<Vec<Value>, Sessio
             continue;
         }
         if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            out.push(v);
+            if let Some(msg) = readable_detail_message(&v) {
+                // 同一消息可能同时以 event_msg.user_message 与
+                // response_item.message 出现 → 相邻去重, 保留历史顺序
+                let dup = out
+                    .last()
+                    .map(|last: &Value| {
+                        last.get("role").and_then(Value::as_str)
+                            == msg.get("role").and_then(Value::as_str)
+                            && last.get("text").and_then(Value::as_str)
+                                == msg.get("text").and_then(Value::as_str)
+                    })
+                    .unwrap_or(false);
+                if !dup {
+                    out.push(msg);
+                }
+            }
         }
     }
     Ok(out)
+}
+
+/// 把一行会话记录转换成可读消息 {type:"message", role, text}。
+/// 只保留真实提问与模型回复, 其余全部过滤。
+fn readable_detail_message(v: &Value) -> Option<Value> {
+    let ty = v.get("type").and_then(Value::as_str)?;
+    match ty {
+        "response_item" => {
+            let payload = v.get("payload")?;
+            if payload.get("type").and_then(Value::as_str) != Some("message") {
+                return None;
+            }
+            let role = payload.get("role").and_then(Value::as_str)?;
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let text = extract_content_text(payload.get("content")?)?;
+            if is_system_injected(&text) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "message",
+                "role": role,
+                "text": text,
+            }))
+        }
+        "event_msg" => {
+            let payload = v.get("payload")?;
+            if payload.get("type").and_then(Value::as_str) != Some("user_message") {
+                return None;
+            }
+            let text = payload.get("message").and_then(Value::as_str)?.to_string();
+            if is_system_injected(&text) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "text": text,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// 从 message content 数组提取纯文本 (input_text / output_text)。
+fn extract_content_text(content: &Value) -> Option<String> {
+    let arr = content.as_array()?;
+    let mut parts = Vec::new();
+    for item in arr {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            parts.push(text.to_string());
+        } else if let Some(text) = item.get("input_text").and_then(Value::as_str) {
+            parts.push(text.to_string());
+        } else if let Some(text) = item.get("output_text").and_then(Value::as_str) {
+            parts.push(text.to_string());
+        } else if let Some(text) = item.get("partial_text").and_then(Value::as_str) {
+            parts.push(text.to_string());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+/// 系统注入标记: Codex 会把环境/权限/技能/模型切换等上下文作为 user 消息
+/// 注入, 这些不是用户真实提问, 会话详情里要过滤掉。
+fn is_system_injected(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<environment_context>",
+        "<permissions",
+        "<skills_instructions>",
+        "<app-context>",
+        "<model_switch>",
+        "<collaboration_mode>",
+        "<multi_agent_mode>",
+        "<user_reminder>",
+        "<system_reminder>",
+        "<turn_aborted>",
+        "<dev_turn_aborted>",
+        "<system_warning>",
+        "<thread_context>",
+        "<task_info>",
+        "<agents_context>",
+        "<request_action>",
+        "<attachments>",
+        "<context>",
+        "<tool_use_restriction>",
+    ];
+    let trimmed = text.trim_start();
+    MARKERS.iter().any(|m| trimmed.starts_with(m))
 }
 
 #[cfg(test)]
@@ -1750,6 +1883,16 @@ mod tests {
     }
 
     #[test]
+    fn title_normalization_collapses_lines() {
+        assert_eq!(
+            normalize_title("第一行\n\n第二行\t[1] user: x"),
+            "第一行 第二行 [1] user: x"
+        );
+        assert_eq!(normalize_title("  前后 空白  "), "前后 空白");
+        assert_eq!(normalize_title("普通标题"), "普通标题");
+    }
+
+    #[test]
     fn db_isolation_without_optional_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.sqlite");
@@ -1801,5 +1944,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!((main, backup), (1, 0));
+    }
+
+    #[test]
+    fn detail_only_keeps_real_user_and_assistant_messages() {
+        let user = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "帮我改一下"}]
+            }
+        });
+        let assistant = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "好的，改好了。"}]
+            }
+        });
+        let developer = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "You are /root"}]
+            }
+        });
+        let injected = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<environment_context>\n  <cwd>/tmp</cwd>"}]
+            }
+        });
+        let permissions = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<permissions instructions>\nSandbox is read-only."}]
+            }
+        });
+        let event_user = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "只审计功能，不修改。"}
+        });
+        let token_count = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"model_context_window": 121600}}
+        });
+        let tool_call = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "function_call", "name": "exec_command"}
+        });
+        let meta = serde_json::json!({"type": "session_meta", "payload": {}});
+
+        let kept: Vec<Value> = [
+            user,
+            assistant,
+            developer,
+            injected,
+            permissions,
+            event_user,
+            token_count,
+            tool_call,
+            meta,
+        ]
+        .iter()
+        .filter_map(readable_detail_message)
+        .collect();
+
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0]["role"], "user");
+        assert_eq!(kept[0]["text"], "帮我改一下");
+        assert_eq!(kept[1]["role"], "assistant");
+        assert_eq!(kept[1]["text"], "好的，改好了。");
+        assert_eq!(kept[2]["role"], "user");
+        assert_eq!(kept[2]["text"], "只审计功能，不修改。");
     }
 }

@@ -11,26 +11,15 @@ node_modules
 dist
 dist-ssr
 src-tauri/target
+license-tool/target
 *.local
 src-tauri/license-key/
 
-# 用户本地素材与敏感配置
+# 用户本地素材 (截图/示意图源文件, 不入库; App 使用 src/assets 里的副本)
 images/
-.claude/
-.env
-.env.*
-*.pem
-*.key
-*.p12
-*.dmg
-*.ipa
 
-# 付费/内部基础设施不入库
-cloudflare/
-cloudflare-download/
-license-tool/
-license-tool-mac/
-pay/
+# 本地 Claude Code 授权配置 (可能含密钥, 不入库)
+.claude/settings.local.json
 
 # Editor directories and files
 .vscode/*

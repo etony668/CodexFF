@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 
 const root = join(import.meta.dirname, "..");
 const versionFile = join(root, "version.txt");
-const helperSrc = join(root, "src-tauri/helpers/CodexFF.c");
+const helperSrc = join(root, "src-tauri/helpers/CodexFF.m");
 const helperBin = join(root, "src-tauri/target/release/helper/CodexFF");
 const bundleApp = join(
   root,
@@ -16,7 +16,7 @@ const bundleApp = join(
 // 编译管理员授权助手 (CodexFF), 打包进 App 的 Resources/helpers
 mkdirSync(join(helperBin, ".."), { recursive: true });
 execSync(
-  `clang -framework Security -O2 -o "${helperBin}" "${helperSrc}"`,
+  `clang -framework Foundation -fobjc-arc -O2 -o "${helperBin}" "${helperSrc}"`,
   { stdio: "inherit" },
 );
 try {
