@@ -630,6 +630,21 @@ pub fn status() -> RouterStatus {
     }
 }
 
+/// Codex 是否仍指向本地路由 (config 的 base_url 被改写且未还原)。
+///
+/// 只要 Codex 还在用本地地址, 无论路由服务当前是否存活都不能退出 App —
+/// Codex 不重读 config, 直接退出后下一请求会打到已关闭的本地端口 → 502。
+pub fn codex_points_at_router() -> bool {
+    let s = load_state();
+    if s.enabled || s.rewritten {
+        return true;
+    }
+    if let Some(url) = current_config_base_url() {
+        return url.contains("127.0.0.1") || url.contains("localhost");
+    }
+    false
+}
+
 /// App 退出时同步收尾: 先还原 config 里的 base_url (Codex 新请求立即回到
 /// 真实中转地址), 再停止代理 — 顺序不能反, 否则 Codex 请求会打到正在关闭
 /// 的本地端口导致会话连接失败。路由未开启时直接跳过。

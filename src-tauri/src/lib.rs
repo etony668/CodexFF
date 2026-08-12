@@ -1033,7 +1033,7 @@ pub fn run() {
             use tauri::Emitter;
             let force = FORCE_EXIT.load(std::sync::atomic::Ordering::Relaxed);
             if !force
-                && local_router::status().enabled
+                && local_router::codex_points_at_router()
                 && crate::session_manager::codex_running()
             {
                 api.prevent_exit();
