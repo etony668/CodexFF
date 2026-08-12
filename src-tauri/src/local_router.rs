@@ -643,6 +643,19 @@ pub fn shutdown() {
     save_state(&s);
 }
 
+/// 官方模式下彻底关闭本地路由: 官方 config 已写入, 不能再把改写前的
+/// 中转 base_url 还原回去覆盖官方配置 — 先清空改写记录, 再停止服务。
+pub async fn disable_for_official() -> Result<RouterStatus, String> {
+    {
+        let mut s = load_state();
+        s.rewritten = false;
+        s.original_base_url = None;
+        s.rewrote_profile = None;
+        save_state(&s);
+    }
+    set_enabled(false).await
+}
+
 /// 启动/停止本地路由 (接入开关完成后, 还会改写激活供应商 base_url)
 pub async fn set_enabled(enabled: bool) -> Result<RouterStatus, String> {
     if enabled {

@@ -205,8 +205,8 @@ async fn activate_official(
         let _ = ip_guard::record_official_activation(ip);
     });
     drop(handle);
-    // 本地路由开启时, 官方模式无需改写 base_url (还原真实配置)
-    local_router::sync_active();
+    // 官方模式不再需要本地路由: 彻底关闭 (不还原中转 base_url, 官方 config 已生效)
+    let _ = local_router::disable_for_official().await;
     let _ = app.emit("provider-changed", ());
     Ok(result)
 }
