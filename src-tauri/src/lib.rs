@@ -94,6 +94,10 @@ struct AppStatus {
 /// 本地路由必须开启做请求层清洗, 防止实例重启/切换流程漏开导致直连中转报错。
 static ROUTER_HEAL_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// 用户明确“仍然退出”标记: 绕过退出拦截 (路由开启 + Codex 运行中)。
+static FORCE_EXIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[tauri::command]
 async fn get_status() -> Result<AppStatus, ApiError> {
     let active = profiles::current_active().ok();
@@ -436,6 +440,13 @@ fn restore_workflow_preset(kind: String) -> Result<workflow::WorkflowAgentInfo, 
 /// 退出整个应用 (首次引导关闭按钮使用; 托盘常驻场景下不隐藏, 直接退出)
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+/// 用户确认“仍然退出”: 设强制标记后退出, 绕过 Codex 运行中的拦截。
+#[tauri::command]
+fn force_quit_app(app: tauri::AppHandle) {
+    FORCE_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
     app.exit(0);
 }
 
@@ -956,6 +967,7 @@ pub fn run() {
             get_official_quota,
             check_ip_type,
             get_switch_stats,
+            force_quit_app,
         ])
         .setup(|app| {
             #[cfg(desktop)]
@@ -1014,7 +1026,23 @@ pub fn run() {
         if let tauri::RunEvent::Reopen { .. } = event {
             tray::show_main_window(app_handle);
         }
-        // 退出前还原本地路由的 base_url 改写, 避免 Codex 指向已停止的代理
+        // 退出拦截: 本地路由正在为 Codex 转发时, 直接退出会让 Codex 下一请求
+        // 打到已关闭的本地端口 → 502/会话连接失败。提示用户先退出 Codex;
+        // 用户选择“仍然退出”时 FORCE_EXIT=true 放行。
+        if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
+            use tauri::Emitter;
+            let force = FORCE_EXIT.load(std::sync::atomic::Ordering::Relaxed);
+            if !force
+                && local_router::status().enabled
+                && crate::session_manager::codex_running()
+            {
+                api.prevent_exit();
+                tray::show_main_window(app_handle);
+                let _ = app_handle.emit("exit-blocked", ());
+            }
+            FORCE_EXIT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        // 真正退出: 先还原 base_url 再停端口 (Codex 已退出或用户强退)
         if matches!(event, tauri::RunEvent::Exit) {
             local_router::shutdown();
         }

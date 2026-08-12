@@ -514,6 +514,11 @@ export function quitApp(): Promise<void> {
   return invoke("quit_app");
 }
 
+/** 用户确认“仍然退出”: 绕过 Codex 运行中的退出拦截 */
+export function forceQuitApp(): Promise<void> {
+  return invoke("force_quit_app");
+}
+
 /** Codex 桌面/CLI 是否在运行 (隔离前预检) */
 export function isCodexRunning(): Promise<boolean> {
   return invoke("is_codex_running");

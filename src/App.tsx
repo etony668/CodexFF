@@ -9,6 +9,7 @@ import {
   checkDnsLeak,
   checkIp,
   errMsg,
+  forceQuitApp,
   getStatus,
   isCodexRunning,
   previewSessionModelRemap,
@@ -31,6 +32,7 @@ function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [exitBlocked, setExitBlocked] = useState(false);
 
   // 请求序号: get_status 含出网 IP 检测 (最坏 ~6s), 并发时慢响应
   // 不得覆盖新响应 (切换后 UI 显示旧状态)
@@ -326,6 +328,16 @@ function App() {
     };
   }, []);
 
+  // 退出拦截: 路由开启 + Codex 运行中时, 后端阻止退出并通知前端确认
+  useEffect(() => {
+    const unlisten = listen("exit-blocked", () => {
+      setExitBlocked(true);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   // 会话模型迁移进度（并发改写大文件时逐文件上报）
   useEffect(() => {
     const unlisten = listen<{
@@ -485,6 +497,29 @@ function App() {
         <div className="notice-banner">
           {notice}
           <button onClick={() => setNotice(null)}>×</button>
+        </div>
+      )}
+      {exitBlocked && (
+        <div className="exit-blocked-overlay">
+          <div className="exit-blocked-box">
+            <h3>Codex 正在使用本地路由</h3>
+            <p>
+              直接退出会断开当前 Codex 会话（请求会打到已关闭的本地代理而失败）。
+              请先完全退出 Codex / ChatGPT 桌面端与命令行，再退出 CodexFF Pro。
+            </p>
+            <div className="exit-blocked-actions">
+              <button onClick={() => setExitBlocked(false)}>知道了</button>
+              <button
+                className="danger"
+                onClick={() => {
+                  setExitBlocked(false);
+                  void forceQuitApp();
+                }}
+              >
+                仍然退出
+              </button>
+            </div>
+          </div>
         </div>
       )}
       {error && (

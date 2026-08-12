@@ -630,15 +630,22 @@ pub fn status() -> RouterStatus {
     }
 }
 
-/// App 退出时同步收尾: 还原 base_url + 停止代理 + 标记关闭
+/// App 退出时同步收尾: 先还原 config 里的 base_url (Codex 新请求立即回到
+/// 真实中转地址), 再停止代理 — 顺序不能反, 否则 Codex 请求会打到正在关闭
+/// 的本地端口导致会话连接失败。路由未开启时直接跳过。
 pub fn shutdown() {
+    let mut s = load_state();
+    if !s.enabled {
+        return;
+    }
+    // 1. 先还原 base_url, 让 Codex 后续请求走真实中转 (不再依赖本地路由)
+    restore_config(&mut s);
+    // 2. 再停止本地代理服务
     if let Some(rt) = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take() {
         if let Some(tx) = rt.shutdown {
             let _ = tx.send(());
         }
     }
-    let mut s = load_state();
-    restore_config(&mut s);
     s.enabled = false;
     save_state(&s);
 }
