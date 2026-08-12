@@ -683,7 +683,12 @@ async fn preview_session_model_remap(
             )
         }
     };
-    let threads = session_model::incompatible_threads(&supported)?;
+    // 只列最近活跃的前 30 个: 全量 600+ 会话的模型迁移会拖住切换几分钟,
+    // 其余会话按需在打开/续聊时迁移 (remap_single_thread / 路由归一化兜底)。
+    let threads: Vec<_> = session_model::incompatible_threads(&supported)?
+        .into_iter()
+        .take(30)
+        .collect();
     Ok(session_model::ModelRemapPreview {
         threads,
         target_model,

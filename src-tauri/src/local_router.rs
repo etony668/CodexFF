@@ -140,6 +140,17 @@ fn sanitize_responses_body(
                         changed = true;
                     }
                 }
+                // Responses API 要求 web_search_call 的 id 以 "ws_" 开头;
+                // Codex 落盘的 web_search_call 用的是 call_ 前缀, 直通官方
+                // 校验会被拒 (invalid_id_prefix)。改写为 ws_ + 原 id 后缀。
+                "web_search_call" => {
+                    if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                        if let Some(suffix) = id.strip_prefix("call_") {
+                            obj.insert("id".into(), serde_json::json!(format!("ws_{suffix}")));
+                            changed = true;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -830,6 +841,28 @@ mod tests {
         );
         let out3 = sanitize_responses_body(&body3, &uri, Some("gpt-5.5"), &[]);
         assert_eq!(out3, body3);
+    }
+
+    #[test]
+    fn web_search_call_id_prefix_rewritten() {
+        let body = Bytes::from(
+            r#"{"model":"gpt-5.6-sol","input":[
+                {"type":"web_search_call","id":"call_00_abc123","status":"completed","action":{"type":"search","queries":["q"]}},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]}"#,
+        );
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        let out = sanitize_responses_body(&body, &uri, None, &[]);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let input = v.get("input").unwrap().as_array().unwrap();
+        assert_eq!(input[0].get("id").unwrap(), "ws_00_abc123");
+        // 非 call_ 前缀原样保留
+        let body2 = Bytes::from(
+            r#"{"model":"gpt-5.6-sol","input":[{"type":"web_search_call","id":"ws_xyz","status":"completed","action":{"type":"search","queries":["q"]}}]}"#,
+        );
+        let out2 = sanitize_responses_body(&body2, &uri, None, &[]);
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(v2.get("input").unwrap()[0].get("id").unwrap(), "ws_xyz");
     }
 
     #[test]
