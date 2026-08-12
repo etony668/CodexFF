@@ -243,6 +243,11 @@ export function ProfilesPage({
     void refreshUsage();
     void refreshRouter();
   }, []);
+  // 故障转移提示: 每 15s 刷新路由状态, 主供应商失败自动切备用时提醒用户
+  useEffect(() => {
+    const t = setInterval(() => void refreshRouter(), 15000);
+    return () => clearInterval(t);
+  }, []);
 
   async function toggleRouter() {
     if (routerBusy) return;
@@ -599,6 +604,26 @@ export function ProfilesPage({
               }`
             : ""}
         </p>
+        {routerStatus?.enabled && (
+          <p className="hint">
+            本地路由接管期间请通过本 App 的「退出」菜单退出；用系统命令等方式
+            强制退出会导致 Codex 会话短暂断连（重新打开 App 会自动恢复路由）。
+          </p>
+        )}
+        {(() => {
+          const fb = routerStatus?.last_fallback;
+          if (!fb) return null;
+          const [fid, ts] = fb;
+          const fresh = Date.now() - ts < 5 * 60 * 1000;
+          if (!fresh) return null;
+          const fname = relays.find((r) => r.id === fid)?.name ?? fid;
+          return (
+            <p className="warn">
+              检测到主供应商故障，已自动切换到备用供应商「{fname}」。
+              请确认当前实际使用的模型与计费符合预期。
+            </p>
+          );
+        })()}
         {relays.length === 0 && (
           <p className="hint">还没有中转 profile, 点下方"添加供应商"或粘贴导入链接。</p>
         )}

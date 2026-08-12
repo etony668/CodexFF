@@ -266,6 +266,8 @@ export interface RouterStatus {
   port: number;
   rewritten: boolean;
   active_provider: string | null;
+  /** 最近一次实际转发到备用供应商 (provider_id, ts_ms) — 故障转移提示用 */
+  last_fallback?: [string, number] | null;
 }
 
 /** 用量统计汇总 (余额历史 + 本地路由请求统计) */

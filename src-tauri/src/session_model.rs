@@ -392,10 +392,17 @@ pub fn apply_remap(
     let mut conn = session_manager::state_db_conn_rw()?;
     let ids: Vec<String> = match thread_ids {
         Some(list) => list.to_vec(),
-        None => incompatible_threads(supported)?
-            .into_iter()
-            .map(|t| t.thread_id)
-            .collect(),
+        None => {
+            // 只迁移最近活跃的前 30 个: 全量迁移 639 个会话（含 GB 级文件）
+            // 会拖住切换几分钟; 其余会话按需在打开/续聊时迁移
+            // (remap_single_thread / 本地路由请求层归一化兜底)。
+            const MAX_RECENT_REMAP: usize = 30;
+            incompatible_threads(supported)?
+                .into_iter()
+                .take(MAX_RECENT_REMAP)
+                .map(|t| t.thread_id)
+                .collect()
+        }
     };
     if ids.is_empty() {
         return Ok(ModelRemapOutcome {

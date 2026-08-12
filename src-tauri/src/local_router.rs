@@ -53,6 +53,17 @@ pub struct RouterStatus {
     pub port: u16,
     pub rewritten: bool,
     pub active_provider: Option<String>,
+    /// 最近一次实际转发到备用供应商 (故障转移): (provider_id, ts_ms)
+    /// 前端据此提示用户当前走的是备用中转。
+    #[serde(default)]
+    pub last_fallback: Option<(String, i64)>,
+}
+
+static LAST_FALLBACK: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+fn record_fallback(provider_id: &str) {
+    *LAST_FALLBACK.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((provider_id.to_string(), now_ms()));
 }
 
 fn state_path() -> std::path::PathBuf {
@@ -481,6 +492,7 @@ async fn forward(
     };
     let mut last_error: Option<String> = None;
     let mut attempted = Vec::new();
+    let primary_id = chain.first().map(|c| c.id.as_str()).unwrap_or_default().to_string();
     for p in chain.iter() {
         let breaker_open = BREAKER
             .lock()
@@ -528,6 +540,10 @@ async fn forward(
                     continue;
                 }
                 let _ = BREAKER.lock().map(|mut b| b.record_success(&p.id));
+                // 主供应商失败后实际由备用供应商应答 → 记录故障转移 (前端提示)
+                if p.id != primary_id {
+                    record_fallback(&p.id);
+                }
                 let ct = resp
                     .headers()
                     .get("content-type")
@@ -619,6 +635,10 @@ async fn forward(
 
 pub fn status() -> RouterStatus {
     let state = load_state();
+    let last_fallback = LAST_FALLBACK
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
     RouterStatus {
         enabled: state.enabled && RUNTIME.lock().map(|r| r.is_some()).unwrap_or(false),
         port: state.port,
@@ -627,6 +647,7 @@ pub fn status() -> RouterStatus {
             ActiveSelection::Relay { profile_id } => profile_id,
             ActiveSelection::Official => "official".to_string(),
         }),
+        last_fallback,
     }
 }
 

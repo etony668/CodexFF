@@ -1044,7 +1044,15 @@ pub fn run() {
         }
         // 真正退出: 先还原 base_url 再停端口 (Codex 已退出或用户强退)
         if matches!(event, tauri::RunEvent::Exit) {
+            if local_router::codex_points_at_router() && crate::session_manager::codex_running() {
+                log::warn!(
+                    "退出时 Codex 仍在运行且指向本地路由 — 本次退出可能由外部途径触发, \
+                     Codex 会话将在下次请求时短暂断连; 重新打开 App 会自动恢复路由"
+                );
+            }
+            if local_router::status().enabled {
             local_router::shutdown();
+            }
         }
     });
 }

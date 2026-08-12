@@ -343,6 +343,7 @@ pub fn materialize_relay_config(
     model_context_window: Option<u64>,
     model_auto_compact_token_limit: Option<u64>,
 ) -> Result<String, CodexConfigError> {
+    let (ctx_w, ctx_c) = effective_ctx(model, model_context_window, model_auto_compact_token_limit);
     let mut doc = DocumentMut::new();
     apply_relay_fields(
         &mut doc,
@@ -352,8 +353,8 @@ pub fn materialize_relay_config(
         wire_api,
         model_reasoning_effort,
         disable_response_storage,
-        model_context_window,
-        model_auto_compact_token_limit,
+        ctx_w,
+        ctx_c,
         false,
     )?;
     Ok(doc.to_string())
@@ -730,6 +731,7 @@ pub fn write_relay_config(
     custom_config: Option<&str>,
     supported_models: Option<&[String]>,
 ) -> Result<(), CodexConfigError> {
+    let (ctx_w, ctx_c) = effective_ctx(model, model_context_window, model_auto_compact_token_limit);
     let mut doc = build_relay_config(
         display_name,
         base_url,
@@ -737,21 +739,21 @@ pub fn write_relay_config(
         wire_api,
         model_reasoning_effort,
         disable_response_storage,
-        model_context_window,
-        model_auto_compact_token_limit,
+        ctx_w,
+        ctx_c,
         custom_config,
     )?;
     let has_supported = supported_models.map(|m| !m.is_empty()).unwrap_or(false);
     // DeepSeek 官方网关: 落盘模型目录文件 (字段已由 apply_relay_fields 注入)
     if is_deepseek_official_gateway(base_url, wire_api) {
-        write_deepseek_model_catalog(model_context_window, model_auto_compact_token_limit)?;
+        write_deepseek_model_catalog(ctx_w, ctx_c)?;
         set_codex_model_catalog_field(&mut doc, true);
     } else if has_supported {
         // 任意中转: 只显示它真实支持的模型, 避免选了不支持的模型提交才报错
         write_relay_model_catalog(
             supported_models.unwrap_or_default(),
-            model_context_window,
-            model_auto_compact_token_limit,
+            ctx_w,
+            ctx_c,
         )?;
         set_codex_model_catalog_field(&mut doc, true);
     } else {
@@ -778,6 +780,37 @@ pub fn top_level_fields() -> Result<(Option<String>, Option<String>, Option<bool
 fn parse_or_default(text: &str) -> Result<DocumentMut, CodexConfigError> {
     text.parse::<DocumentMut>()
         .map_err(|e| CodexConfigError::TomlParse(e.to_string()))
+}
+
+/// 上下文窗口默认值 (中转 profile 未显式填写时):
+/// - deepseek 模型: 1M (官方窗口)
+/// - GPT 系 / 官方 o 系列: 1M — 长会话依赖 Codex 自动压缩, 显式窗口避免
+///   "ran out of room" 直接拒绝; 压缩阈值默认窗口的 90%
+/// - 其它模型: 128k (Codex 默认窗口)
+fn effective_ctx(
+    model: &str,
+    window: Option<u64>,
+    compact: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let w = window.or_else(|| {
+        let m = model.to_ascii_lowercase();
+        if m.contains("deepseek") {
+            Some(1048576)
+        } else if m.starts_with("gpt-")
+            || (m.starts_with('o')
+                && m[1..]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false))
+        {
+            Some(1000000)
+        } else {
+            Some(128000)
+        }
+    });
+    let c = compact.or_else(|| w.map(|x| x * 9 / 10));
+    (w, c)
 }
 
 pub(crate) fn write_config_text(text: &str) -> Result<(), CodexConfigError> {
@@ -840,6 +873,20 @@ pub enum CurrentProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_ctx_defaults_by_model() {
+        // 显式值优先
+        assert_eq!(effective_ctx("gpt-5.6-sol", Some(400_000), Some(360_000)), (Some(400_000), Some(360_000)));
+        // GPT 中转: 1M 窗口 + 90% 压缩阈值
+        assert_eq!(effective_ctx("gpt-5.6-sol", None, None), (Some(1_000_000), Some(900_000)));
+        // DeepSeek: 官方窗口
+        assert_eq!(effective_ctx("deepseek-v4-flash", None, None), (Some(1_048_576), Some(943_718)));
+        // 其它模型: Codex 默认 128k
+        assert_eq!(effective_ctx("my-custom-llm", None, None), (Some(128_000), Some(115_200)));
+        // 只给窗口 → 压缩阈值自动 90%
+        assert_eq!(effective_ctx("gpt-5.5", Some(500_000), None), (Some(500_000), Some(450_000)));
+    }
 
     #[test]
     fn relay_switch_preserves_live_common_sections() {
