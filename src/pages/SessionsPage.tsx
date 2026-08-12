@@ -4,13 +4,11 @@ import {
   SessionMeta,
   UnifySessionMeta,
   errMsg,
-  getCurrentModelInfo,
   hasUnifyBackup,
   isCodexRunning,
   listUnifiableSessions,
   listSessions,
   migrateSessionsToShared,
-  remapSingleThread,
   restoreUnifiedSessions,
   sessionDetail,
   setSessionIsolated,
@@ -32,20 +30,16 @@ interface SessionGroup {
 export function SessionsPage({ onToast }: Props) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
   const [selected, setSelected] = useState<SessionMeta | null>(null);
   const [detail, setDetail] = useState<unknown[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
-  const [detailErr, setDetailErr] = useState<string | null>(null);
+  const [detailUnavailable, setDetailUnavailable] = useState(false);
   const [search, setSearch] = useState("");
   // 隔离进度 (Codex 必须完全退出; 过程显示进度)
   const [isolatingGroup, setIsolatingGroup] = useState<string | null>(null);
   const [isolateStep, setIsolateStep] = useState("");
   // 项目分组折叠状态 (默认展开)
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  // 当前供应商默认模型 + 可用模型列表（“用当前模型续聊”判断用）
-  const [currentModel, setCurrentModel] = useState<string | null>(null);
-  const [currentModels, setCurrentModels] = useState<string[]>([]);
   // 统一会话历史迁移 (旧官方 "openai" 桶 → 共享 "custom" 桶, 迁移前自动备份)
   const [unifyList, setUnifyList] = useState<UnifySessionMeta[] | null>(null);
   const [unifyBackup, setUnifyBackup] = useState(false);
@@ -60,15 +54,12 @@ export function SessionsPage({ onToast }: Props) {
     setLoading(true);
     try {
       setSessions(await listSessions());
-      setErr(null);
-      getCurrentModelInfo()
-        .then((info) => {
-          setCurrentModel(info.model);
-          setCurrentModels(info.supported_models);
-        })
-        .catch(() => {});
     } catch (e) {
-      setErr(errMsg(e));
+      onToast?.({
+        title: "加载会话失败",
+        message: errMsg(e),
+        kind: "warn",
+      });
     } finally {
       setLoading(false);
     }
@@ -104,12 +95,19 @@ export function SessionsPage({ onToast }: Props) {
     setSelected(s);
     setDetail([]);
     setDetailLoading(true);
-    setDetailErr(null);
+    setDetailUnavailable(false);
     try {
       const d = await sessionDetail(s.path, 300);
       if (req === detailReq.current) setDetail(d);
     } catch (e) {
-      if (req === detailReq.current) setDetailErr(errMsg(e));
+      if (req === detailReq.current) {
+        setDetailUnavailable(true);
+        onToast?.({
+          title: "加载会话内容失败",
+          message: errMsg(e),
+          kind: "warn",
+        });
+      }
     } finally {
       if (req === detailReq.current) setDetailLoading(false);
     }
@@ -170,9 +168,11 @@ export function SessionsPage({ onToast }: Props) {
         }
       }
       if (failures.length > 0) {
-        setErr(
-          `${pending.length - failures.length}/${pending.length} 个会话处理完成；${failures.length} 个失败。${failures[0]}`,
-        );
+        onToast?.({
+          title: "部分会话处理失败",
+          message: `${pending.length - failures.length}/${pending.length} 个会话处理完成；${failures.length} 个失败。${failures[0]}`,
+          kind: "warn",
+        });
       }
     } catch (e) {
       const msg = errMsg(e);
@@ -182,7 +182,7 @@ export function SessionsPage({ onToast }: Props) {
           message: msg,
         });
       } else {
-        setErr(msg);
+        onToast?.({ title: "会话隔离失败", message: msg, kind: "warn" });
       }
     } finally {
       setIsolatingGroup(null);
@@ -198,51 +198,6 @@ export function SessionsPage({ onToast }: Props) {
       else next.add(key);
       return next;
     });
-  }
-
-  // 单个会话“用当前模型续聊”：改成当前供应商默认模型，原模型备份可恢复
-  function requestRemapModel(s: SessionMeta) {
-    if (!currentModel || s.model === currentModel) return;
-    onToast?.({
-      kind: "confirm",
-      title: "用当前模型续聊？",
-      message: `该会话当前绑定 ${s.model}，当前供应商不支持。改为 ${currentModel} 后可直接继续；原模型会自动备份，切回支持它的供应商时恢复。`,
-      confirmLabel: "改为当前模型",
-      cancelLabel: "取消",
-      onConfirm: () => {
-        void doRemapModel(s);
-      },
-    });
-  }
-
-  async function doRemapModel(s: SessionMeta) {
-    try {
-      if (await isCodexRunning()) {
-        onToast?.({
-          title: "无法迁移",
-          message: "Codex / ChatGPT 桌面端正在运行。请先完全退出后再迁移会话模型。",
-        });
-        return;
-      }
-    } catch {
-      // 预检失败不阻塞，后端还有强制检测
-    }
-    try {
-      const out = await remapSingleThread(s.thread_id);
-      await load();
-      onToast?.({
-        kind: "info",
-        title: "已迁移",
-        message: `${out.remapped + out.restored} 个会话已改用当前模型，可以直接继续。`,
-      });
-    } catch (e) {
-      const msg = errMsg(e);
-      if (msg.includes("Codex")) {
-        onToast?.({ title: "无法迁移", message: msg });
-      } else {
-        setErr(msg);
-      }
-    }
   }
 
   async function refreshUnify() {
@@ -481,7 +436,6 @@ export function SessionsPage({ onToast }: Props) {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
-        {err && <p className="error">{err}</p>}
         {loading && <p className="hint">扫描中…</p>}
         {isolateStep && <p className="hint">隔离进度：{isolateStep}</p>}
         {!loading && filtered.length === 0 && (
@@ -581,23 +535,6 @@ export function SessionsPage({ onToast }: Props) {
                           {s.isolated ? " · 已隔离 (官方不可见)" : ""}
                         </span>
                       </div>
-                      <div className="row-card-actions">
-                        {currentModel &&
-                          s.model &&
-                          s.model !== currentModel &&
-                          !currentModels.includes(s.model) && (
-                            <button
-                              className="link-btn"
-                              title="把该会话的模型改为当前供应商默认模型，原模型会自动备份"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                requestRemapModel(s);
-                              }}
-                            >
-                              用当前模型续聊
-                            </button>
-                          )}
-                      </div>
                     </div>
                   ))}
                 </div>
@@ -614,11 +551,13 @@ export function SessionsPage({ onToast }: Props) {
             点左侧会话查看内容。会话跨 provider 共享；标记隔离的会话官方订阅不可见。
           </p>
         )}
-        {selected && detailErr && <p className="error">{detailErr}</p>}
-        {selected && !detailErr && detailLoading && (
+        {selected && detailLoading && (
           <p className="hint">加载中…</p>
         )}
-        {selected && !detailErr && !detailLoading && detail.length === 0 && (
+        {selected && detailUnavailable && !detailLoading && (
+          <p className="hint">内容暂未加载，可重新点击该会话重试。</p>
+        )}
+        {selected && !detailUnavailable && !detailLoading && detail.length === 0 && (
           <p className="hint">会话无可见内容。</p>
         )}
         <div className="session-lines">

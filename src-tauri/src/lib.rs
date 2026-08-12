@@ -22,9 +22,15 @@ pub mod vault;
 pub mod workflow;
 
 use serde::Serialize;
+use std::sync::LazyLock;
 use tauri::Manager;
+use tokio::sync::Mutex as AsyncMutex;
 
 use profiles::{ActiveSelection, ProfilesError, RelayProfile, RelayProfileInput};
+
+/// 覆盖完整的 async 供应商事务：预检、路由解除、profile 写入、接管验证、
+/// 补偿回滚和切换记录都必须串行，不能只锁住中间的同步文件写入阶段。
+static PROVIDER_SWITCH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
 #[derive(Serialize)]
 struct ApiError {
@@ -94,10 +100,6 @@ struct AppStatus {
 /// 本地路由必须开启做请求层清洗, 防止实例重启/切换流程漏开导致直连中转报错。
 static ROUTER_HEAL_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 用户明确“仍然退出”标记: 绕过退出拦截 (路由开启 + Codex 运行中)。
-static FORCE_EXIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 #[tauri::command]
 async fn get_status() -> Result<AppStatus, ApiError> {
     let active = profiles::current_active().ok();
@@ -112,16 +114,24 @@ async fn get_status() -> Result<AppStatus, ApiError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if now.saturating_sub(ROUTER_HEAL_LAST.load(std::sync::atomic::Ordering::Relaxed)) >= 30 {
-        if !local_router::status().enabled
-            && matches!(
-                crate::profiles::current_active(),
-                Ok(crate::profiles::ActiveSelection::Relay { .. })
-            )
-            && crate::session_manager::codex_running()
-        {
-            // 请求层兜底 (reasoning 清洗 + 模型归一化), 中转激活 + Codex
-            // 运行中时必须开启, 否则旧会话绑定官方模型直连中转会被拒。
+    let active_compat_supported = profiles::current_active()
+        .ok()
+        .and_then(|active| match active {
+            ActiveSelection::Relay { profile_id } => relays
+                .iter()
+                .find(|profile| profile.id == profile_id)
+                .map(local_router::profile_supports_lossless_compatibility),
+            ActiveSelection::Official => Some(false),
+        })
+        .unwrap_or(false);
+    if now.saturating_sub(ROUTER_HEAL_LAST.load(std::sync::atomic::Ordering::Relaxed)) >= 30
+        && !local_router::status().enabled
+        && active_compat_supported
+        && crate::session_manager::codex_running()
+    {
+        // 请求层兜底 (reasoning 清洗 + 模型归一化), 中转激活 + Codex 运行中时
+        // 必须开启, 否则旧会话绑定官方模型直连中转会被拒。
+        if let Ok(_switch_guard) = PROVIDER_SWITCH_LOCK.try_lock() {
             let _ = local_router::set_enabled(true).await;
         }
         ROUTER_HEAL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
@@ -141,12 +151,29 @@ fn list_relays() -> Result<Vec<RelayProfile>, ApiError> {
 }
 
 #[tauri::command]
-fn add_relay(input: RelayProfileInput) -> Result<RelayProfile, ApiError> {
+async fn add_relay(input: RelayProfileInput) -> Result<RelayProfile, ApiError> {
+    let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
     Ok(profiles::add_relay_profile(input)?)
 }
 
 #[tauri::command]
-fn update_relay(id: String, input: RelayProfileInput) -> Result<RelayProfile, ApiError> {
+async fn update_relay(id: String, input: RelayProfileInput) -> Result<RelayProfile, ApiError> {
+    let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
+    let editing_active = matches!(
+        profiles::current_active(),
+        Ok(ActiveSelection::Relay { ref profile_id }) if profile_id == &id
+    );
+    if editing_active
+        && (local_router::status().enabled
+            || local_router::codex_may_depend_on_router()
+            || crate::session_manager::codex_running())
+    {
+        return Err(ApiError {
+            message:
+                "当前供应商正在使用中。请先完全退出 Codex / ChatGPT 并关闭会话兼容路由，再修改该供应商。"
+                    .into(),
+        });
+    }
     Ok(profiles::update_relay_profile(&id, input)?)
 }
 
@@ -156,7 +183,8 @@ fn get_common_config() -> Result<Option<String>, ApiError> {
 }
 
 #[tauri::command]
-fn set_common_config(snippet: String) -> Result<(), ApiError> {
+async fn set_common_config(snippet: String) -> Result<(), ApiError> {
+    let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
     Ok(profiles::set_common_config(&snippet)?)
 }
 
@@ -169,8 +197,86 @@ fn get_default_config_toml(preset_config: Option<String>) -> Result<String, ApiE
 }
 
 #[tauri::command]
-fn delete_relay(id: String) -> Result<(), ApiError> {
+async fn delete_relay(id: String) -> Result<(), ApiError> {
+    let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
     Ok(profiles::delete_relay_profile(&id)?)
+}
+
+async fn restore_router_after_switch_failure(
+    was_active: bool,
+    was_automatic: bool,
+) -> Result<(), String> {
+    if !was_active {
+        return Ok(());
+    }
+    let status = if was_automatic {
+        local_router::ensure_session_compatibility(true).await?
+    } else {
+        local_router::set_enabled(true).await?
+    };
+    if status.enabled && status.rewritten && !status.degraded {
+        Ok(())
+    } else {
+        Err("路由恢复后未达到可用状态".into())
+    }
+}
+
+async fn degrade_router_after_incomplete_snapshot(
+    should_keep_listener: bool,
+    reason: String,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if should_keep_listener {
+        if let Err(e) = local_router::prepare_session_compatibility().await {
+            errors.push(format!("保留监听器失败: {e}"));
+        }
+    }
+    if let Err(e) = local_router::mark_degraded(reason.clone()) {
+        errors.push(format!("保存路由降级状态失败: {e}"));
+    }
+    if errors.is_empty() {
+        Err(reason)
+    } else {
+        Err(format!("{reason}; {}", errors.join("; ")))
+    }
+}
+
+async fn restore_router_after_verified_snapshot(
+    snapshot_restore: &Result<(), ProfilesError>,
+    was_active: bool,
+    was_automatic: bool,
+) -> Result<(), String> {
+    match snapshot_restore {
+        Ok(()) => restore_router_after_switch_failure(was_active, was_automatic).await,
+        Err(e) => {
+            degrade_router_after_incomplete_snapshot(
+                was_active || local_router::codex_may_depend_on_router(),
+                format!("供应商快照未完整恢复，已禁止兼容路由重新接管: {e}"),
+            )
+            .await
+        }
+    }
+}
+
+async fn restore_relay_router_after_verified_snapshot(
+    snapshot_restore: &Result<(), ProfilesError>,
+    router_was_active: bool,
+    compatibility_prepared: bool,
+) -> Result<(), String> {
+    match snapshot_restore {
+        Ok(()) if router_was_active => local_router::sync_active().map(|_| ()),
+        Ok(()) if compatibility_prepared => local_router::cancel_prepared_compatibility(),
+        Ok(()) => Ok(()),
+        Err(e) => {
+            degrade_router_after_incomplete_snapshot(
+                router_was_active
+                    || compatibility_prepared
+                    || local_router::codex_may_depend_on_router(),
+                format!("供应商快照未完整恢复，已禁止兼容路由重新接管: {e}"),
+            )
+            .await
+        }
+    }
 }
 
 /// 激活官方 profile。激活前 IP 硬检查: 有基线且当前出口 ≠ 基线 →
@@ -181,7 +287,19 @@ async fn activate_official(
     force: Option<bool>,
 ) -> Result<ActiveSelection, ApiError> {
     use tauri::Emitter;
-    // 封号主因 = 官方账号活跃 IP 变化。基线存在且不一致 → 拦截,
+    let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
+    let profile_kind = codex_config::current_profile_kind();
+    let active_identity = profiles::current_active();
+    let safe_known_official = matches!(profile_kind, Ok(codex_config::CurrentProfile::Official))
+        && matches!(active_identity, Ok(ActiveSelection::Official));
+    if !safe_known_official && crate::session_manager::codex_running() {
+        return Err(ApiError {
+            message:
+                "请先完全退出 Codex / ChatGPT，再切换官方订阅。当前供应商身份为第三方或存在不一致，必须确保第三方地址与凭证已从进程内退出。"
+                    .to_string(),
+        });
+    }
+    // 账号被风控主因 = 官方账号活跃 IP 变化。基线存在且不一致 → 拦截,
     // 提示用户先固定出口; 确认无误后 force 重试。
     if !force.unwrap_or(false) {
         let current = ip_guard::current_public_ip().await;
@@ -197,11 +315,50 @@ async fn activate_official(
             }
         }
     }
+    let router_before = local_router::status();
+    let router_was_active = router_before.enabled || local_router::codex_may_depend_on_router();
+    let switch_snapshot = profiles::capture_switch_snapshot()?;
+    if router_was_active {
+        local_router::shutdown().map_err(|e| ApiError {
+            message: format!("切换官方前无法安全退出会话兼容路由: {e}"),
+        })?;
+    }
     // 切换进度逐步入前端 (配置写入 → 凭证恢复 → 会话隔离)
-    let result = profiles::activate_official_with_progress(&|step| {
+    let result = match profiles::activate_official_with_progress(&|step| {
         use tauri::Emitter;
         let _ = app.emit("switch-progress", step);
-    })?;
+    }) {
+        Ok(result) => result,
+        Err(e) => {
+            let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
+            let router_rollback = restore_router_after_verified_snapshot(
+                &rollback,
+                router_was_active,
+                router_before.automatic,
+            )
+            .await;
+            return Err(ApiError {
+                message: format!(
+                    "切换官方失败: {e}; 状态回滚: {rollback:?}; 路由回滚: {router_rollback:?}"
+                ),
+            });
+        }
+    };
+    // 官方模式不再需要本地路由: 彻底关闭 (不还原中转 base_url, 官方 config 已生效)
+    if let Err(e) = local_router::disable_for_official().await {
+        let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
+        let router_rollback = restore_router_after_verified_snapshot(
+            &rollback,
+            router_was_active,
+            router_before.automatic,
+        )
+        .await;
+        return Err(ApiError {
+            message: format!(
+                "切换官方后无法安全关闭会话兼容路由: {e}; 状态回滚: {rollback:?}; 路由回滚: {router_rollback:?}"
+            ),
+        });
+    }
     // 记录官方激活基线 IP — 必须后台跑: current_public_ip 无缓存时
     // 探测 3 个服务最坏 ~18s, await 会让"切回官方"按钮卡死
     let handle = tauri::async_runtime::spawn(async move {
@@ -209,8 +366,13 @@ async fn activate_official(
         let _ = ip_guard::record_official_activation(ip);
     });
     drop(handle);
-    // 官方模式不再需要本地路由: 彻底关闭 (不还原中转 base_url, 官方 config 已生效)
-    let _ = local_router::disable_for_official().await;
+    if let Err(e) = profiles::record_switch() {
+        log::warn!("记录官方切换历史失败: {e}");
+        let _ = app.emit(
+            "switch-warning",
+            format!("供应商已切换，但切换历史记录失败，频繁切换告警可能不准确: {e}"),
+        );
+    }
     let _ = app.emit("provider-changed", ());
     Ok(result)
 }
@@ -233,19 +395,142 @@ async fn activate_relay(
     profile_id: String,
 ) -> Result<ActiveSelection, ApiError> {
     use tauri::Emitter;
-    let result = profiles::activate_relay_with_progress(&profile_id, &|step| {
+    let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
+    let target_profile = profiles::list_relay_profiles()?
+        .into_iter()
+        .find(|p| p.id == profile_id)
+        .ok_or_else(|| ApiError {
+            message: format!("profile 不存在: {profile_id}"),
+        })?;
+    let mut target_models = target_profile.supported_models.clone();
+    let target_wire = target_profile.wire_api.as_deref().unwrap_or("openai_chat");
+    if target_models.is_empty() {
+        if let Ok(Some(key)) = vault::get_relay_key(&profile_id) {
+            if let Ok(models) = fetch_relay_models(&target_profile.base_url, &key).await {
+                target_models = models.clone();
+                let _ = profiles::update_relay_supported_models(&profile_id, models);
+            }
+        }
+    }
+    let has_history = session_model::has_historical_threads().unwrap_or(true);
+    let model_incompatible =
+        session_model::has_incompatible_threads(&target_models).unwrap_or(true);
+    let compatibility_required = has_history || model_incompatible;
+    if (compatibility_required || local_router::codex_may_depend_on_router())
+        && !matches!(target_wire, "responses" | "openai_responses")
+    {
+        return Err(ApiError {
+            message: format!(
+                "当前供应商使用 {target_wire} 协议。历史会话无损接续目前仅支持 Responses 协议；为避免损坏会话或错误认证，本次切换已取消。"
+            ),
+        });
+    }
+    let router_already_active = {
+        let status = local_router::status();
+        status.enabled
+            && status.rewritten
+            && !status.degraded
+            && local_router::codex_points_at_router()
+    };
+    if !router_already_active && crate::session_manager::codex_running() {
+        return Err(ApiError {
+            message:
+                "请先完全退出 Codex / ChatGPT，再切换第三方供应商。首次切换会安全启用会话兼容层；下次启动后历史会话可直接续聊，且不会修改原始会话文件。"
+                    .to_string(),
+        });
+    }
+    let switch_snapshot = profiles::capture_switch_snapshot()?;
+    let compatibility_prepared = if compatibility_required && !router_already_active {
+        local_router::prepare_session_compatibility()
+            .await
+            .map_err(|e| ApiError {
+                message: format!("无法启动会话兼容层，本次未切换供应商: {e}"),
+            })?
+    } else {
+        false
+    };
+    if router_already_active {
+        local_router::prepare_provider_switch().map_err(|e| ApiError {
+            message: format!("无法解除旧供应商的兼容路由接管，本次未切换: {e}"),
+        })?;
+    }
+    let result = match profiles::activate_relay_with_progress(&profile_id, &|step| {
         use tauri::Emitter;
         let _ = app.emit("switch-progress", step);
-    })?;
-    // 本地路由开启时, 把激活供应商 base_url 改写为本地代理
-    local_router::sync_active();
-    // Codex 运行中无法安全改写会话文件 → 自动开启本地路由, 在请求层做
-    // reasoning 清洗 + 模型归一化, 保证所有第三方 GPT 中转都能接续。
-    if crate::session_manager::codex_running() {
-        let _ = app.emit("switch-progress", "自动开启本地路由清洗会话数据…");
-        if let Ok(status) = local_router::set_enabled(true).await {
-            let _ = app.emit("router-status", status);
+    }) {
+        Ok(result) => result,
+        Err(e) => {
+            let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
+            let router_rollback = restore_relay_router_after_verified_snapshot(
+                &rollback,
+                router_already_active,
+                compatibility_prepared,
+            )
+            .await;
+            return Err(ApiError {
+                message: format!(
+                    "供应商切换失败: {e}; 状态回滚: {rollback:?}; 路由回滚: {router_rollback:?}"
+                ),
+            });
         }
+    };
+    if compatibility_required {
+        let _ = app.emit("switch-progress", "启用会话兼容层…");
+        let router = match local_router::ensure_session_compatibility(true).await {
+            Ok(router) if router.enabled && router.rewritten && !router.degraded => router,
+            Ok(_) => {
+                let e = "兼容路由未完成接管".to_string();
+                let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
+                let router_rollback = restore_relay_router_after_verified_snapshot(
+                    &rollback,
+                    router_already_active,
+                    compatibility_prepared,
+                )
+                .await;
+                return Err(ApiError {
+                    message: format!(
+                        "供应商切换已回滚: {e}; 状态回滚: {rollback:?}; 路由回滚: {router_rollback:?}"
+                    ),
+                });
+            }
+            Err(e) => {
+                let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
+                let router_rollback = restore_relay_router_after_verified_snapshot(
+                    &rollback,
+                    router_already_active,
+                    compatibility_prepared,
+                )
+                .await;
+                return Err(ApiError {
+                    message: format!(
+                        "会话兼容层接管失败，供应商切换已回滚: {e}; 状态回滚: {rollback:?}; 路由回滚: {router_rollback:?}"
+                    ),
+                });
+            }
+        };
+        let _ = app.emit("router-status", router);
+    } else if local_router::status().enabled {
+        if let Err(e) = local_router::sync_active() {
+            let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
+            let router_rollback = restore_relay_router_after_verified_snapshot(
+                &rollback,
+                router_already_active,
+                compatibility_prepared,
+            )
+            .await;
+            return Err(ApiError {
+                message: format!(
+                    "本地路由跟随供应商失败，切换已回滚: {e}; 状态回滚: {rollback:?}; 路由回滚: {router_rollback:?}"
+                ),
+            });
+        }
+    }
+    if let Err(e) = profiles::record_switch() {
+        log::warn!("记录第三方切换历史失败: {e}");
+        let _ = app.emit(
+            "switch-warning",
+            format!("供应商已切换，但切换历史记录失败，频繁切换告警可能不准确: {e}"),
+        );
     }
     let _ = app.emit("provider-changed", ());
     Ok(result)
@@ -443,13 +728,6 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-/// 用户确认“仍然退出”: 设强制标记后退出, 绕过 Codex 运行中的拦截。
-#[tauri::command]
-fn force_quit_app(app: tauri::AppHandle) {
-    FORCE_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
-    app.exit(0);
-}
-
 /// Codex 桌面/CLI 是否在运行 (前端隔离前预检, 弹悬浮提示用)
 #[tauri::command]
 fn is_codex_running() -> Result<bool, ApiError> {
@@ -576,181 +854,6 @@ async fn test_relay(
     }
 }
 
-/// 当前配置的默认模型 + 思考档位 + 可用模型清单（会话页“用当前模型续聊”用）
-#[derive(Serialize)]
-struct CurrentModelInfo {
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    supported_models: Vec<String>,
-}
-
-/// 计算切换目标（官方或中转）的默认模型/档位与可用模型清单。
-/// 中转没有保存模型清单时在线拉取并回填。
-async fn current_remap_target() -> Result<(String, Option<String>, Vec<String>), ApiError> {
-    let active = profiles::current_active()?;
-    let (model, effort, _) = codex_config::top_level_fields()?;
-    match active {
-        ActiveSelection::Official => {
-            let supported = if session_model::list_catalog_slugs().is_empty() {
-                session_model::OFFICIAL_MODELS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            } else {
-                session_model::list_catalog_slugs()
-            };
-            Ok((
-                model.unwrap_or_else(|| "gpt-5.6-sol".to_string()),
-                effort,
-                supported,
-            ))
-        }
-        ActiveSelection::Relay { profile_id } => {
-            let relays = profiles::list_relay_profiles()?;
-            let profile = relays
-                .iter()
-                .find(|p| p.id == profile_id)
-                .cloned()
-                .ok_or_else(|| ApiError {
-                    message: format!("供应商不存在: {profile_id}"),
-                })?;
-            let mut supported = profile.supported_models.clone();
-            if supported.is_empty() {
-                if let Ok(Some(key)) = vault::get_relay_key(&profile_id) {
-                    if let Ok(models) = fetch_relay_models(&profile.base_url, &key).await {
-                        supported = models.clone();
-                        let _ = profiles::update_relay_supported_models(&profile_id, models);
-                    }
-                }
-            }
-            Ok((
-                model.unwrap_or(profile.model),
-                effort.or(profile.model_reasoning_effort),
-                supported,
-            ))
-        }
-    }
-}
-
-/// 切换前预览：目标供应商不支持的旧会话模型清单。
-/// profile_id = None 表示官方订阅。
-#[tauri::command]
-async fn preview_session_model_remap(
-    profile_id: Option<String>,
-) -> Result<session_model::ModelRemapPreview, ApiError> {
-    let (target_model, target_effort, supported, models_unknown) = match profile_id {
-        None => {
-            let state = vault::load_relay_state();
-            let model = state
-                .prev_model
-                .clone()
-                .unwrap_or_else(|| "gpt-5.6-sol".to_string());
-            let supported = if session_model::list_catalog_slugs().is_empty() {
-                session_model::OFFICIAL_MODELS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            } else {
-                session_model::list_catalog_slugs()
-            };
-            (model, state.prev_effort.clone(), supported, false)
-        }
-        Some(id) => {
-            let relays = profiles::list_relay_profiles()?;
-            let profile = relays
-                .iter()
-                .find(|p| p.id == id)
-                .cloned()
-                .ok_or_else(|| ApiError {
-                    message: format!("供应商不存在: {id}"),
-                })?;
-            let mut supported = profile.supported_models.clone();
-            let mut unknown = supported.is_empty();
-            if supported.is_empty() {
-                if let Ok(Some(key)) = vault::get_relay_key(&id) {
-                    if let Ok(models) = fetch_relay_models(&profile.base_url, &key).await {
-                        supported = models.clone();
-                        unknown = false;
-                        let _ = profiles::update_relay_supported_models(&id, models);
-                    }
-                }
-            }
-            (
-                profile.model,
-                profile.model_reasoning_effort,
-                supported,
-                unknown,
-            )
-        }
-    };
-    // 只列最近活跃的前 30 个: 全量 600+ 会话的模型迁移会拖住切换几分钟,
-    // 其余会话按需在打开/续聊时迁移 (remap_single_thread / 路由归一化兜底)。
-    let threads: Vec<_> = session_model::incompatible_threads(&supported)?
-        .into_iter()
-        .take(30)
-        .collect();
-    Ok(session_model::ModelRemapPreview {
-        threads,
-        target_model,
-        target_effort,
-        supported_models: supported,
-        models_unknown,
-    })
-}
-
-/// 切换完成后执行模型迁移（thread_ids = None 表示迁移全部不兼容会话）。
-#[tauri::command]
-async fn apply_session_model_remap(
-    app: tauri::AppHandle,
-    thread_ids: Option<Vec<String>>,
-) -> Result<session_model::ModelRemapOutcome, ApiError> {
-    let (model, effort, supported) = current_remap_target().await?;
-    use tauri::Emitter;
-    let handle = app.clone();
-    let progress = move |p: session_model::RemapProgress| {
-        let _ = handle.emit("session-model-remap-progress", p);
-    };
-    Ok(session_model::apply_remap(
-        thread_ids.as_deref(),
-        &model,
-        effort.as_deref(),
-        &supported,
-        &progress,
-    )?)
-}
-
-/// 会话管理页：把单个会话改为当前供应商默认模型（原模型备份，切回自动恢复）。
-#[tauri::command]
-async fn remap_single_thread(
-    app: tauri::AppHandle,
-    thread_id: String,
-) -> Result<session_model::ModelRemapOutcome, ApiError> {
-    let (model, effort, supported) = current_remap_target().await?;
-    use tauri::Emitter;
-    let handle = app.clone();
-    let progress = move |p: session_model::RemapProgress| {
-        let _ = handle.emit("session-model-remap-progress", p);
-    };
-    Ok(session_model::remap_single_thread(
-        &thread_id,
-        &model,
-        effort.as_deref(),
-        &supported,
-        &progress,
-    )?)
-}
-
-/// 当前配置默认模型 / 思考档位 / 可用模型列表
-#[tauri::command]
-fn get_current_model_info() -> Result<CurrentModelInfo, ApiError> {
-    let (model, effort, _) = codex_config::top_level_fields()?;
-    Ok(CurrentModelInfo {
-        model,
-        reasoning_effort: effort,
-        supported_models: session_model::list_catalog_slugs(),
-    })
-}
-
 /// 读取中转 key (编辑表单回填用, cc-switch 对齐 — API Key 字段可见)。
 /// key 存 keyring/vault, 不回传列表, 只在编辑指定 profile 时取。
 #[tauri::command]
@@ -833,6 +936,22 @@ async fn list_usage_stats() -> usage_stats::UsageOverview {
 /// 本地路由开关 (启动/停止 127.0.0.1 代理)
 #[tauri::command]
 async fn set_local_router(enabled: bool) -> Result<local_router::RouterStatus, ApiError> {
+    let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
+    if enabled && session_model::has_historical_threads().unwrap_or(true) {
+        if let ActiveSelection::Relay { profile_id } = profiles::current_active()? {
+            let profile = profiles::list_relay_profiles()?
+                .into_iter()
+                .find(|profile| profile.id == profile_id)
+                .ok_or_else(|| ApiError {
+                    message: "当前第三方供应商记录不存在".into(),
+                })?;
+            if !local_router::profile_supports_lossless_compatibility(&profile) {
+                return Err(ApiError {
+                    message: "当前供应商不是 Responses 协议，不能开启历史会话兼容路由".into(),
+                });
+            }
+        }
+    }
     Ok(local_router::set_enabled(enabled)
         .await
         .map_err(|e| ApiError { message: e })?)
@@ -882,11 +1001,15 @@ fn handle_deeplink(app: &tauri::AppHandle, url: &str) {
     }
     let handle = app.clone();
     let url = url.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        let result = (|| -> Result<String, String> {
-            let p = profiles::import_from_text(&url).map_err(|e| e.to_string())?;
-            Ok(format!("imported:{}", p.name))
-        })();
+    tauri::async_runtime::spawn(async move {
+        let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            profiles::import_from_text(&url)
+                .map(|p| format!("imported:{}", p.name))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("导入任务失败: {e}")));
         let msg = match result {
             Ok(v) => v,
             Err(e) => format!("error:{e}"),
@@ -961,10 +1084,6 @@ pub fn run() {
             set_local_router,
             local_router_status,
             get_relay_key,
-            preview_session_model_remap,
-            apply_session_model_remap,
-            remap_single_thread,
-            get_current_model_info,
             take_pending_deeplink,
             get_common_config,
             set_common_config,
@@ -972,7 +1091,6 @@ pub fn run() {
             get_official_quota,
             check_ip_type,
             get_switch_stats,
-            force_quit_app,
         ])
         .setup(|app| {
             #[cfg(desktop)]
@@ -999,25 +1117,12 @@ pub fn run() {
             // (普通 App), 仅用户点窗口关闭按钮时隐藏 (见 on_window_event)
             tray::setup_tray(app.handle())?;
 
-            // 启动兜底: 激活的是中转且会话存在需要清洗的推理数据时 —
-            // Codex 未运行 → 直接清洗会话文件; Codex 运行中 → 自动开启
-            // 本地路由, 在请求层清洗, 保证第三方 GPT 中转都能用。
-            if let Ok(crate::profiles::ActiveSelection::Relay { .. }) =
-                crate::profiles::current_active()
+            // 恢复上一实例仍被 Codex 缓存的兼容路由；若不存在有效接管，
+            // 清理陈旧 localhost 状态。整个过程不改写任何历史会话。
+            if let Err(e) =
+                tauri::async_runtime::block_on(local_router::resume_or_recover_startup())
             {
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    use tauri::Emitter;
-                    if crate::session_manager::codex_running() {
-                        if let Ok(status) = local_router::set_enabled(true).await {
-                            let _ = app_handle.emit("router-status", status);
-                        }
-                    } else if let Err(e) =
-                        crate::session_model::sanitize_reasoning_content(None, &|_| {})
-                    {
-                        log::warn!("启动时清洗会话推理数据失败: {e}");
-                    }
-                });
+                log::warn!("启动恢复会话兼容路由失败: {e}");
             }
 
             Ok(())
@@ -1033,30 +1138,29 @@ pub fn run() {
         }
         // 退出拦截: 本地路由正在为 Codex 转发时, 直接退出会让 Codex 下一请求
         // 打到已关闭的本地端口 → 502/会话连接失败。提示用户先退出 Codex;
-        // 用户选择“仍然退出”时 FORCE_EXIT=true 放行。
+        // 只要 Codex 仍依赖本地路由，就必须阻止退出，避免下一请求命中
+        // 已关闭的 19331 端口。不存在绕过此保护的“强制退出”入口。
         if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
             use tauri::Emitter;
-            let force = FORCE_EXIT.load(std::sync::atomic::Ordering::Relaxed);
-            if !force
-                && local_router::codex_points_at_router()
-                && crate::session_manager::codex_running()
+            if local_router::codex_may_depend_on_router() && crate::session_manager::codex_running()
             {
                 api.prevent_exit();
                 tray::show_main_window(app_handle);
                 let _ = app_handle.emit("exit-blocked", ());
             }
-            FORCE_EXIT.store(false, std::sync::atomic::Ordering::Relaxed);
         }
-        // 真正退出: 先还原 base_url 再停端口 (Codex 已退出或用户强退)
+        // 退出前先关闭本地路由 (还原 base_url + 停端口), 避免 Codex 会话
+        // 在 App 退出后仍指向已停止的本地代理而连接失败
         if matches!(event, tauri::RunEvent::Exit) {
-            if local_router::codex_points_at_router() && crate::session_manager::codex_running() {
+            if local_router::codex_may_depend_on_router() && crate::session_manager::codex_running()
+            {
                 log::warn!(
                     "退出时 Codex 仍在运行且指向本地路由 — 本次退出可能由外部途径触发, \
                      Codex 会话将在下次请求时短暂断连; 重新打开 App 会自动恢复路由"
                 );
             }
-            if local_router::status().enabled {
-            local_router::shutdown();
+            if local_router::status().enabled || local_router::codex_may_depend_on_router() {
+                let _ = local_router::shutdown();
             }
         }
     });

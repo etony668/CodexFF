@@ -104,6 +104,48 @@ fn cleanup(tmp: &Path, mount: &Path) {
     let _ = std::fs::remove_dir_all(mount);
 }
 
+fn verify_official_codex(app: &Path) -> Result<(), String> {
+    let verify = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(app)
+        .output()
+        .map_err(|e| format!("无法运行 codesign: {e}"))?;
+    if !verify.status.success() {
+        return Err(format!(
+            "官方安装包签名校验失败: {}",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        ));
+    }
+    let detail = Command::new("/usr/bin/codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(app)
+        .output()
+        .map_err(|e| format!("无法读取安装包签名: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&detail.stdout),
+        String::from_utf8_lossy(&detail.stderr)
+    );
+    if !text.lines().any(|line| line.trim() == "Identifier=com.openai.codex") {
+        return Err("安装包标识不是官方 Codex（com.openai.codex）".into());
+    }
+    if !text.lines().any(|line| line.trim() == "TeamIdentifier=2DC432GLL2") {
+        return Err("安装包开发者 Team ID 不是 OpenAI 官方签名".into());
+    }
+    let assess = Command::new("/usr/sbin/spctl")
+        .args(["--assess", "--type", "execute", "--verbose=2"])
+        .arg(app)
+        .output()
+        .map_err(|e| format!("无法运行 Gatekeeper 校验: {e}"))?;
+    if !assess.status.success() {
+        return Err(format!(
+            "Gatekeeper 拒绝该安装包: {}",
+            String::from_utf8_lossy(&assess.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// 下载官方 DMG 并安装 Codex 桌面端到 /Applications, 进度通过 emit 上抛。
 pub async fn install_desktop(
     emit: impl Fn(InstallProgress) + Send + Sync,
@@ -226,32 +268,50 @@ pub async fn install_desktop(
         cleanup(&tmp, &mount);
         return Err("/Applications/Codex.app 已存在，无需重复安装".into());
     }
+    emit(InstallProgress {
+        phase: "校验".into(),
+        percent: 95.0,
+        message: "正在验证 OpenAI 官方签名…".into(),
+    });
+    if let Err(e) = verify_official_codex(&src) {
+        cleanup(&tmp, &mount);
+        return Err(e);
+    }
 
     emit(InstallProgress {
         phase: "安装".into(),
         percent: 96.0,
         message: "正在复制到应用程序…".into(),
     });
+    let stage = PathBuf::from(format!(
+        "/Applications/.Codex-installing-{}.app",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&stage);
     let copy = Command::new("/usr/bin/ditto")
         .arg(&src)
-        .arg("/Applications/Codex.app")
+        .arg(&stage)
         .status()
         .map_err(|e| {
             cleanup(&tmp, &mount);
             format!("无法运行 ditto: {e}")
         })?;
-    cleanup(&tmp, &mount);
     if !copy.success() {
+        let _ = std::fs::remove_dir_all(&stage);
+        cleanup(&tmp, &mount);
         return Err("复制到应用程序失败，请检查磁盘权限".into());
     }
-    if !Path::new("/Applications/Codex.app").exists() {
-        return Err("安装失败：未找到目标应用".into());
+    if let Err(e) = verify_official_codex(&stage) {
+        let _ = std::fs::remove_dir_all(&stage);
+        cleanup(&tmp, &mount);
+        return Err(format!("复制后的应用校验失败: {e}"));
     }
-    // 移除隔离属性, 避免首次打开被 Gatekeeper 拦截
-    let _ = Command::new("xattr")
-        .args(["-dr", "com.apple.quarantine", "/Applications/Codex.app"])
-        .status();
-
+    if let Err(e) = std::fs::rename(&stage, "/Applications/Codex.app") {
+        let _ = std::fs::remove_dir_all(&stage);
+        cleanup(&tmp, &mount);
+        return Err(format!("安装最终落盘失败: {e}"));
+    }
+    cleanup(&tmp, &mount);
     emit(InstallProgress {
         phase: "完成".into(),
         percent: 100.0,

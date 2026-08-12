@@ -26,6 +26,7 @@ import {
   updateRelay,
 } from "../api";
 import { AddProviderPanel } from "../AddProviderPanel";
+import type { ToastRequest } from "../FloatingToast";
 
 interface Props {
   status: AppStatus | null;
@@ -35,6 +36,8 @@ interface Props {
   switching?: boolean;
   /** 切换检测进度文案 (如 "检测出口 IP…") */
   switchingLabel?: string;
+  /** 请求 App 层统一显示悬浮提示。 */
+  onToast?: (toast: ToastRequest) => void;
 }
 
 const emptyQuota: OfficialQuota = {
@@ -149,9 +152,11 @@ export function ProfilesPage({
   onChanged,
   switching,
   switchingLabel,
+  onToast,
 }: Props) {
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const showError = (title: string, message: string) =>
+    onToast?.({ title, message, kind: "warn" });
 
   // 添加/编辑供应商面板 (cc-switch 式全屏面板 + 预设选择)
   const [panelOpen, setPanelOpen] = useState(false);
@@ -212,7 +217,7 @@ export function ProfilesPage({
         message: "Codex 桌面端已安装",
       });
     } catch (e) {
-      setErr(errMsg(e));
+      showError("安装失败", errMsg(e));
     } finally {
       setCodexInstalling(false);
     }
@@ -259,7 +264,11 @@ export function ProfilesPage({
       setRouterStatus(s);
       void refreshUsage();
     } catch (e) {
-      setErr(errMsg(e));
+      const message = errMsg(e);
+      showError(
+        next ? "开启本地路由失败" : "关闭本地路由失败",
+        message,
+      );
     } finally {
       setRouterBusy(false);
       setPendingEnabled(null);
@@ -404,7 +413,7 @@ export function ProfilesPage({
       setConfirmDel(null);
       await onChanged();
     } catch (e) {
-      setErr(errMsg(e));
+      showError("删除供应商失败", errMsg(e));
     } finally {
       setBusy(false);
     }
@@ -596,12 +605,14 @@ export function ProfilesPage({
           </div>
         </div>
         <p className="hint router-status">
-          {routerStatus?.enabled
+          {routerStatus?.degraded
+            ? routerStatus.recovery_message || "会话兼容路由需要恢复"
+            : routerStatus?.enabled
             ? `运行中 · 端口 ${routerStatus.port}${
                 routerStatus.rewritten
                   ? " · 已接管激活供应商"
                   : " · 未接管（请切换到中转供应商）"
-              }`
+              }${routerStatus.automatic ? " · 会话兼容自动启用" : ""}`
             : ""}
         </p>
         {routerStatus?.enabled && (
@@ -700,8 +711,6 @@ export function ProfilesPage({
         </div>
       </section>
 
-      {err && <p className="error">{err}</p>}
-
       <section className="card usage-card">
         <h2>用量统计</h2>
         <p className="hint">
@@ -789,6 +798,7 @@ SOFTWARE.`}
         onClose={() => setPanelOpen(false)}
         onSave={saveProvider}
         onSaved={onChanged}
+        onToast={onToast}
       />
     </div>
   );

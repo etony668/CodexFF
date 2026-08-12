@@ -243,7 +243,7 @@ pub fn write_official_config(
 /// wire_api = "responses"                    # chat | responses | anthropic
 /// requires_openai_auth = true               # 认证走 auth.json 的 OPENAI_API_KEY
 /// model_context_window = 1000000            # 可选 — 上下文窗口 (显式值优先)
-/// model_auto_compact_token_limit = 800000   # 可选 — 超限自动压缩阈值
+/// model_auto_compact_token_limit = 220000   # 可选 — 超限自动压缩阈值
 /// codexff_relay = true                      # 归属标记, 切换回官方时清理
 /// ```
 ///
@@ -568,7 +568,14 @@ pub fn write_relay_model_catalog(
                 128_000
             };
         let ctx = context_window.unwrap_or(inferred_window);
-        let compact = auto_compact_limit.unwrap_or_else(|| ctx.saturating_mul(80) / 100);
+        let compact = auto_compact_limit.unwrap_or_else(|| {
+            let default = ctx.saturating_mul(80) / 100;
+            if is_gpt_family(&normalized) {
+                default.min(GPT_RELAY_COMPACT_CAP)
+            } else {
+                default
+            }
+        });
         let mut m = template.clone();
         let obj = m.as_object_mut().ok_or_else(|| {
             CodexConfigError::Io(std::io::Error::new(
@@ -785,8 +792,24 @@ fn parse_or_default(text: &str) -> Result<DocumentMut, CodexConfigError> {
 /// 上下文窗口默认值 (中转 profile 未显式填写时):
 /// - deepseek 模型: 1M (官方窗口)
 /// - GPT 系 / 官方 o 系列: 1M — 长会话依赖 Codex 自动压缩, 显式窗口避免
-///   "ran out of room" 直接拒绝; 压缩阈值默认窗口的 90%
+///   "ran out of room" 直接拒绝; 但桌面端对 gpt-5.x 会话实际按内置窗口
+///   (~25.8 万 token) 运行, 压缩阈值若按 1M 的 90% 设会在撞墙前永不触发,
+///   因此 GPT 系默认压缩阈值封顶 22 万 (官方 issue #19409 的 workaround),
+///   让 Codex 在到达内置窗口前主动压缩; DeepSeek 1M 真生效, 维持 90%
 /// - 其它模型: 128k (Codex 默认窗口)
+const GPT_RELAY_COMPACT_CAP: u64 = 220_000;
+
+fn is_gpt_family(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("gpt-")
+        || (m.starts_with('o')
+            && m[1..]
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false))
+}
+
 fn effective_ctx(
     model: &str,
     window: Option<u64>,
@@ -796,20 +819,21 @@ fn effective_ctx(
         let m = model.to_ascii_lowercase();
         if m.contains("deepseek") {
             Some(1048576)
-        } else if m.starts_with("gpt-")
-            || (m.starts_with('o')
-                && m[1..]
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_digit())
-                    .unwrap_or(false))
-        {
+        } else if is_gpt_family(model) {
             Some(1000000)
         } else {
             Some(128000)
         }
     });
-    let c = compact.or_else(|| w.map(|x| x * 9 / 10));
+    let c = compact.or_else(|| {
+        let w = w?;
+        let default = w.saturating_mul(9) / 10;
+        if is_gpt_family(model) {
+            Some(default.min(GPT_RELAY_COMPACT_CAP))
+        } else {
+            Some(default)
+        }
+    });
     (w, c)
 }
 
@@ -878,14 +902,18 @@ mod tests {
     fn effective_ctx_defaults_by_model() {
         // 显式值优先
         assert_eq!(effective_ctx("gpt-5.6-sol", Some(400_000), Some(360_000)), (Some(400_000), Some(360_000)));
-        // GPT 中转: 1M 窗口 + 90% 压缩阈值
-        assert_eq!(effective_ctx("gpt-5.6-sol", None, None), (Some(1_000_000), Some(900_000)));
+        // GPT 中转: 1M 窗口 + 压缩阈值封顶 22 万 (桌面端内置窗口 ~25.8 万,
+        // 80 万阈值会在撞墙前永不触发 → 显式降低让 Codex 提前压缩)
+        assert_eq!(effective_ctx("gpt-5.6-sol", None, None), (Some(1_000_000), Some(220_000)));
         // DeepSeek: 官方窗口
         assert_eq!(effective_ctx("deepseek-v4-flash", None, None), (Some(1_048_576), Some(943_718)));
         // 其它模型: Codex 默认 128k
         assert_eq!(effective_ctx("my-custom-llm", None, None), (Some(128_000), Some(115_200)));
-        // 只给窗口 → 压缩阈值自动 90%
-        assert_eq!(effective_ctx("gpt-5.5", Some(500_000), None), (Some(500_000), Some(450_000)));
+        // 只给窗口 → GPT 压缩阈值仍封顶 22 万; 其它模型自动 90%
+        assert_eq!(effective_ctx("gpt-5.5", Some(500_000), None), (Some(500_000), Some(220_000)));
+        assert_eq!(effective_ctx("my-custom-llm", Some(500_000), None), (Some(500_000), Some(450_000)));
+        // 显式给的压缩阈值优先, 不被 22 万封顶覆盖
+        assert_eq!(effective_ctx("gpt-5.6-sol", Some(1_000_000), Some(900_000)), (Some(1_000_000), Some(900_000)));
     }
 
     #[test]
@@ -1049,8 +1077,9 @@ enabled = true
                 .unwrap_or_else(|| panic!("missing {slug}"))
         };
         assert_eq!(by_slug("gpt-5.6-luna")["context_window"], 1_000_000);
-        assert_eq!(by_slug("gpt-5.6-luna")["auto_compact_token_limit"], 800_000);
+        assert_eq!(by_slug("gpt-5.6-luna")["auto_compact_token_limit"], 220_000);
         assert_eq!(by_slug("gpt-5.5")["context_window"], 1_000_000);
+        assert_eq!(by_slug("gpt-5.5")["auto_compact_token_limit"], 220_000);
         assert_eq!(by_slug("deepseek-v4-flash")["context_window"], 1_048_576);
         assert_eq!(
             by_slug("deepseek-v4-flash")["auto_compact_token_limit"],

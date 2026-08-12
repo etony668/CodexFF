@@ -7,6 +7,7 @@ import {
   errMsg,
   fmtResolverIps,
 } from "../api";
+import type { ToastRequest } from "../FloatingToast";
 
 interface Props {
   status: AppStatus | null;
@@ -15,6 +16,7 @@ interface Props {
   dnsLeak: DnsLeakResult | null;
   dnsChecking: boolean;
   onRunDnsCheck: () => void;
+  onToast?: (toast: ToastRequest) => void;
 }
 
 export function SettingsPage({
@@ -23,10 +25,10 @@ export function SettingsPage({
   dnsLeak,
   dnsChecking,
   onRunDnsCheck,
+  onToast,
 }: Props) {
   const [checking, setChecking] = useState(false);
   const [ip, setIp] = useState(status?.ip ?? null);
-  const [err, setErr] = useState<string | null>(null);
 
   // status 刷新后同步 — 切官方/刷新会更新基线, 页面不能停在旧值
   useEffect(() => {
@@ -35,11 +37,14 @@ export function SettingsPage({
 
   async function recheck() {
     setChecking(true);
-    setErr(null);
     try {
       setIp(await checkIp());
     } catch (e) {
-      setErr(errMsg(e));
+      onToast?.({
+        title: "出口 IP 检测失败",
+        message: errMsg(e),
+        kind: "warn",
+      });
     } finally {
       setChecking(false);
     }
@@ -95,7 +100,6 @@ export function SettingsPage({
         <button onClick={recheck} disabled={checking} className="primary">
           {checking ? "检测中…" : "重新检测"}
         </button>
-        {err && <p className="error">{err}</p>}
       </section>
 
       <section className="card">

@@ -63,35 +63,6 @@ export interface RelayTestResult {
   status_code: number | null;
 }
 
-export interface ModelRemapThread {
-  thread_id: string;
-  title: string;
-  model: string;
-  reasoning_effort: string | null;
-  last_active_ms: number;
-}
-
-export interface ModelRemapPreview {
-  threads: ModelRemapThread[];
-  target_model: string;
-  target_effort: string | null;
-  supported_models: string[];
-  /** true = 拿不到目标供应商模型清单，无法判断不兼容会话 */
-  models_unknown: boolean;
-}
-
-export interface ModelRemapOutcome {
-  remapped: number;
-  restored: number;
-  thread_ids: string[];
-}
-
-export interface CurrentModelInfo {
-  model: string | null;
-  reasoning_effort: string | null;
-  supported_models: string[];
-}
-
 export interface IpCheckResult {
   current_ip: string | null;
   last_official_ip: string | null;
@@ -265,6 +236,9 @@ export interface RouterStatus {
   enabled: boolean;
   port: number;
   rewritten: boolean;
+  automatic: boolean;
+  degraded: boolean;
+  recovery_message: string | null;
   active_provider: string | null;
   /** 最近一次实际转发到备用供应商 (provider_id, ts_ms) — 故障转移提示用 */
   last_fallback?: [string, number] | null;
@@ -343,30 +317,6 @@ export function getSwitchStats(): Promise<number> {
 
 export function activateRelay(profileId: string): Promise<ActiveSelection> {
   return invoke("activate_relay", { profileId });
-}
-
-/** 切换前预览：目标供应商不支持的旧会话模型清单（null = 官方） */
-export function previewSessionModelRemap(
-  profileId: string | null,
-): Promise<ModelRemapPreview> {
-  return invoke("preview_session_model_remap", { profileId });
-}
-
-/** 切换完成后迁移旧会话模型（null = 全部不兼容会话） */
-export function applySessionModelRemap(
-  threadIds: string[] | null,
-): Promise<ModelRemapOutcome> {
-  return invoke("apply_session_model_remap", { threadIds });
-}
-
-/** 会话管理页：单个会话改为当前供应商默认模型 */
-export function remapSingleThread(threadId: string): Promise<ModelRemapOutcome> {
-  return invoke("remap_single_thread", { threadId });
-}
-
-/** 当前配置默认模型 / 思考档位 / 可用模型列表 */
-export function getCurrentModelInfo(): Promise<CurrentModelInfo> {
-  return invoke("get_current_model_info");
 }
 
 export function listSessions(): Promise<SessionMeta[]> {
@@ -514,11 +464,6 @@ export function restoreWorkflowPreset(kind: string): Promise<WorkflowAgentInfo> 
 /** 退出整个应用 */
 export function quitApp(): Promise<void> {
   return invoke("quit_app");
-}
-
-/** 用户确认“仍然退出”: 绕过 Codex 运行中的退出拦截 */
-export function forceQuitApp(): Promise<void> {
-  return invoke("force_quit_app");
 }
 
 /** Codex 桌面/CLI 是否在运行 (隔离前预检) */

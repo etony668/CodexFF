@@ -10,6 +10,7 @@ import {
   setCommonConfig,
   testRelay,
 } from "./api";
+import type { ToastRequest } from "./FloatingToast";
 import { CATEGORY_LABELS, CodexffPreset, codexffPresets } from "./presets";
 
 interface Props {
@@ -20,6 +21,7 @@ interface Props {
   /** 保存 (添加或更新) */
   onSave: (input: RelayProfileInput) => Promise<void>;
   onSaved: () => void;
+  onToast?: (toast: ToastRequest) => void;
 }
 
 interface Form {
@@ -96,7 +98,14 @@ function numOrNull(s: string): number | null {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
-export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Props) {
+export function AddProviderPanel({
+  open,
+  editing,
+  onClose,
+  onSave,
+  onSaved,
+  onToast,
+}: Props) {
   // 阶段: presets (选预设) → form (填表)
   const [stage, setStage] = useState<"presets" | "form">("presets");
   const [query, setQuery] = useState("");
@@ -116,7 +125,6 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
   const [commonOpen, setCommonOpen] = useState(false);
   const [commonSnippet, setCommonSnippet] = useState("");
   const [commonSaving, setCommonSaving] = useState(false);
-  const [commonErr, setCommonErr] = useState<string | null>(null);
 
   // 打开时重置 + 编辑回填
   useEffect(() => {
@@ -149,8 +157,14 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
   useEffect(() => {
     getCommonConfig()
       .then((s) => setCommonSnippet(s ?? ""))
-      .catch((e) => setCommonErr(errMsg(e)));
-  }, []);
+      .catch((e) =>
+        onToast?.({
+          title: "读取公共配置失败",
+          message: errMsg(e),
+          kind: "warn",
+        }),
+      );
+  }, [onToast]);
 
   const visiblePresets = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -170,7 +184,11 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
     try {
       configToml = await getDefaultConfigToml(p.config ?? null);
     } catch (e) {
-      setErr(`读取默认配置失败: ${errMsg(e)}`);
+      onToast?.({
+        title: "读取默认配置失败",
+        message: errMsg(e),
+        kind: "warn",
+      });
     }
     setForm({
       name: p.name,
@@ -199,7 +217,11 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
     try {
       configToml = await getDefaultConfigToml(null);
     } catch (e) {
-      setErr(`读取默认配置失败: ${errMsg(e)}`);
+      onToast?.({
+        title: "读取默认配置失败",
+        message: errMsg(e),
+        kind: "warn",
+      });
     }
     setForm({ ...emptyForm, configToml });
     setStage("form");
@@ -207,13 +229,13 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
 
   async function saveCommon() {
     setCommonSaving(true);
-    setCommonErr(null);
     try {
       await setCommonConfig(commonSnippet);
       setCommonOpen(false);
       onSaved();
     } catch (e) {
-      setCommonErr(errMsg(e));
+      const message = errMsg(e);
+      onToast?.({ title: "保存公共配置失败", message, kind: "warn" });
     } finally {
       setCommonSaving(false);
     }
@@ -227,9 +249,24 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
     setTesting(true);
     setErr(null);
     try {
-      setTestResult(await testRelay(form.baseUrl, form.key, form.wireApi || null));
+      const result = await testRelay(
+        form.baseUrl,
+        form.key,
+        form.wireApi || null,
+      );
+      if (result.ok) {
+        setTestResult(result);
+      } else {
+        setTestResult(null);
+        onToast?.({
+          title: "连接测试失败",
+          message: result.error ?? "供应商返回了无法识别的错误",
+          kind: "warn",
+        });
+      }
     } catch (e) {
-      setErr(errMsg(e));
+      setErr(null);
+      onToast?.({ title: "连接测试失败", message: errMsg(e), kind: "warn" });
     } finally {
       setTesting(false);
     }
@@ -278,7 +315,12 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
       onSaved();
       onClose();
     } catch (e) {
-      setErr(errMsg(e));
+      setErr(null);
+      onToast?.({
+        title: editing ? "保存供应商失败" : "添加供应商失败",
+        message: errMsg(e),
+        kind: "warn",
+      });
     } finally {
       setBusy(false);
     }
@@ -543,7 +585,6 @@ export function AddProviderPanel({ open, editing, onClose, onSave, onSaved }: Pr
                   </span>
                 )}
               </div>
-              {commonErr && <p className="error">{commonErr}</p>}
               {err && <p className="error">{err}</p>}
               <div className="form-actions">
                 <button type="submit" className="primary" disabled={busy}>

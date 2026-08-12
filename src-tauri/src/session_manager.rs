@@ -1002,8 +1002,17 @@ pub fn sync_session_isolation() -> Result<(), SessionError> {
 pub fn sync_session_isolation_with_progress(
     progress: &dyn Fn(&str),
 ) -> Result<(), SessionError> {
+    sync_session_isolation_for(official_active(), progress)
+}
+
+/// 按明确的目标模式同步隔离。切换事务失败时 profiles.active 可能尚未恢复，
+/// 回滚必须使用快照中的目标值，不能依赖当前 config 推断，否则会把会话再次
+/// 移向失败切换的方向。
+pub fn sync_session_isolation_for(
+    official: bool,
+    progress: &dyn Fn(&str),
+) -> Result<(), SessionError> {
     let items = load_isolated();
-    let official = official_active();
     isolation_log(&format!(
         "sync start official={official} isolated_items={}",
         items.len()
@@ -1309,7 +1318,7 @@ fn project_name_for_cwd(cwd: &str, projects: &[(String, String)]) -> String {
 
 pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
     // 自愈: 按当前激活模式把标记会话放到正确位置 (官方 ↔ 金库隔离区)
-    let _ = sync_session_isolation();
+    sync_session_isolation()?;
     let titles = load_thread_titles();
     let models = load_thread_models();
     let cwds = load_thread_cwds();
@@ -1580,7 +1589,7 @@ pub(crate) fn load_thread_titles() -> HashMap<String, String> {
     titles
 }
 
-/// 从 state_5.sqlite 读线程当前绑定模型（会话列表“用当前模型续聊”判断用）。
+/// 从 state_5.sqlite 读取线程当前绑定模型，供会话扫描与兼容性判断使用。
 pub(crate) fn load_thread_models() -> HashMap<String, String> {
     let mut models = HashMap::new();
     let db_path = codex_config::codex_state_db_path();

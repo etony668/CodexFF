@@ -154,11 +154,14 @@ pub fn scan_openai_sessions() -> Result<Vec<UnifySessionMeta>, session_manager::
                 .strip_prefix(&codex_dir())
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            found.push(UnifySessionMeta {
-                title: titles
+            let title = session_manager::normalize_title(
+                &titles
                     .get(&thread_id)
                     .cloned()
                     .unwrap_or_else(|| session_id.clone()),
+            );
+            found.push(UnifySessionMeta {
+                title,
                 id: session_id,
                 thread_id,
                 path: rel,

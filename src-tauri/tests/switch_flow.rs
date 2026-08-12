@@ -496,7 +496,8 @@ fn relay_auth_marker_roundtrip() {
     vault::delete_relay_key(&p2.id).unwrap();
 }
 
-/// 会话详情: 路径穿越拒绝 + archived 会话按归档根解析
+/// 会话详情: 只返回真实对话 + 路径穿越拒绝 + archived 路径仍可安全解析。
+/// archived 会话不会出现在 scan_sessions 列表，但已有路径的详情读取保持兼容。
 #[test]
 fn session_detail_path_safety_and_archived() {
     let (_dir, _guard) = temp_env("session_path");
@@ -505,12 +506,12 @@ fn session_detail_path_safety_and_archived() {
     fs::create_dir_all(codex.join("archived_sessions")).unwrap();
     fs::write(
         codex.join("sessions/abc.jsonl"),
-        r#"{"type":"session_meta","payload":{"title":"t1","model":"m1"}}"#,
+        r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
     )
     .unwrap();
     fs::write(
         codex.join("archived_sessions/old.jsonl"),
-        r#"{"type":"session_meta","payload":{"title":"t2","model":"m2"}}"#,
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}}"#,
     )
     .unwrap();
     // 造一个 sessions 目录外的文件, 供穿越测试
@@ -679,7 +680,7 @@ fn import_with_config_param_materializes() {
     let config_json = r#"{"auth":{"OPENAI_API_KEY":"sk-import"},"config":"model = \"gpt-5.6-codex\"\nenable_goal_mode = true\n"}"#;
     let b64 = general_purpose::STANDARD.encode(config_json);
     let url = format!(
-        "ccswitch://v1/import?resource=provider&app=codex&name=ImportFull&endpoint=https%3A%2F%2Fimport.example.com%2Fv1&apiKey=sk-import&model=gpt-5.2-codex&config={b64}"
+        "ccswitch://v1/import?resource=provider&app=codex&name=ImportFull&endpoint=https%3A%2F%2F8.8.8.8%2Fv1&apiKey=sk-import&model=gpt-5.2-codex&config={b64}"
     );
 
     let p = profiles::import_from_text(&url).unwrap();
@@ -717,7 +718,7 @@ fn import_with_config_param_materializes() {
     let live = fs::read_to_string(codexff_lib::codex_config::codex_config_path()).unwrap();
     assert!(live.contains("model_provider = \"custom\""), "live: {live}");
     assert!(live.contains("enable_goal_mode = true"), "live: {live}");
-    assert!(live.contains("import.example.com"), "relay 表注入: {live}");
+    assert!(live.contains("8.8.8.8"), "relay 表注入: {live}");
 
     vault::delete_relay_key(&p.id).unwrap();
 }
@@ -730,7 +731,7 @@ fn import_without_config_materializes_defaults() {
     seed_official_auth();
     seed_official_config();
 
-    let url = "ccswitch://v1/import?resource=provider&app=codex&name=ImportPlain&endpoint=https%3A%2F%2Fplain.example.com%2Fv1&apiKey=sk-plain&model=gpt-5.2-codex";
+    let url = "ccswitch://v1/import?resource=provider&app=codex&name=ImportPlain&endpoint=https%3A%2F%2F8.8.4.4%2Fv1&apiKey=sk-plain&model=gpt-5.2-codex";
     let p = profiles::import_from_text(url).unwrap();
 
     let saved = profiles::load_profiles()
@@ -748,12 +749,12 @@ fn import_without_config_materializes_defaults() {
     // config.toml 物化: 完整中转文档
     let cfg = saved.config_toml.as_deref().unwrap();
     assert!(cfg.contains("model = \"gpt-5.2-codex\""), "cfg: {cfg}");
-    assert!(cfg.contains("plain.example.com"), "cfg: {cfg}");
+    assert!(cfg.contains("8.8.4.4"), "cfg: {cfg}");
     assert!(cfg.contains("codexff_relay = true"), "cfg: {cfg}");
 
     profiles::activate_relay(&p.id).unwrap();
     let live = fs::read_to_string(codexff_lib::codex_config::codex_config_path()).unwrap();
-    assert!(live.contains("plain.example.com"), "live: {live}");
+    assert!(live.contains("8.8.4.4"), "live: {live}");
     assert!(live.contains("model_provider = \"custom\""), "live: {live}");
 
     vault::delete_relay_key(&p.id).unwrap();
@@ -826,11 +827,11 @@ fn key_rotation_rebuilds_materialized_auth() {
     seed_official_auth();
     seed_official_config();
 
-    let url = "ccswitch://v1/import?resource=provider&app=codex&name=Rotate&endpoint=https%3A%2F%2Frot.example.com%2Fv1&apiKey=sk-old";
+    let url = "ccswitch://v1/import?resource=provider&app=codex&name=Rotate&endpoint=https%3A%2F%2F1.1.1.1%2Fv1&apiKey=sk-old";
     let p = profiles::import_from_text(url).unwrap();
 
     // 只改 key, auth.json textarea 内容不动 (前端总会回传当前 textarea)
-    let mut input = relay_input("Rotate", "https://rot.example.com/v1", "", "sk-new");
+    let mut input = relay_input("Rotate", "https://1.1.1.1/v1", "", "sk-new");
     input.auth_json = Some(
         profiles::load_profiles().unwrap().relays[0]
             .auth_json

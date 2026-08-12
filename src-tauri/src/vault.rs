@@ -3,15 +3,20 @@
 //! 安全模型:
 //! - 官方凭证只在官方 profile 激活时存在于 ~/.codex/auth.json
 //! - 切到中转时, 官方凭证被 seal 进 vault 并从 auth.json 物理移除
-//! - 中转 key 存 vault 文件 (0600), 默认不访问系统 keyring;
-//!   CODEXFF_KEYRING=1 时才切回 keyring (兼容旧版本, 会触发钥匙串授权)
+//! - 所有凭证以 AES-256-GCM 加密后存 vault，主密钥只存 macOS 钥匙串
 //! - vault 目录权限 700
 //!
 //! 即使代理被绕过、config 被篡改, 中转模式下官方凭证也不在磁盘上。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::Engine;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -139,7 +144,7 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
 
 /// vault 里是否有官方凭证 (决定官方激活时能否自动恢复登录)
 pub fn restore_has_credentials() -> bool {
-    official_auth_path().exists()
+    get_secret("official-auth").ok().flatten().is_some() || official_auth_path().exists()
 }
 
 /// 官方模式下补捕获: codex login 后 vault 尚无官方凭证副本时, 从当前
@@ -150,7 +155,8 @@ pub fn restore_has_credentials() -> bool {
 /// 新 tokens.auth_mode=chatgpt / 非空 OPENAI_API_KEY), 我们写的中转 key
 /// 文件 (带归属标记) 不捕获 — 防止把中转 key 当官方凭证备份。
 pub fn capture_official_if_missing() -> Result<(), VaultError> {
-    if official_auth_path().exists() {
+    migrate_legacy_official_auth()?;
+    if get_secret("official-auth")?.is_some() {
         return Ok(());
     }
     let auth_path = codex_config::codex_auth_path();
@@ -183,7 +189,9 @@ pub fn capture_official_if_missing() -> Result<(), VaultError> {
         })
         .unwrap_or(false);
     if (has_chatgpt || has_new_format || has_api_key) && !is_our_relay_key {
-        atomic_write_bytes(&official_auth_path(), &bytes)?;
+        let official = sanitize_official_auth(&parsed)?;
+        validate_official_auth_value(&official)?;
+        set_secret("official-auth", &serde_json::to_string_pretty(&official)?)?;
     }
     Ok(())
 }
@@ -208,6 +216,112 @@ pub(crate) fn contains_official_credentials(auth: &Value) -> bool {
 /// auth.json 归属标记: 我们写的中转 key 文件带此字段 (识别而非形状猜测)
 const RELAY_AUTH_MARKER: &str = "codexff_relay_key";
 
+fn is_relay_marked(auth: &Value) -> bool {
+    auth.as_object()
+        .and_then(|o| o.get(RELAY_AUTH_MARKER))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// 官方 OAuth 与中转字段曾被第三方工具写进同一个 auth.json 时，只保存
+/// 官方认证所需字段。这样切回官方不会把 relay key/marker 一起恢复。
+///
+/// 没有 OAuth、也没有 CodexFF relay 标记的单独 OPENAI_API_KEY 仍按用户
+/// 手动的官方 API key 保留；一旦存在 OAuth，则 API key 必须移除，避免
+/// 无法判定归属的 key 与官方订阅同时在线。
+fn sanitize_official_auth(auth: &Value) -> Result<Value, VaultError> {
+    let Some(obj) = auth.as_object() else {
+        return Err(VaultError::Keyring("auth.json 必须是 JSON 对象".into()));
+    };
+    if is_relay_marked(auth) && !contains_official_credentials(auth) {
+        return Err(VaultError::Keyring("中转凭证不能保存为官方凭证".into()));
+    }
+
+    if contains_official_credentials(auth) {
+        let mut official = serde_json::Map::new();
+        for key in ["ChatGPT", "auth_mode", "tokens", "last_refresh"] {
+            if let Some(value) = obj.get(key) {
+                official.insert(key.to_string(), value.clone());
+            }
+        }
+        let value = Value::Object(official);
+        if !contains_official_credentials(&value) {
+            return Err(VaultError::Keyring(
+                "官方凭证清洗后缺少 ChatGPT 登录信息".into(),
+            ));
+        }
+        Ok(value)
+    } else {
+        let mut value = auth.clone();
+        if let Some(clean) = value.as_object_mut() {
+            clean.remove(RELAY_AUTH_MARKER);
+        }
+        Ok(value)
+    }
+}
+
+pub(crate) fn validate_official_auth_value(auth: &Value) -> Result<(), VaultError> {
+    if is_relay_marked(auth) {
+        return Err(VaultError::Keyring(
+            "官方 auth.json 中仍有中转归属标记".into(),
+        ));
+    }
+    if contains_official_credentials(auth) {
+        let has_relay_key = auth
+            .as_object()
+            .map(|o| {
+                [
+                    "OPENAI_API_KEY",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                ]
+                .iter()
+                .any(|key| {
+                    o.get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| !v.is_empty())
+                })
+            })
+            .unwrap_or(false);
+        if has_relay_key {
+            return Err(VaultError::Keyring(
+                "官方 OAuth 与第三方 API key 不能同时存在".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_relay_auth_value(auth: &Value) -> Result<(), VaultError> {
+    if contains_official_credentials(auth) {
+        return Err(VaultError::Keyring(
+            "中转 auth.json 中包含官方 ChatGPT 凭证".into(),
+        ));
+    }
+    if !is_relay_marked(auth) {
+        return Err(VaultError::Keyring(
+            "中转 auth.json 缺少 CodexFF 归属标记".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_official_auth_file() -> Result<(), VaultError> {
+    let Some(auth) =
+        codex_config::read_auth_json().map_err(|e| VaultError::Keyring(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    validate_official_auth_value(&auth)
+}
+
+pub fn validate_relay_auth_file() -> Result<(), VaultError> {
+    let auth = codex_config::read_auth_json()
+        .map_err(|e| VaultError::Keyring(e.to_string()))?
+        .ok_or_else(|| VaultError::Keyring("中转 auth.json 不存在".into()))?;
+    validate_relay_auth_value(&auth)
+}
+
 /// seal: 官方凭证从 ~/.codex/auth.json 移入 vault (副本), 然后删除 auth.json。
 /// 之后立刻用中转 key 重写 auth.json 的操作由调用方完成, 此处只保证官方凭证离场。
 ///
@@ -216,6 +330,7 @@ const RELAY_AUTH_MARKER: &str = "codexff_relay_key";
 /// 覆盖已存官方备份 — 防止 relay→relay 切换把官方凭证备份冲掉。
 pub fn seal_official_auth() -> Result<bool, VaultError> {
     ensure_vault_dir()?;
+    migrate_legacy_official_auth()?;
     let auth_path = codex_config::codex_auth_path();
     if !auth_path.exists() {
         return Ok(false);
@@ -232,9 +347,10 @@ pub fn seal_official_auth() -> Result<bool, VaultError> {
         .unwrap_or(false);
 
     if has_official || !is_our_relay_key {
-        if has_official || !official_auth_path().exists() {
-            // 整文件备份 — 官方凭证 + 用户可能放的其他 key 一并保全
-            atomic_write_bytes(&official_auth_path(), &bytes)?;
+        if has_official || get_secret("official-auth")?.is_none() {
+            let official = sanitize_official_auth(&parsed)?;
+            validate_official_auth_value(&official)?;
+            set_secret("official-auth", &serde_json::to_string_pretty(&official)?)?;
         }
     }
     // 物理移除 — 中转模式下官方凭证不存在于 auth.json
@@ -244,12 +360,18 @@ pub fn seal_official_auth() -> Result<bool, VaultError> {
 
 /// restore: vault 里的官方凭证写回 ~/.codex/auth.json
 pub fn restore_official_auth() -> Result<bool, VaultError> {
-    let path = official_auth_path();
-    if !path.exists() {
+    migrate_legacy_official_auth()?;
+    let Some(text) = get_secret("official-auth")? else {
         return Ok(false);
-    }
-    let bytes = fs::read(&path)?;
-    atomic_write_bytes(&codex_config::codex_auth_path(), &bytes)?;
+    };
+    let parsed: Value = serde_json::from_str(&text)?;
+    let official = sanitize_official_auth(&parsed)?;
+    validate_official_auth_value(&official)?;
+    atomic_write_bytes(
+        &codex_config::codex_auth_path(),
+        serde_json::to_string_pretty(&official)?.as_bytes(),
+    )?;
+    validate_official_auth_file()?;
     Ok(true)
 }
 
@@ -289,19 +411,21 @@ pub fn restore_config_backup() -> Result<(), VaultError> {
     Ok(())
 }
 
-// ---- 中转 key 存取: 默认 vault 文件 (0600), keyring 可选 ----
-// GUI 环境下 SecItem 访问每次弹钥匙串授权框 (未签名 app macOS 不记住授权),
-// 且弹窗在部分签名/系统组合下卡死 (采样确认: SecKeychainAddGenericPassword →
-// CSSM_EncryptDataFinal, 即使不在主线程) — 自动流程 (余额查询) 也会触发,
-// 体验灾难。因此默认全走 vault 文件: 与官方凭证同目录同权限 (0600/0700),
-// 威胁模型一致 (官方凭证本就明文存 vault; cc-switch 更是明文 sqlite)。
-// 设置 CODEXFF_KEYRING=1 可切回 keyring (优先, 超时/失败降级文件)。
+// ---- 加密机密存储: AES-256-GCM 文件 + 钥匙串主密钥 ----
+// 只访问一个钥匙串条目，避免每个供应商各弹一次授权。磁盘上的
+// secrets.v1.json 永远只有密文；旧版明文 relay-keys.json / official-auth.json
+// 首次读取后会迁移并删除。
 const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const MASTER_SERVICE: &str = "com.codexff.vault.v2";
+const MASTER_ACCOUNT: &str = "encryption-master-key";
+static MASTER_KEY_CACHE: LazyLock<Mutex<Option<[u8; 32]>>> = LazyLock::new(|| Mutex::new(None));
+static TEST_SECRETS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn keyring_enabled() -> bool {
-    std::env::var("CODEXFF_KEYRING")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncryptedValue {
+    nonce: String,
+    ciphertext: String,
 }
 
 fn keyring_timeout() -> std::time::Duration {
@@ -329,6 +453,214 @@ fn keyring_call<T: Send + 'static>(
     }
 }
 
+fn use_test_secret_store() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("CODEXFF_VAULT_DIR")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+}
+
+fn secrets_path() -> PathBuf {
+    vault_dir().join("secrets.v1.json")
+}
+
+fn master_key() -> Result<[u8; 32], VaultError> {
+    if let Some(key) = *MASTER_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Ok(key);
+    }
+    let existing = keyring_call(|| {
+        let entry =
+            keyring::Entry::new(MASTER_SERVICE, MASTER_ACCOUNT).map_err(|e| e.to_string())?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    })?
+    .ok_or_else(|| VaultError::Keyring("读取钥匙串主密钥超时".into()))?;
+    let key = if let Some(encoded) = existing {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| VaultError::Keyring(format!("钥匙串主密钥损坏: {e}")))?;
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| VaultError::Keyring("钥匙串主密钥长度无效".into()))?
+    } else {
+        let mut key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+        let saved = keyring_call(move || {
+            let entry =
+                keyring::Entry::new(MASTER_SERVICE, MASTER_ACCOUNT).map_err(|e| e.to_string())?;
+            entry.set_password(&encoded).map_err(|e| e.to_string())
+        })?;
+        if saved.is_none() {
+            return Err(VaultError::Keyring("写入钥匙串主密钥超时".into()));
+        }
+        key
+    };
+    *MASTER_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(key);
+    Ok(key)
+}
+
+fn read_encrypted_values() -> Result<HashMap<String, EncryptedValue>, VaultError> {
+    let path = secrets_path();
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_encrypted_values(values: &HashMap<String, EncryptedValue>) -> Result<(), VaultError> {
+    ensure_vault_dir()?;
+    if values.is_empty() {
+        let _ = fs::remove_file(secrets_path());
+        return Ok(());
+    }
+    atomic_write_bytes(
+        &secrets_path(),
+        serde_json::to_string_pretty(values)?.as_bytes(),
+    )
+}
+
+fn encrypt_value(key: &[u8; 32], value: &str) -> Result<EncryptedValue, VaultError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| VaultError::Keyring(e.to_string()))?;
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), value.as_bytes())
+        .map_err(|e| VaultError::Keyring(format!("机密加密失败: {e}")))?;
+    Ok(EncryptedValue {
+        nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
+        ciphertext: base64::engine::general_purpose::STANDARD.encode(ciphertext),
+    })
+}
+
+/// 一次性更新一组机密。生产环境只写一次加密文件，避免多字段保存到一半
+/// 失败后出现“API 报失败但金库已有部分新值”的撕裂状态。
+fn update_secrets(updates: &[(&str, Option<&str>)]) -> Result<(), VaultError> {
+    if use_test_secret_store() {
+        let mut secrets = TEST_SECRETS.lock().unwrap_or_else(|e| e.into_inner());
+        for (account, value) in updates {
+            match value.map(str::trim).filter(|v| !v.is_empty()) {
+                Some(value) => {
+                    secrets.insert((*account).to_string(), value.to_string());
+                }
+                None => {
+                    secrets.remove(*account);
+                }
+            }
+        }
+        return Ok(());
+    }
+    let key = master_key()?;
+    let mut values = read_encrypted_values()?;
+    for (account, value) in updates {
+        match value.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => {
+                values.insert((*account).to_string(), encrypt_value(&key, value)?);
+            }
+            None => {
+                values.remove(*account);
+            }
+        }
+    }
+    write_encrypted_values(&values)
+}
+
+pub fn set_secret(account: &str, value: &str) -> Result<(), VaultError> {
+    update_secrets(&[(account, Some(value))])
+}
+
+pub fn get_secret(account: &str) -> Result<Option<String>, VaultError> {
+    if use_test_secret_store() {
+        return Ok(TEST_SECRETS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account)
+            .cloned());
+    }
+    let values = read_encrypted_values()?;
+    let Some(value) = values.get(account) else {
+        return Ok(None);
+    };
+    let nonce = base64::engine::general_purpose::STANDARD
+        .decode(&value.nonce)
+        .map_err(|e| VaultError::Keyring(format!("机密 nonce 损坏: {e}")))?;
+    let nonce = <[u8; 12]>::try_from(nonce.as_slice())
+        .map_err(|_| VaultError::Keyring("机密 nonce 长度无效".into()))?;
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(&value.ciphertext)
+        .map_err(|e| VaultError::Keyring(format!("机密密文损坏: {e}")))?;
+    let key = master_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| VaultError::Keyring(e.to_string()))?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|_| VaultError::Keyring("机密解密失败，钥匙串主密钥可能已变化".into()))?;
+    String::from_utf8(plaintext)
+        .map(Some)
+        .map_err(|e| VaultError::Keyring(format!("机密文本编码无效: {e}")))
+}
+
+pub fn delete_secret(account: &str) -> Result<(), VaultError> {
+    update_secrets(&[(account, None)])
+}
+
+pub fn set_profile_secret(
+    profile_id: &str,
+    kind: &str,
+    value: Option<&str>,
+) -> Result<(), VaultError> {
+    let account = format!("relay:{profile_id}:{kind}");
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => set_secret(&account, value),
+        None => delete_secret(&account),
+    }
+}
+
+pub fn get_profile_secret(profile_id: &str, kind: &str) -> Result<Option<String>, VaultError> {
+    get_secret(&format!("relay:{profile_id}:{kind}"))
+}
+
+pub fn set_profile_secrets(
+    profile_id: &str,
+    updates: &[(&str, Option<&str>)],
+) -> Result<(), VaultError> {
+    let accounts = updates
+        .iter()
+        .map(|(kind, value)| (format!("relay:{profile_id}:{kind}"), *value))
+        .collect::<Vec<_>>();
+    let refs = accounts
+        .iter()
+        .map(|(account, value)| (account.as_str(), *value))
+        .collect::<Vec<_>>();
+    update_secrets(&refs)?;
+    if updates.iter().any(|(kind, _)| *kind == "key") {
+        file_del_key(profile_id)?;
+    }
+    Ok(())
+}
+
+pub fn delete_profile_secrets(profile_id: &str) -> Result<(), VaultError> {
+    let kinds = [
+        "key",
+        "auth-json",
+        "usage-api-key",
+        "usage-access-token",
+        "config-toml",
+        "usage-script",
+    ];
+    let accounts = kinds
+        .iter()
+        .map(|kind| (format!("relay:{profile_id}:{kind}"), None))
+        .collect::<Vec<_>>();
+    let refs = accounts
+        .iter()
+        .map(|(account, value)| (account.as_str(), *value))
+        .collect::<Vec<_>>();
+    update_secrets(&refs)?;
+    Ok(())
+}
+
 fn relay_keys_path() -> PathBuf {
     vault_dir().join("relay-keys.json")
 }
@@ -338,16 +670,6 @@ fn file_relay_keys() -> std::collections::HashMap<String, String> {
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default()
-}
-
-fn file_set_key(profile_id: &str, key: &str) -> Result<(), VaultError> {
-    ensure_vault_dir()?;
-    let mut m = file_relay_keys();
-    m.insert(profile_id.to_string(), key.to_string());
-    atomic_write_bytes(
-        &relay_keys_path(),
-        serde_json::to_string_pretty(&m)?.as_bytes(),
-    )
 }
 
 fn file_del_key(profile_id: &str) -> Result<(), VaultError> {
@@ -365,72 +687,43 @@ fn file_del_key(profile_id: &str) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// 中转 key 存取入口。默认 vault 文件 (无钥匙串弹窗);
-/// CODEXFF_KEYRING=1 时 keyring 优先, 超时/报错降级文件。
 pub fn set_relay_key(profile_id: &str, key: &str) -> Result<(), VaultError> {
     ensure_vault_dir()?;
-    let pid = profile_id.to_string();
-    if !keyring_enabled() {
-        return file_set_key(&pid, key);
-    }
-    let key = key.to_string();
-    let pid_kr = pid.clone();
-    let key_kr = key.clone();
-    match keyring_call(move || {
-        let entry = keyring::Entry::new("com.codexff.vault", &format!("relay:{pid_kr}"))
-            .map_err(|e| e.to_string())?;
-        entry.set_password(&key_kr).map_err(|e| e.to_string())
-    }) {
-        Ok(Some(())) => Ok(()),
-        _ => file_set_key(&pid, &key),
-    }
+    set_profile_secrets(profile_id, &[("key", Some(key))])
 }
 
 pub fn get_relay_key(profile_id: &str) -> Result<Option<String>, VaultError> {
-    let pid = profile_id.to_string();
-    // 文件优先 — 无钥匙串弹窗 (默认完全不访问 keyring)
-    if let Some(k) = file_relay_keys().get(&pid) {
-        return Ok(Some(k.clone()));
+    if let Some(key) = get_profile_secret(profile_id, "key")? {
+        return Ok(Some(key));
     }
-    // 仅显式开启 CODEXFF_KEYRING=1 时才读 keyring (兼容旧版本存储)
-    if keyring_enabled() {
-        let pid_kr = pid.clone();
-        match keyring_call(move || {
-            let entry = keyring::Entry::new("com.codexff.vault", &format!("relay:{pid_kr}"))
-                .map_err(|e| e.to_string())?;
-            match entry.get_password() {
-                Ok(k) => Ok(Some(k)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(e.to_string()),
-            }
-        }) {
-            Ok(Some(Some(k))) => {
-                let _ = file_set_key(&pid, &k);
-                Ok(Some(k))
-            }
-            _ => Ok(None),
-        }
-    } else {
-        Ok(None)
+    let legacy = file_relay_keys().get(profile_id).cloned();
+    if let Some(key) = legacy {
+        set_profile_secret(profile_id, "key", Some(&key))?;
+        file_del_key(profile_id)?;
+        return Ok(Some(key));
     }
+    Ok(None)
 }
 
 pub fn delete_relay_key(profile_id: &str) -> Result<(), VaultError> {
-    let pid = profile_id.to_string();
-    // 默认只删文件; 仅显式开启 CODEXFF_KEYRING=1 时同步删 keyring 残留
-    if keyring_enabled() {
-        let pid_kr = pid.clone();
-        let _ = keyring_call(move || {
-            let entry = keyring::Entry::new("com.codexff.vault", &format!("relay:{pid_kr}"))
-                .map_err(|e| e.to_string())?;
-            match entry.delete_credential() {
-                Ok(()) => Ok(()),
-                Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(e.to_string()),
-            }
-        });
+    delete_profile_secrets(profile_id)?;
+    file_del_key(profile_id)
+}
+
+fn migrate_legacy_official_auth() -> Result<(), VaultError> {
+    let path = official_auth_path();
+    if !path.exists() {
+        return Ok(());
     }
-    file_del_key(&pid)
+    if get_secret("official-auth")?.is_none() {
+        let bytes = fs::read(&path)?;
+        let parsed: Value = serde_json::from_slice(&bytes)?;
+        let official = sanitize_official_auth(&parsed)?;
+        validate_official_auth_value(&official)?;
+        set_secret("official-auth", &serde_json::to_string_pretty(&official)?)?;
+    }
+    fs::remove_file(path)?;
+    Ok(())
 }
 
 /// 写中转 auth.json。前置条件: 官方凭证已被 seal 移除。
@@ -469,5 +762,53 @@ pub fn write_relay_auth(profile_id: &str, custom_auth: Option<&str>) -> Result<(
             serde_json::json!({ "OPENAI_API_KEY": key, RELAY_AUTH_MARKER: true }).to_string()
         }
     };
-    atomic_write_bytes(&codex_config::codex_auth_path(), text.as_bytes())
+    let parsed: Value = serde_json::from_str(&text)?;
+    validate_relay_auth_value(&parsed)?;
+    atomic_write_bytes(&codex_config::codex_auth_path(), text.as_bytes())?;
+    validate_relay_auth_file()
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_oauth_and_relay_fields_are_split_before_official_storage() {
+        let mixed = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "access_token": "oauth-token" },
+            "OPENAI_API_KEY": "relay-key",
+            RELAY_AUTH_MARKER: true,
+            "unrelated": "drop-me"
+        });
+        let official = sanitize_official_auth(&mixed).expect("sanitize official auth");
+        assert!(contains_official_credentials(&official));
+        assert!(official.get("OPENAI_API_KEY").is_none());
+        assert!(official.get(RELAY_AUTH_MARKER).is_none());
+        assert!(official.get("unrelated").is_none());
+        validate_official_auth_value(&official).expect("official credentials are isolated");
+    }
+
+    #[test]
+    fn relay_validation_rejects_official_credentials_and_missing_marker() {
+        let mixed = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "access_token": "oauth-token" },
+            "OPENAI_API_KEY": "relay-key",
+            RELAY_AUTH_MARKER: true
+        });
+        assert!(validate_relay_auth_value(&mixed).is_err());
+        assert!(validate_relay_auth_value(&serde_json::json!({
+            "OPENAI_API_KEY": "relay-key"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn unmarked_api_key_only_auth_remains_valid_official_api_key() {
+        let api_key = serde_json::json!({ "OPENAI_API_KEY": "user-official-key" });
+        let official = sanitize_official_auth(&api_key).expect("sanitize api key auth");
+        assert_eq!(official, api_key);
+        validate_official_auth_value(&official).expect("standalone official api key accepted");
+    }
 }

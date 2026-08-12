@@ -1,6 +1,6 @@
 [package]
 name = "codexff"
-version = "1.0.190"
+version = "1.0.196"
 description = "Codex profile switcher with credential vault, local proxy and session manager"
 authors = ["codexff"]
 edition = "2021"
@@ -34,9 +34,14 @@ env_logger = "0.11"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+aes-gcm = "0.10"
+ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
 core-foundation-sys = "0.8"
 tauri-plugin-deep-link = "2.4.9"
 rquickjs = "0.12.2"
+obfstr = "0.2"
 libc = "0.2"
 
 [dev-dependencies]

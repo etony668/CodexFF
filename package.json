@@ -1,7 +1,7 @@
 {
   "name": "codexff",
   "private": true,
-  "version": "1.0.190",
+  "version": "1.0.196",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "sync-version": "node scripts/sync-version.mjs",
+    "bump-version": "node scripts/bump-version.mjs",
     "build:app": "node scripts/build-app.mjs"
   },
   "dependencies": {

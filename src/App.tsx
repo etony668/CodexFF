@@ -5,14 +5,10 @@ import {
   DnsLeakResult,
   activateOfficial,
   activateRelay,
-  applySessionModelRemap,
   checkDnsLeak,
   checkIp,
   errMsg,
-  forceQuitApp,
   getStatus,
-  isCodexRunning,
-  previewSessionModelRemap,
   takePendingDeeplink,
 } from "./api";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -30,9 +26,7 @@ type Tab = "profiles" | "sessions" | "workflow" | "pets" | "settings";
 function App() {
   const [tab, setTab] = useState<Tab>("profiles");
   const [status, setStatus] = useState<AppStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [exitBlocked, setExitBlocked] = useState(false);
 
   // 请求序号: get_status 含出网 IP 检测 (最坏 ~6s), 并发时慢响应
   // 不得覆盖新响应 (切换后 UI 显示旧状态)
@@ -44,10 +38,9 @@ function App() {
       const s = await getStatus();
       if (seq !== refreshSeq.current) return; // 已有更新的刷新, 丢弃旧结果
       setStatus(s);
-      setError(null);
     } catch (e) {
       if (seq !== refreshSeq.current) return;
-      setError(errMsg(e));
+      showErrorToast("状态刷新失败", errMsg(e));
     }
   }
 
@@ -57,9 +50,8 @@ function App() {
       const msg = e.payload;
       if (msg.startsWith("imported:")) {
         setNotice(`✓ 已通过链接导入 "${msg.slice(9)}"`);
-        setError(null);
       } else {
-        setError(msg);
+        showErrorToast("链接导入失败", msg);
       }
       setTab("profiles");
       refresh();
@@ -121,36 +113,24 @@ function App() {
         if (!msg) return;
         if (msg.startsWith("imported:")) {
           setNotice(`✓ 已通过链接导入 "${msg.slice(9)}"`);
-          setError(null);
         } else {
-          setError(msg);
+          showErrorToast("链接导入失败", msg);
         }
         setTab("profiles");
         refresh();
       })
-      .catch((e) => setError(errMsg(e)));
+      .catch((e) => showErrorToast("链接处理失败", errMsg(e)));
   }, []);
 
   const [switching, setSwitching] = useState(false);
   // 切换检测进度 (官方模式: 出口 IP → 基线比对 → 写入配置)
   const [switchStep, setSwitchStep] = useState<string | null>(null);
 
-  // 切换实际执行：自动把不兼容旧会话迁移到当前供应商模型（无需手动操作）
+  // 切换时不批量改写历史会话；续聊由本地路由按当前供应商适配。
   async function performSwitch(sel: "official" | string, force: boolean) {
     if (switching) return; // 防双击并发切换 (config 读写非原子, 会互相覆盖)
     setSwitching(true);
     try {
-      // 1. 先检查旧会话模型兼容性
-      setSwitchStep("检查旧会话模型…");
-      const preview = await previewSessionModelRemap(sel === "official" ? null : sel);
-      const needMigrate = preview.threads.length > 0 && !preview.models_unknown;
-      // 请求层归一化兜底: Codex 运行中也允许切换, 本地路由会把请求 model
-      // 改写为当前供应商默认模型, 旧会话无需退出即可接续。
-      const codexRunning = needMigrate
-        ? await isCodexRunning().catch(() => false)
-        : false;
-
-      // 2. 写配置
       if (sel === "official") {
         setSwitchStep("写入官方配置与凭证…");
         await activateOfficial(force);
@@ -163,37 +143,15 @@ function App() {
           ? "官方订阅"
           : status?.relays.find((r) => r.id === sel)?.name ?? sel;
 
-      // 3. 自动迁移全部不兼容旧会话 (Codex 运行中跳过 — 由本地路由请求层归一化)
-      if (needMigrate && !codexRunning) {
-        setSwitchStep("迁移旧会话模型…");
-        const ids = preview.threads.map((t) => t.thread_id);
-        try {
-          const out = await applySessionModelRemap(ids);
-          setSwitchStep(null);
-          await refresh();
-          setNotice(
-            `已切换到 ${relayName}，${out.remapped + out.restored} 个旧会话已自动改用当前模型，可以直接接续。`
-          );
-        } catch (e) {
-          setSwitchStep(null);
-          await refresh();
-          setNotice(
-            `已切换到 ${relayName}，但旧会话模型迁移失败：${errMsg(e)}。`
-          );
-        }
-      } else if (needMigrate && codexRunning) {
-        setSwitchStep(null);
-        await refresh();
-        setNotice(
-          `已切换到 ${relayName}。${preview.threads.length} 个旧会话模型由本地路由自动适配，可以直接接续。`
-        );
-      } else {
-        setSwitchStep(null);
-        await refresh();
-        setNotice(`已切换到 ${relayName}。`);
-      }
+      setSwitchStep(null);
+      await refresh();
+      setNotice(
+        sel === "official"
+          ? `已切换到 ${relayName}。`
+          : `已切换到 ${relayName}。历史会话由兼容层按当前供应商适配，原始会话记录未修改。`
+      );
     } catch (e) {
-      setError(errMsg(e));
+      showErrorToast("切换失败", errMsg(e));
     } finally {
       setSwitching(false);
       setSwitchStep(null);
@@ -236,7 +194,7 @@ function App() {
     } catch (e) {
       setSwitching(false);
       setSwitchStep(null);
-      setError(errMsg(e));
+      showErrorToast("切换失败", errMsg(e));
     }
   }
 
@@ -265,6 +223,9 @@ function App() {
   } | null>(null);
   // 子页面请求的通用悬浮提示 (统一在 App 的提示容器里, 避免多个容器重叠)
   const [pageToast, setPageToast] = useState<ToastRequest | null>(null);
+  function showErrorToast(title: string, message: string) {
+    setPageToast({ title, message, kind: "warn" });
+  }
   // 首次运行引导 (钥匙串/授权弹窗说明 + 隐私确认)
   const [firstRunOpen, setFirstRunOpen] = useState(false);
   // 主题: 默认跟随系统, 用户可手动切换 (auto=跟随系统 / light / dark), 记忆到本地
@@ -309,6 +270,7 @@ function App() {
       setDnsLeak(r);
     } catch (e) {
       setDnsLeak({ token: "", resolver_ips: [], current_ip: null, leaking: null, rounds: 0, error: errMsg(e), doh_protected: false, dns_via_proxy: null });
+      showErrorToast("DNS 泄露检测失败", errMsg(e));
     } finally {
       setDnsChecking(false);
     }
@@ -328,26 +290,24 @@ function App() {
     };
   }, []);
 
-  // 退出拦截: 路由开启 + Codex 运行中时, 后端阻止退出并通知前端确认
   useEffect(() => {
-    const unlisten = listen("exit-blocked", () => {
-      setExitBlocked(true);
+    const unlisten = listen<string>("switch-warning", (event) => {
+      showErrorToast(
+        "切换已完成，但有一项记录失败",
+        event.payload,
+      );
     });
     return () => {
       unlisten.then((f) => f());
     };
   }, []);
 
-  // 会话模型迁移进度（并发改写大文件时逐文件上报）
+  // 退出拦截: 路由开启 + Codex 运行中时，后端阻止退出并显示倒计时提示。
   useEffect(() => {
-    const unlisten = listen<{
-      done: number;
-      total: number;
-      current: string | null;
-    }>("session-model-remap-progress", (e) => {
-      const p = e.payload;
-      setSwitchStep(
-        `迁移旧会话模型（${p.done}/${p.total}）${p.current ? ` · ${p.current}` : ""}…`
+    const unlisten = listen("exit-blocked", () => {
+      showErrorToast(
+        "暂时无法退出",
+        "Codex 正在使用本地路由。请先完全退出 Codex / ChatGPT 桌面端与命令行，再退出 CodexFF。",
       );
     });
     return () => {
@@ -499,36 +459,6 @@ function App() {
           <button onClick={() => setNotice(null)}>×</button>
         </div>
       )}
-      {exitBlocked && (
-        <div className="exit-blocked-overlay">
-          <div className="exit-blocked-box">
-            <h3>Codex 正在使用本地路由</h3>
-            <p>
-              直接退出会断开当前 Codex 会话（请求会打到已关闭的本地代理而失败）。
-              请先完全退出 Codex / ChatGPT 桌面端与命令行，再退出 CodexFF Pro。
-            </p>
-            <div className="exit-blocked-actions">
-              <button onClick={() => setExitBlocked(false)}>知道了</button>
-              <button
-                className="danger"
-                onClick={() => {
-                  setExitBlocked(false);
-                  void forceQuitApp();
-                }}
-              >
-                仍然退出
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {error && (
-        <div className="error-banner">
-          {error}
-          <button onClick={() => setError(null)}>×</button>
-        </div>
-      )}
-
       <main className="app-main">
         {tab === "profiles" && (
           <ProfilesPage
@@ -537,6 +467,7 @@ function App() {
             onChanged={refresh}
             switching={switching}
             switchingLabel={switchStep ?? undefined}
+            onToast={setPageToast}
           />
         )}
         {tab === "sessions" && <SessionsPage onToast={setPageToast} />}
@@ -549,6 +480,7 @@ function App() {
             dnsLeak={dnsLeak}
             dnsChecking={dnsChecking}
             onRunDnsCheck={runDnsCheck}
+            onToast={setPageToast}
           />
         )}
       </main>

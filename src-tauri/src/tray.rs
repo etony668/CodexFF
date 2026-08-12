@@ -48,9 +48,9 @@ fn handle_menu_event(app: &AppHandle, event_id: &str) {
         "show_main" => show_main_window(app),
         "quit" => {
             log::info!("状态栏菜单退出");
-            // Codex 仍指向本地路由时不能直接退出: Codex 不重读 config,
-            // 下一请求仍打本地端口 → 502。弹窗提示先退出 Codex。
-            if crate::local_router::codex_points_at_router()
+            // 本地路由正在为 Codex 转发时不能直接退出: Codex 不会重读 config,
+            // 下一请求仍打本地端口 → 502。提示先退出 Codex。
+            if crate::local_router::codex_may_depend_on_router()
                 && crate::session_manager::codex_running()
             {
                 use tauri::Emitter;

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export type FloatingToastKind = "info" | "warn" | "confirm";
 
@@ -29,17 +29,32 @@ export function FloatingToast({
 }: FloatingToastProps) {
   const isConfirm = kind === "confirm";
   const onCloseRef = useRef(onClose);
+  const [remainingSeconds, setRemainingSeconds] = useState(() =>
+    Math.max(1, Math.ceil(durationMs / 1000)),
+  );
   useEffect(() => {
     onCloseRef.current = onClose;
   }, [onClose]);
 
   // 需要用户确认时取消倒计时, 由用户点击确认/取消关闭;
-  // 普通提示按 durationMs 自动消失。
+  // 普通提示统一展示倒计时并按 durationMs 自动消失。
   useEffect(() => {
     if (isConfirm) return;
+    const startedAt = Date.now();
+    setRemainingSeconds(Math.max(1, Math.ceil(durationMs / 1000)));
+    const countdown = window.setInterval(() => {
+      const remaining = Math.max(
+        1,
+        Math.ceil((durationMs - (Date.now() - startedAt)) / 1000),
+      );
+      setRemainingSeconds(remaining);
+    }, 200);
     const timer = window.setTimeout(() => onCloseRef.current(), durationMs);
-    return () => window.clearTimeout(timer);
-  }, [isConfirm, durationMs]);
+    return () => {
+      window.clearInterval(countdown);
+      window.clearTimeout(timer);
+    };
+  }, [isConfirm, durationMs, title, message]);
 
   return (
     <div
@@ -47,7 +62,10 @@ export function FloatingToast({
       role={isConfirm ? "alertdialog" : "alert"}
     >
       {title && <span className="floating-toast-title">{title}</span>}
-      <span className="floating-toast-message">{message}</span>
+      <span className="floating-toast-message">
+        {message}
+        {!isConfirm && `（${remainingSeconds} 秒后自动关闭）`}
+      </span>
       {isConfirm ? (
         <div className="floating-toast-actions">
           <button className="primary" onClick={onConfirm}>
