@@ -335,6 +335,16 @@ pub(crate) fn state_db_conn_rw() -> Result<Connection, SessionError> {
     Ok(conn)
 }
 
+/// 只读连接 — Codex 运行中写库时也能安全读取 (WAL 下读写不互斥)。
+pub(crate) fn state_db_conn_ro() -> Result<Connection, SessionError> {
+    let conn = Connection::open_with_flags(
+        codex_config::codex_state_db_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    Ok(conn)
+}
+
 /// 确保隔离备份表存在 (同结构空表; 仅存隔离期间, 不复制触发器/索引)
 fn ensure_db_backup_tables(conn: &Connection) -> Result<(), SessionError> {
     for (src, dst) in [

@@ -647,18 +647,30 @@ fn collect_rollout_files(
             }
         }
     }
+    // 按最近修改倒序 — 活跃会话排最前, “是否还需要清洗”的判断能在
+    // 毫秒级命中, 不会因为先扫几百个旧会话拖慢切换/自愈。
+    files.sort_by(|a, b| {
+        let ma = std::fs::metadata(a).and_then(|m| m.modified()).ok();
+        let mb = std::fs::metadata(b).and_then(|m| m.modified()).ok();
+        mb.cmp(&ma)
+    });
     Ok(files)
 }
 
 /// 是否存在需要清洗的 reasoning 条目（切中转前快速判断）。
-pub fn reasoning_sanitize_needed() -> Result<bool, ModelRemapError> {
-    let conn = session_manager::state_db_conn_rw()?;
-    for f in collect_rollout_files(&conn, None)? {
-        if count_offending_reasoning(&f).unwrap_or(0) > 0 {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+///
+/// fail-open: 数据库被 Codex 占用/读取异常时按“需要清洗”处理, 让本地路由
+/// 兜底清洗, 而不是静默跳过导致直连中转报错。
+pub fn reasoning_sanitize_needed() -> bool {
+    let Ok(conn) = session_manager::state_db_conn_ro() else {
+        return true;
+    };
+    let Ok(files) = collect_rollout_files(&conn, None) else {
+        return true;
+    };
+    files
+        .iter()
+        .any(|f| count_offending_reasoning(f).unwrap_or(1) > 0)
 }
 
 /// 流式改写 reasoning 条目的 content → []。失败时删除临时文件、原文件不动。

@@ -90,6 +90,10 @@ struct AppStatus {
     version: String,
 }
 
+/// 本地路由自愈节流 (30s): 中转激活 + 会话需要清洗 + Codex 运行中时,
+/// 本地路由必须开启做请求层清洗, 防止实例重启/切换流程漏开导致直连中转报错。
+static ROUTER_HEAL_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[tauri::command]
 async fn get_status() -> Result<AppStatus, ApiError> {
     let active = profiles::current_active().ok();
@@ -99,6 +103,25 @@ async fn get_status() -> Result<AppStatus, ApiError> {
     let _ = vault::capture_official_if_missing();
     let official_login_present = vault::restore_has_credentials();
     let ip = ip_guard::check_ip().await;
+    // 自愈: 中转激活 + 会话需要清洗 + Codex 运行中 → 确保本地路由开启。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(ROUTER_HEAL_LAST.load(std::sync::atomic::Ordering::Relaxed)) >= 30 {
+        if !local_router::status().enabled {
+            if let Ok(crate::profiles::ActiveSelection::Relay { .. }) =
+                crate::profiles::current_active()
+            {
+                if crate::session_manager::codex_running()
+                    && crate::session_model::reasoning_sanitize_needed()
+                {
+                    let _ = local_router::set_enabled(true).await;
+                }
+            }
+        }
+        ROUTER_HEAL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(AppStatus {
         active,
         relays,
@@ -214,12 +237,12 @@ async fn activate_relay(
     local_router::sync_active();
     // Codex 正在运行且会话里存在需要清洗的推理数据时, 无法安全改写会话文件 →
     // 自动开启本地路由, 在请求层清洗, 保证所有第三方 GPT 中转都能用。
-    if crate::session_manager::codex_running() {
-        if let Ok(true) = crate::session_model::reasoning_sanitize_needed() {
-            let _ = app.emit("switch-progress", "自动开启本地路由清洗会话数据…");
-            if let Ok(status) = local_router::set_enabled(true).await {
-                let _ = app.emit("router-status", status);
-            }
+    if crate::session_manager::codex_running()
+        && crate::session_model::reasoning_sanitize_needed()
+    {
+        let _ = app.emit("switch-progress", "自动开启本地路由清洗会话数据…");
+        if let Ok(status) = local_router::set_enabled(true).await {
+            let _ = app.emit("router-status", status);
         }
     }
     let _ = app.emit("provider-changed", ());
@@ -970,8 +993,7 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use tauri::Emitter;
-                    let needed = crate::session_model::reasoning_sanitize_needed()
-                        .unwrap_or(false);
+                    let needed = crate::session_model::reasoning_sanitize_needed();
                     if !needed {
                         return;
                     }
