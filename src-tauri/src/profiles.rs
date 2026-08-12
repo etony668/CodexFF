@@ -816,6 +816,17 @@ pub fn activate_official_with_progress(
     vault::clear_relay_state();
     profiles.active = Some(ActiveSelection::Official);
     save_profiles(&profiles)?;
+    // 3.5 清洗 reasoning 条目 (官方 Responses schema 要求 encrypted_content
+    // 存在时 content 为空数组)。Codex 正在运行会自动跳过, 本地路由请求层兜底。
+    progress("清洗会话推理数据…");
+    if let Err(e) = crate::session_model::sanitize_reasoning_content(None, &|p| {
+        progress(&format!(
+            "清洗会话推理数据 ({}/{})…",
+            p.done, p.total
+        ));
+    }) {
+        log::warn!("官方激活后清洗会话推理数据失败: {e}");
+    }
     // 4. 会话隔离: 标记的会话移入金库隔离区, 官方 CLI 扫不到
     progress("隔离标记会话…");
     if let Err(e) = crate::session_manager::sync_session_isolation_with_progress(progress) {
@@ -932,6 +943,18 @@ pub fn activate_relay_with_progress(
         profile_id: profile_id.to_string(),
     });
     save_profiles(&profiles)?;
+    // 3.5 清洗 reasoning 条目 — 保证直通官方 Responses API 的第三方中转
+    // (皮卡丘等) 不会被 array_above_max_length 拒掉。Codex 正在运行会自动跳过,
+    // 由本地路由在请求层兜底清洗。
+    progress("清洗会话推理数据…");
+    if let Err(e) = crate::session_model::sanitize_reasoning_content(None, &|p| {
+        progress(&format!(
+            "清洗会话推理数据 ({}/{})…",
+            p.done, p.total
+        ));
+    }) {
+        log::warn!("中转激活后清洗会话推理数据失败: {e}");
+    }
     // 4. 会话恢复: 标记的会话从金库隔离区移回 codex 目录
     progress("恢复标记会话…");
     if let Err(e) = crate::session_manager::sync_session_isolation_with_progress(progress) {

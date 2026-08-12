@@ -553,9 +553,275 @@ pub fn remap_single_thread(
     )
 }
 
+/// 清洗进度（前端展示 "清洗会话推理数据 (x/y) …"）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SanitizeProgress {
+    pub done: usize,
+    pub total: usize,
+    pub current: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SanitizeOutcome {
+    pub sanitized_files: usize,
+    pub sanitized_items: usize,
+    /// Codex 正在运行时跳过（会话文件写入中，不能安全改写）
+    pub skipped_running: bool,
+    pub backups: Vec<String>,
+}
+
+/// reasoning 条目是否需要清洗: 官方 Responses schema 要求 reasoning 条目
+/// 只要带 encrypted_content 字段（即使为 null）content 就必须是空数组。
+/// Codex 写第三方供应商会话时会产生 content+encrypted_content:null 的组合，
+/// 直通官方 Responses API 的中转（皮卡丘等）会 400（array_above_max_length）。
+fn reasoning_content_needs_sanitize(v: &Value) -> bool {
+    let Some(pl) = v
+        .get("payload")
+        .and_then(|p| p.as_object())
+    else {
+        return false;
+    };
+    if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        return false;
+    }
+    if pl.get("type").and_then(|t| t.as_str()) != Some("reasoning") {
+        return false;
+    }
+    if !pl.contains_key("encrypted_content") {
+        return false;
+    }
+    pl.get("content")
+        .and_then(|c| c.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+}
+
+fn count_offending_reasoning(path: &Path) -> Result<usize, ModelRemapError> {
+    let input = std::fs::File::open(path).map_err(SessionError::Io)?;
+    let reader = BufReader::new(input);
+    let mut n = 0usize;
+    for line in reader.lines() {
+        let line = line.map_err(SessionError::Io)?;
+        if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+            if reasoning_content_needs_sanitize(&v) {
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// 收集线程对应的 rollout 文件（去重，普通 + 隔离区 + 归档一起）。
+fn collect_rollout_files(
+    conn: &Connection,
+    thread_ids: Option<&[String]>,
+) -> Result<Vec<PathBuf>, ModelRemapError> {
+    let ids: Vec<String> = match thread_ids {
+        Some(list) => list.to_vec(),
+        None => {
+            let mut stmt = conn
+                .prepare("SELECT id FROM threads")
+                .map_err(|e| ModelRemapError::Other(format!("读取会话列表失败: {e}")))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| ModelRemapError::Other(format!("读取会话列表失败: {e}")))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| ModelRemapError::Other(format!("读取会话列表失败: {e}")))?);
+            }
+            out
+        }
+    };
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let states = load_thread_states(conn, &ids)?;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for (_thread_id, st) in states {
+        if let Some(rel) = &st.rollout_path {
+            for f in resolve_rollout_files(rel) {
+                if seen.insert(f.clone()) {
+                    files.push(f);
+                }
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// 是否存在需要清洗的 reasoning 条目（切中转前快速判断）。
+pub fn reasoning_sanitize_needed() -> Result<bool, ModelRemapError> {
+    let conn = session_manager::state_db_conn_rw()?;
+    for f in collect_rollout_files(&conn, None)? {
+        if count_offending_reasoning(&f).unwrap_or(0) > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 流式改写 reasoning 条目的 content → []。失败时删除临时文件、原文件不动。
+fn rewrite_reasoning_content(path: &Path) -> Result<(), ModelRemapError> {
+    let tmp = path.with_extension("jsonl.reasoning-tmp");
+    let result = (|| -> Result<(), ModelRemapError> {
+        let input = std::fs::File::open(path).map_err(SessionError::Io)?;
+        let mut reader = BufReader::new(input);
+        let output = std::fs::File::create(&tmp).map_err(SessionError::Io)?;
+        let mut writer = BufWriter::new(output);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).map_err(SessionError::Io)?;
+            if n == 0 {
+                break;
+            }
+            let mut changed = line.clone();
+            if let Ok(mut v) = serde_json::from_str::<Value>(line.trim()) {
+                if reasoning_content_needs_sanitize(&v) {
+                    if let Some(pl) = v
+                        .get_mut("payload")
+                        .and_then(|p| p.as_object_mut())
+                    {
+                        pl.insert(
+                            "content".into(),
+                            serde_json::json!([]),
+                        );
+                        changed = serde_json::to_string(&v)
+                            .map_err(|e| ModelRemapError::Other(e.to_string()))?;
+                        changed.push('\n');
+                    }
+                }
+            }
+            writer
+                .write_all(changed.as_bytes())
+                .map_err(SessionError::Io)?;
+        }
+        writer
+            .flush()
+            .map_err(SessionError::Io)?;
+        writer
+            .into_inner()
+            .map_err(|e| SessionError::Io(e.into_error()))?
+            .sync_all()
+            .map_err(SessionError::Io)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            std::fs::rename(&tmp, path).map_err(SessionError::Io)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 清洗所有（或指定）线程 rollout 里不合规的 reasoning 条目。
+/// Codex 正在运行时跳过（返回 skipped_running=true），由本地路由在请求层兜底。
+pub fn sanitize_reasoning_content(
+    thread_ids: Option<&[String]>,
+    progress: &dyn Fn(SanitizeProgress),
+) -> Result<SanitizeOutcome, ModelRemapError> {
+    let skipped_running = session_manager::codex_running();
+    if skipped_running {
+        log::warn!("清洗 reasoning 条目需修改 Codex 会话数据，Codex 正在运行，跳过");
+        return Ok(SanitizeOutcome {
+            sanitized_files: 0,
+            sanitized_items: 0,
+            skipped_running: true,
+            backups: Vec::new(),
+        });
+    }
+    let conn = session_manager::state_db_conn_rw()?;
+    let files = collect_rollout_files(&conn, thread_ids)?;
+    let total = files.len();
+    let mut outcome = SanitizeOutcome {
+        sanitized_files: 0,
+        sanitized_items: 0,
+        skipped_running: false,
+        backups: Vec::new(),
+    };
+    for (i, f) in files.iter().enumerate() {
+        progress(SanitizeProgress {
+            done: i + 1,
+            total,
+            current: f.file_name().map(|n| n.to_string_lossy().into_owned()),
+        });
+        let count = match count_offending_reasoning(f) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("扫描会话推理数据失败 {}: {e}", f.display());
+                continue;
+            }
+        };
+        if count == 0 {
+            continue;
+        }
+        let Some(backup) = crate::vault::backup_snapshot("session-reasoning", f) else {
+            log::warn!("备份会话文件失败，跳过清洗 {}", f.display());
+            continue;
+        };
+        if let Err(e) = rewrite_reasoning_content(f) {
+            log::warn!("清洗会话推理数据失败 {}: {e}", f.display());
+            continue;
+        }
+        outcome.sanitized_files += 1;
+        outcome.sanitized_items += count;
+        outcome
+            .backups
+            .push(backup.to_string_lossy().into_owned());
+    }
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_needs_sanitize_only_when_ec_present_with_content() {
+        let ok_empty: Value = serde_json::from_str(
+            r#"{"type":"response_item","payload":{"type":"reasoning","id":"r1","summary":[],"content":[],"encrypted_content":null}}"#,
+        )
+        .unwrap();
+        assert!(!reasoning_content_needs_sanitize(&ok_empty));
+
+        let bad: Value = serde_json::from_str(
+            r#"{"type":"response_item","payload":{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"x"}],"encrypted_content":null}}"#,
+        )
+        .unwrap();
+        assert!(reasoning_content_needs_sanitize(&bad));
+
+        let no_ec: Value = serde_json::from_str(
+            r#"{"type":"response_item","payload":{"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"x"}]}}"#,
+        )
+        .unwrap();
+        assert!(!reasoning_content_needs_sanitize(&no_ec));
+    }
+
+    #[test]
+    fn rewrite_reasoning_empties_content_and_preserves_other_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("reasoning.jsonl");
+        std::fs::write(
+            &p,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"id\":\"r1\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"x\"}],\"encrypted_content\":null}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        rewrite_reasoning_content(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("\"content\":[]"));
+        assert!(text.contains("\"type\":\"reasoning\""));
+        assert!(text.contains("\"type\":\"message\""));
+        assert!(!text.contains("reasoning_text"));
+    }
 
     #[test]
     fn rollout_settings_rewritten() {

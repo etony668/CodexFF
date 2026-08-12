@@ -265,6 +265,20 @@ pub fn backup_config() -> Result<Option<PathBuf>, VaultError> {
     Ok(Some(backup))
 }
 
+/// 会话/代理配置等大文件的快照备份: 复制到 vault/backups/{kind}-{ts}-{name}。
+/// 备份失败返回 None（调用方按告警处理，不阻断主流程）。
+pub fn backup_snapshot(kind: &str, path: &Path) -> Option<PathBuf> {
+    ensure_vault_dir().ok()?;
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session.jsonl".into());
+    let dest = backup_dir().join(format!("{kind}-{ts}-{name}"));
+    fs::copy(path, &dest).ok()?;
+    Some(dest)
+}
+
 /// 回滚 config.toml 到备份
 pub fn restore_config_backup() -> Result<(), VaultError> {
     let backup = backup_dir().join("config.toml");

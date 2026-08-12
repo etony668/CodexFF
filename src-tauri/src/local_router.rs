@@ -6,14 +6,17 @@
 //! - 用量日志: 从响应/SSE 流中提取 model 与 usage token, 写入 usage_stats
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::profiles::{self, ActiveSelection};
 use crate::usage_stats::{self, UsageLogEntry};
@@ -74,6 +77,75 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// 直通官方 Responses API 的中转会严格校验 input 里的 reasoning 条目:
+/// encrypted_content 字段存在（即使 null）时 content 必须为空数组，否则返回
+/// 400 array_above_max_length。这里在请求层把不合规条目清空，保证任何第三方
+/// GPT 中转都能用；解析失败或非 responses 请求原样转发。
+fn sanitize_responses_body(body: &Bytes, uri: &Uri) -> Bytes {
+    let path = uri.path();
+    if !path.ends_with("/responses") {
+        return body.clone();
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(input) = v.get_mut("input").and_then(|i| i.as_array_mut()) else {
+        return body.clone();
+    };
+    let mut changed = false;
+    for item in input.iter_mut() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(typ) = obj.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        match typ {
+            "reasoning" => {
+                if obj.contains_key("encrypted_content") {
+                    let content_nonempty = obj
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false);
+                    if content_nonempty {
+                        obj.insert("content".into(), serde_json::json!([]));
+                        changed = true;
+                    }
+                }
+            }
+            "function_call"
+            | "function_call_output"
+            | "custom_tool_call"
+            | "custom_tool_call_output" => {
+                if obj.remove("content").is_some() {
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !changed {
+        return body.clone();
+    }
+    serde_json::to_vec(&v)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| body.clone())
+}
+
+/// mpsc 接收端包装成 axum 可用的 Stream（响应逐块回传，不整包缓冲）。
+struct RxStream {
+    rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+impl Stream for RxStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
 }
 
 /// 熔断器: 连续失败计数 + 冷却期
@@ -381,7 +453,16 @@ async fn forward(
             continue;
         };
         attempted.push(p.id.clone());
-        let url = format!("{}{}", p.base_url.trim_end_matches('/'), uri.path_and_query().map(|q| q.as_str()).unwrap_or(""));
+        // 本地路由 base_url 统一写成 http://127.0.0.1:PORT/v1, Codex 会请求
+        // /v1/responses; 转发时必须剥掉 /v1 前缀, 还原成直连形态
+        // (base_url 无 /v1 的 DeepSeek/皮卡丘 = /responses, 带 /v1 的 =
+        // /v1/responses), 否则根路径直达的中转会 404。
+        let raw_path = uri
+            .path_and_query()
+            .map(|q| q.as_str())
+            .unwrap_or("");
+        let forward_path = raw_path.strip_prefix("/v1").unwrap_or(raw_path);
+        let url = format!("{}{}", p.base_url.trim_end_matches('/'), forward_path);
     let http = client();
     let mut req = http
             .request(method.clone(), &url)
@@ -408,27 +489,62 @@ async fn forward(
                     .get("content-type")
                     .map(|v| v.to_str().unwrap_or("application/json").to_string())
                     .unwrap_or_else(|| "application/json".to_string());
-                // 读取响应并采样 usage (接入阶段改为流式 tee)
-                let (model, prompt, completion, total) =
-                    stream_and_extract(resp).await;
-                let cost = estimate_cost(model.as_deref(), prompt, completion);
-                usage_stats::append_usage_log(UsageLogEntry {
-                    ts_ms: now_ms(),
-                    provider_id: p.id.clone(),
-                    provider_name: p.name.clone(),
-                    model,
-                    wire_api: p.wire_api.clone(),
-                    prompt_tokens: prompt,
-                    completion_tokens: completion,
-                    total_tokens: total,
-                    cost,
-                    status,
-                    error: None,
+                // 流式转发 (SSE tee): 逐块回给客户端, 同时采样 usage/model。
+                let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+                let sampler: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+                let sampler_task = Arc::clone(&sampler);
+                let stream = resp.bytes_stream();
+                let pid = p.id.clone();
+                let pname = p.name.clone();
+                let wire = p.wire_api.clone();
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    const SAMPLE_CAP: usize = 8 * 1024 * 1024;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(b) => {
+                                {
+                                    let mut buf = sampler_task
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if buf.len() < SAMPLE_CAP {
+                                        buf.extend_from_slice(&b);
+                                    }
+                                }
+                                if tx.send(Ok(b)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(std::io::Error::other(e.to_string())))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    let buf = sampler_task.lock().map(|g| g.clone()).unwrap_or_default();
+                    let text = String::from_utf8_lossy(&buf);
+                    let (model, prompt, completion, total) = extract_usage_from_text(&text);
+                    let cost = estimate_cost(model.as_deref(), prompt, completion);
+                    usage_stats::append_usage_log(UsageLogEntry {
+                        ts_ms: now_ms(),
+                        provider_id: pid,
+                        provider_name: pname,
+                        model,
+                        wire_api: wire,
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        total_tokens: total,
+                        cost,
+                        status,
+                        error: None,
+                    });
                 });
                 return Response::builder()
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
                     .header("content-type", ct)
-                    .body(Body::from("streamed"))
+                    .body(Body::from_stream(RxStream { rx }))
                     .unwrap();
             }
             Err(e) => {
@@ -455,18 +571,6 @@ async fn forward(
         .status(StatusCode::BAD_GATEWAY)
         .body(Body::from("all upstream providers failed"))
         .unwrap()
-}
-
-async fn stream_and_extract(resp: reqwest::Response) -> (Option<String>, Option<u64>, Option<u64>, Option<u64>) {
-    // MVP: 读取完整响应并解析 usage (流式转发在接入阶段改为 tee 流)
-    match resp.bytes().await {
-        Ok(bytes) => {
-            let text = String::from_utf8_lossy(&bytes);
-            let (model, prompt, completion, total) = extract_usage_from_text(&text);
-            (model, prompt, completion, total)
-        }
-        Err(_) => (None, None, None, None),
-    }
 }
 
 pub fn status() -> RouterStatus {
@@ -552,12 +656,55 @@ async fn handler(
                 .unwrap()
         }
     };
+    let bytes = sanitize_responses_body(&bytes, &uri);
     forward(method, uri, headers, bytes).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rx_stream_delivers_chunks_in_order() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        tx.send(Ok(Bytes::from_static(b"data: {\"a\":1}\n\n")))
+            .await
+            .unwrap();
+        tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut s = RxStream { rx };
+        let mut got = Vec::new();
+        while let Some(chunk) = s.next().await {
+            got.push(chunk.unwrap().to_vec());
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1], b"data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn responses_body_reasoning_content_emptied() {
+        let body = Bytes::from(
+            r#"{"model":"gpt-5.5","input":[
+                {"type":"reasoning","id":"r1","summary":[],"content":[{"type":"reasoning_text","text":"x"}],"encrypted_content":null},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"function_call","id":"f1","name":"x","arguments":"{}","content":[]}
+            ]}"#,
+        );
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        let out = sanitize_responses_body(&body, &uri);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let input = v.get("input").unwrap().as_array().unwrap();
+        assert_eq!(
+            input[0].get("content").unwrap().as_array().unwrap().len(),
+            0
+        );
+        assert!(input[2].get("content").is_none());
+        // 非 responses 路径原样
+        let uri2: Uri = "/v1/chat/completions".parse().unwrap();
+        assert_eq!(sanitize_responses_body(&body, &uri2), body);
+    }
 
     #[test]
     fn breaker_opens_after_threshold() {

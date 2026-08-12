@@ -212,6 +212,16 @@ async fn activate_relay(
     })?;
     // 本地路由开启时, 把激活供应商 base_url 改写为本地代理
     local_router::sync_active();
+    // Codex 正在运行且会话里存在需要清洗的推理数据时, 无法安全改写会话文件 →
+    // 自动开启本地路由, 在请求层清洗, 保证所有第三方 GPT 中转都能用。
+    if crate::session_manager::codex_running() {
+        if let Ok(true) = crate::session_model::reasoning_sanitize_needed() {
+            let _ = app.emit("switch-progress", "自动开启本地路由清洗会话数据…");
+            if let Ok(status) = local_router::set_enabled(true).await {
+                let _ = app.emit("router-status", status);
+            }
+        }
+    }
     let _ = app.emit("provider-changed", ());
     Ok(result)
 }
@@ -950,6 +960,32 @@ pub fn run() {
             // 状态栏常驻: 注册 tray 图标 + 菜单; Dock 图标平时保留
             // (普通 App), 仅用户点窗口关闭按钮时隐藏 (见 on_window_event)
             tray::setup_tray(app.handle())?;
+
+            // 启动兜底: 激活的是中转且会话存在需要清洗的推理数据时 —
+            // Codex 未运行 → 直接清洗会话文件; Codex 运行中 → 自动开启
+            // 本地路由, 在请求层清洗, 保证第三方 GPT 中转都能用。
+            if let Ok(crate::profiles::ActiveSelection::Relay { .. }) =
+                crate::profiles::current_active()
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Emitter;
+                    let needed = crate::session_model::reasoning_sanitize_needed()
+                        .unwrap_or(false);
+                    if !needed {
+                        return;
+                    }
+                    if crate::session_manager::codex_running() {
+                        if let Ok(status) = local_router::set_enabled(true).await {
+                            let _ = app_handle.emit("router-status", status);
+                        }
+                    } else if let Err(e) =
+                        crate::session_model::sanitize_reasoning_content(None, &|_| {})
+                    {
+                        log::warn!("启动时清洗会话推理数据失败: {e}");
+                    }
+                });
+            }
 
             Ok(())
         })

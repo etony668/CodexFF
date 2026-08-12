@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "codexff"
-version = "1.0.172"
+version = "1.0.173"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -603,6 +603,7 @@ dependencies = [
  "core-foundation-sys",
  "dirs",
  "env_logger",
+ "futures-util",
  "keyring",
  "libc",
  "log",
