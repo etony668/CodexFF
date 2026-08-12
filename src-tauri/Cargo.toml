@@ -1,6 +1,6 @@
 [package]
 name = "codexff"
-version = "1.0.183"
+version = "1.0.184"
 description = "Codex profile switcher with credential vault, local proxy and session manager"
 authors = ["codexff"]
 edition = "2021"
