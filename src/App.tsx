@@ -138,21 +138,15 @@ function App() {
     if (switching) return; // 防双击并发切换 (config 读写非原子, 会互相覆盖)
     setSwitching(true);
     try {
-      // 1. 先检查旧会话模型兼容性（不兼容时需要 Codex 完全退出才能迁移）
+      // 1. 先检查旧会话模型兼容性
       setSwitchStep("检查旧会话模型…");
       const preview = await previewSessionModelRemap(sel === "official" ? null : sel);
       const needMigrate = preview.threads.length > 0 && !preview.models_unknown;
-      if (needMigrate) {
-        const running = await isCodexRunning().catch(() => false);
-        if (running) {
-          setSwitching(false);
-          setSwitchStep(null);
-          setNotice(
-            `检测到 ${preview.threads.length} 个旧会话需要迁移模型。请先完全退出 Codex / ChatGPT 再切换，切换时会自动迁移，无需手动操作。`
-          );
-          return;
-        }
-      }
+      // 请求层归一化兜底: Codex 运行中也允许切换, 本地路由会把请求 model
+      // 改写为当前供应商默认模型, 旧会话无需退出即可接续。
+      const codexRunning = needMigrate
+        ? await isCodexRunning().catch(() => false)
+        : false;
 
       // 2. 写配置
       if (sel === "official") {
@@ -167,8 +161,8 @@ function App() {
           ? "官方订阅"
           : status?.relays.find((r) => r.id === sel)?.name ?? sel;
 
-      // 3. 自动迁移全部不兼容旧会话
-      if (needMigrate) {
+      // 3. 自动迁移全部不兼容旧会话 (Codex 运行中跳过 — 由本地路由请求层归一化)
+      if (needMigrate && !codexRunning) {
         setSwitchStep("迁移旧会话模型…");
         const ids = preview.threads.map((t) => t.thread_id);
         try {
@@ -185,6 +179,12 @@ function App() {
             `已切换到 ${relayName}，但旧会话模型迁移失败：${errMsg(e)}。`
           );
         }
+      } else if (needMigrate && codexRunning) {
+        setSwitchStep(null);
+        await refresh();
+        setNotice(
+          `已切换到 ${relayName}。${preview.threads.length} 个旧会话模型由本地路由自动适配，可以直接接续。`
+        );
       } else {
         setSwitchStep(null);
         await refresh();

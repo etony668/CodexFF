@@ -79,11 +79,18 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 直通官方 Responses API 的中转会严格校验 input 里的 reasoning 条目:
-/// encrypted_content 字段存在（即使 null）时 content 必须为空数组，否则返回
-/// 400 array_above_max_length。这里在请求层把不合规条目清空，保证任何第三方
-/// GPT 中转都能用；解析失败或非 responses 请求原样转发。
-fn sanitize_responses_body(body: &Bytes, uri: &Uri) -> Bytes {
+/// 请求层清洗 + 模型归一化（直通官方 Responses API 的中转会严格校验）:
+/// 1. reasoning 条目 encrypted_content 存在（即使 null）时 content 必须为空
+///    数组，否则 400 array_above_max_length；
+/// 2. 请求 model 不属于当前供应商 → 改写为供应商默认模型，旧会话无需
+///    退出 Codex / 改写会话文件即可跨供应商接续。
+/// 解析失败或非 responses 请求原样转发。
+fn sanitize_responses_body(
+    body: &Bytes,
+    uri: &Uri,
+    fallback_model: Option<&str>,
+    supported: &[String],
+) -> Bytes {
     let path = uri.path();
     if !path.ends_with("/responses") {
         return body.clone();
@@ -91,40 +98,58 @@ fn sanitize_responses_body(body: &Bytes, uri: &Uri) -> Bytes {
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
     };
-    let Some(input) = v.get_mut("input").and_then(|i| i.as_array_mut()) else {
-        return body.clone();
-    };
     let mut changed = false;
-    for item in input.iter_mut() {
-        let Some(obj) = item.as_object_mut() else {
-            continue;
+    if let Some(input) = v.get_mut("input").and_then(|i| i.as_array_mut()) {
+        for item in input.iter_mut() {
+            let Some(obj) = item.as_object_mut() else {
+                continue;
+            };
+            let Some(typ) = obj.get("type").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            match typ {
+                "reasoning" => {
+                    if obj.contains_key("encrypted_content") {
+                        let content_nonempty = obj
+                            .get("content")
+                            .and_then(|c| c.as_array())
+                            .map(|a| !a.is_empty())
+                            .unwrap_or(false);
+                        if content_nonempty {
+                            obj.insert("content".into(), serde_json::json!([]));
+                            changed = true;
+                        }
+                    }
+                }
+                "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output" => {
+                    if obj.remove("content").is_some() {
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // 模型归一化: 清单已知 → 不在清单即替换; 清单未知 → 仅官方模型名替换
+    // (用户自定义的第三方模型名原样透传, 不误伤)。
+    if let Some(cur) = v.get("model").and_then(|m| m.as_str()) {
+        let needs_replace = if supported.is_empty() {
+            is_official_model_name(cur)
+        } else {
+            !supported.iter().any(|s| s == cur)
         };
-        let Some(typ) = obj.get("type").and_then(|t| t.as_str()) else {
-            continue;
-        };
-        match typ {
-            "reasoning" => {
-                if obj.contains_key("encrypted_content") {
-                    let content_nonempty = obj
-                        .get("content")
-                        .and_then(|c| c.as_array())
-                        .map(|a| !a.is_empty())
-                        .unwrap_or(false);
-                    if content_nonempty {
-                        obj.insert("content".into(), serde_json::json!([]));
+        if needs_replace {
+            if let Some(fb) = fallback_model {
+                if !fb.is_empty() && fb != cur {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("model".into(), serde_json::json!(fb));
                         changed = true;
                     }
                 }
             }
-            "function_call"
-            | "function_call_output"
-            | "custom_tool_call"
-            | "custom_tool_call_output" => {
-                if obj.remove("content").is_some() {
-                    changed = true;
-                }
-            }
-            _ => {}
         }
     }
     if !changed {
@@ -133,6 +158,21 @@ fn sanitize_responses_body(body: &Bytes, uri: &Uri) -> Bytes {
     serde_json::to_vec(&v)
         .map(Bytes::from)
         .unwrap_or_else(|_| body.clone())
+}
+
+/// 是否官方模型名（清单未知时只替换官方模型，避免误伤自定义模型）。
+fn is_official_model_name(m: &str) -> bool {
+    let lower = m.to_ascii_lowercase();
+    crate::session_model::OFFICIAL_MODELS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(m))
+        || lower.starts_with("gpt-5")
+        || (lower.starts_with('o')
+            && lower[1..]
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false))
 }
 
 /// mpsc 接收端包装成 axum 可用的 Stream（响应逐块回传，不整包缓冲）。
@@ -453,6 +493,10 @@ async fn forward(
             continue;
         };
         attempted.push(p.id.clone());
+        // 每个候选供应商用自己的默认模型/模型清单做请求层清洗+归一化
+        // (fallback chain 里各供应商模型不同, 不能复用同一个 body)。
+        let body =
+            sanitize_responses_body(&body, &uri, Some(p.model.as_str()), &p.supported_models);
         // 本地路由 base_url 统一写成 http://127.0.0.1:PORT/v1, Codex 会请求
         // /v1/responses; 转发时必须剥掉 /v1 前缀, 还原成直连形态
         // (base_url 无 /v1 的 DeepSeek/皮卡丘 = /responses, 带 /v1 的 =
@@ -656,7 +700,6 @@ async fn handler(
                 .unwrap()
         }
     };
-    let bytes = sanitize_responses_body(&bytes, &uri);
     forward(method, uri, headers, bytes).await
 }
 
@@ -693,7 +736,7 @@ mod tests {
             ]}"#,
         );
         let uri: Uri = "/v1/responses".parse().unwrap();
-        let out = sanitize_responses_body(&body, &uri);
+        let out = sanitize_responses_body(&body, &uri, None, &[]);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let input = v.get("input").unwrap().as_array().unwrap();
         assert_eq!(
@@ -703,7 +746,34 @@ mod tests {
         assert!(input[2].get("content").is_none());
         // 非 responses 路径原样
         let uri2: Uri = "/v1/chat/completions".parse().unwrap();
-        assert_eq!(sanitize_responses_body(&body, &uri2), body);
+        assert_eq!(sanitize_responses_body(&body, &uri2, None, &[]), body);
+    }
+
+    #[test]
+    fn responses_model_rewritten_per_supported_list() {
+        let body = Bytes::from(
+            r#"{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#,
+        );
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        // 清单已知且不含当前模型 → 替换为供应商默认
+        let out = sanitize_responses_body(
+            &body,
+            &uri,
+            Some("deepseek-v4-flash"),
+            &["deepseek-v4-flash".into(), "deepseek-v4-pro".into()],
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v.get("model").unwrap(), "deepseek-v4-flash");
+        // 清单未知 + 官方模型名 → 替换
+        let out2 = sanitize_responses_body(&body, &uri, Some("gpt-5.5"), &[]);
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(v2.get("model").unwrap(), "gpt-5.5");
+        // 清单未知 + 自定义模型 → 原样透传
+        let body3 = Bytes::from(
+            r#"{"model":"my-custom-llm","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#,
+        );
+        let out3 = sanitize_responses_body(&body3, &uri, Some("gpt-5.5"), &[]);
+        assert_eq!(out3, body3);
     }
 
     #[test]

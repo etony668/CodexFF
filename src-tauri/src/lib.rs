@@ -109,16 +109,16 @@ async fn get_status() -> Result<AppStatus, ApiError> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if now.saturating_sub(ROUTER_HEAL_LAST.load(std::sync::atomic::Ordering::Relaxed)) >= 30 {
-        if !local_router::status().enabled {
-            if let Ok(crate::profiles::ActiveSelection::Relay { .. }) =
-                crate::profiles::current_active()
-            {
-                if crate::session_manager::codex_running()
-                    && crate::session_model::reasoning_sanitize_needed()
-                {
-                    let _ = local_router::set_enabled(true).await;
-                }
-            }
+        if !local_router::status().enabled
+            && matches!(
+                crate::profiles::current_active(),
+                Ok(crate::profiles::ActiveSelection::Relay { .. })
+            )
+            && crate::session_manager::codex_running()
+        {
+            // 请求层兜底 (reasoning 清洗 + 模型归一化), 中转激活 + Codex
+            // 运行中时必须开启, 否则旧会话绑定官方模型直连中转会被拒。
+            let _ = local_router::set_enabled(true).await;
         }
         ROUTER_HEAL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
     }
@@ -235,11 +235,9 @@ async fn activate_relay(
     })?;
     // 本地路由开启时, 把激活供应商 base_url 改写为本地代理
     local_router::sync_active();
-    // Codex 正在运行且会话里存在需要清洗的推理数据时, 无法安全改写会话文件 →
-    // 自动开启本地路由, 在请求层清洗, 保证所有第三方 GPT 中转都能用。
-    if crate::session_manager::codex_running()
-        && crate::session_model::reasoning_sanitize_needed()
-    {
+    // Codex 运行中无法安全改写会话文件 → 自动开启本地路由, 在请求层做
+    // reasoning 清洗 + 模型归一化, 保证所有第三方 GPT 中转都能接续。
+    if crate::session_manager::codex_running() {
         let _ = app.emit("switch-progress", "自动开启本地路由清洗会话数据…");
         if let Ok(status) = local_router::set_enabled(true).await {
             let _ = app.emit("router-status", status);
@@ -993,10 +991,6 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use tauri::Emitter;
-                    let needed = crate::session_model::reasoning_sanitize_needed();
-                    if !needed {
-                        return;
-                    }
                     if crate::session_manager::codex_running() {
                         if let Ok(status) = local_router::set_enabled(true).await {
                             let _ = app_handle.emit("router-status", status);
