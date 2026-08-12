@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "codexff"
-version = "1.0.183"
+version = "1.0.184"
 dependencies = [
  "axum",
  "base64 0.22.1",
