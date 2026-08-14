@@ -38,8 +38,8 @@ export function SessionsPage({ onToast }: Props) {
   // 隔离进度 (Codex 必须完全退出; 过程显示进度)
   const [isolatingGroup, setIsolatingGroup] = useState<string | null>(null);
   const [isolateStep, setIsolateStep] = useState("");
-  // 项目分组折叠状态 (默认展开)
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // null 表示首次加载：所有项目默认折叠。
+  const [collapsed, setCollapsed] = useState<Set<string> | null>(null);
   // 统一会话历史迁移 (旧官方 "openai" 桶 → 共享 "custom" 桶, 迁移前自动备份)
   const [unifyList, setUnifyList] = useState<UnifySessionMeta[] | null>(null);
   const [unifyBackup, setUnifyBackup] = useState(false);
@@ -193,7 +193,8 @@ export function SessionsPage({ onToast }: Props) {
 
   function toggleGroup(key: string) {
     setCollapsed((prev) => {
-      const next = new Set(prev);
+      // 首次交互前全部折叠；点击某一组时只展开该组。
+      const next = prev === null ? new Set(groups.map((g) => g.key)) : new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
       return next;
@@ -426,7 +427,7 @@ export function SessionsPage({ onToast }: Props) {
       <section className="card session-list">
         <h2>会话 ({sessions.length})</h2>
         <p className="hint">
-          与官方一致按项目目录/名称分组，默认展开可收起；勾选 = 该项目下所有
+          与官方一致按项目目录/名称分组，默认折叠可展开；勾选 = 该项目下所有
           线程在官方订阅下不可见，切换官方时自动迁移，切回第三方后自动恢复。
           同线程已合并为一条，点击查看最新一条。
         </p>
@@ -444,7 +445,7 @@ export function SessionsPage({ onToast }: Props) {
         {groups.map((g) => {
           const allIsolated = g.sessions.every((s) => s.isolated);
           const anyIsolated = g.sessions.some((s) => s.isolated);
-          const isCollapsed = collapsed.has(g.key);
+          const isCollapsed = collapsed === null || collapsed.has(g.key);
           return (
             <div key={g.key} className="session-group">
               <div className="session-group-head">

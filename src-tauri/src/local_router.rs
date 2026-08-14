@@ -26,6 +26,8 @@ pub const DEFAULT_PORT: u16 = 19331;
 const BREAKER_THRESHOLD: u32 = 3;
 const BREAKER_COOLDOWN_SECS: i64 = 30;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
+const UPSTREAM_ERROR_BODY_LIMIT: usize = 8 * 1024;
+const UPSTREAM_ERROR_TEXT_LIMIT: usize = 1200;
 
 static RUNTIME: Mutex<Option<RuntimeState>> = Mutex::new(None);
 static BREAKER: LazyLock<Mutex<Breaker>> = LazyLock::new(|| Mutex::new(Breaker::default()));
@@ -59,6 +61,10 @@ pub struct RouterState {
     pub degraded: bool,
     #[serde(default)]
     pub recovery_message: Option<String>,
+    /// App 被外部终止时 Codex 仍可能缓存 localhost。下次启动必须先恢复
+    /// 监听与接管，不能仅依赖已经还原为真实地址的磁盘配置。
+    #[serde(default)]
+    pub resume_after_restart: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -682,6 +688,85 @@ async fn send_upstream_request(
     req.send().await
 }
 
+async fn read_upstream_error_body(resp: reqwest::Response) -> Bytes {
+    let mut stream = resp.bytes_stream();
+    let mut body = Vec::new();
+    while body.len() < UPSTREAM_ERROR_BODY_LIMIT {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = UPSTREAM_ERROR_BODY_LIMIT - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    Bytes::from(body)
+}
+
+fn upstream_error_snippet(body: &[u8], api_key: &str) -> String {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let text = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+                .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+        })
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    let redacted = if api_key.is_empty() {
+        text
+    } else {
+        text.replace(api_key, "[REDACTED]")
+    };
+    let compact = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "empty response body".to_string();
+    }
+    let mut chars = compact.chars();
+    let limited: String = chars.by_ref().take(UPSTREAM_ERROR_TEXT_LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{limited}…")
+    } else {
+        limited
+    }
+}
+
+fn upstream_http_failure(
+    profile: &profiles::RelayProfile,
+    status: u16,
+    body: &[u8],
+    api_key: &str,
+) -> String {
+    format!(
+        "upstream {} ({}) returned {}: {}",
+        profile.name,
+        profile.id,
+        status,
+        upstream_error_snippet(body, api_key)
+    )
+}
+
+fn router_error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    let message = message.into();
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "codexff_router_error",
+            "param": null,
+            "code": status.as_u16().to_string()
+        }
+    });
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json; charset=utf-8")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 /// 读取当前 config.toml 中 custom 供应商的 base_url
 fn current_config_base_url() -> Option<String> {
     let text = crate::codex_config::read_config_text().ok()?;
@@ -788,6 +873,16 @@ fn config_needs_restore(state: &RouterState, current_base_url: Option<&str>) -> 
     state.rewritten || current_base_url.map(is_local_router_url).unwrap_or(false)
 }
 
+fn should_resume_on_startup(
+    active_relay_known: bool,
+    has_router_evidence: bool,
+    resume_after_restart: bool,
+    codex_running: bool,
+) -> bool {
+    active_relay_known
+        && (has_router_evidence || (resume_after_restart && codex_running))
+}
+
 /// 按状态还原真实 base_url
 fn restore_config(s: &mut RouterState) -> Result<(), String> {
     if !config_needs_restore(s, current_config_base_url().as_deref()) {
@@ -858,6 +953,7 @@ pub fn recover_stale_startup_state() -> Result<RouterStatus, String> {
     s.rewrote_profile = None;
     s.degraded = false;
     s.recovery_message = None;
+    s.resume_after_restart = false;
     save_state(&s)?;
     Ok(status())
 }
@@ -902,6 +998,7 @@ pub fn sync_active() -> Result<RouterStatus, String> {
         s.rewrote_profile = Some(profile.id);
         s.degraded = false;
         s.recovery_message = None;
+        s.resume_after_restart = false;
         save_state(&s)?;
         let current = status();
         if !current.enabled || !current.rewritten || current.degraded {
@@ -921,26 +1018,19 @@ pub fn sync_active() -> Result<RouterStatus, String> {
 
 async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let Some((active_profile, _)) = active_relay() else {
-        return Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from("no active relay provider"))
-            .unwrap();
+        return router_error_response(StatusCode::BAD_GATEWAY, "no active relay provider");
     };
     if !profile_supports_lossless_compatibility(&active_profile) {
-        return Response::builder()
-            .status(StatusCode::NOT_IMPLEMENTED)
-            .body(Body::from(
-                "session compatibility router only supports Responses providers",
-            ))
-            .unwrap();
+        return router_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "session compatibility router only supports Responses providers",
+        );
     }
     if !is_responses_path(uri.path()) {
-        return Response::builder()
-            .status(StatusCode::NOT_IMPLEMENTED)
-            .body(Body::from(
-                "session compatibility router only accepts Responses requests",
-            ))
-            .unwrap();
+        return router_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "session compatibility router only accepts Responses requests",
+        );
     }
     let chain: Vec<profiles::RelayProfile> = {
         let relays = profiles::list_relay_profiles().unwrap_or_default();
@@ -960,6 +1050,7 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
         chain
     };
     let mut last_error: Option<String> = None;
+    let mut last_status: Option<u16> = None;
     let mut attempted = Vec::new();
     let primary_id = chain
         .first()
@@ -974,7 +1065,7 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
         let Some(pkey) = vault::get_relay_key(&p.id).ok().flatten() else {
             continue;
         };
-        attempted.push(p.id.clone());
+        attempted.push((p.id.clone(), p.name.clone()));
         // 每个候选供应商用自己的默认模型/模型清单做请求层清洗+归一化
         // (fallback chain 里各供应商模型不同, 不能复用同一个 body)。
         let empty_reasoning_content = reasoning_policy_for(p);
@@ -1072,7 +1163,9 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                 }
                 if status >= 500 || status == 429 {
                     let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
-                    last_error = Some(format!("upstream {} {}", p.id, status));
+                    let error_body = read_upstream_error_body(resp).await;
+                    last_status = Some(status);
+                    last_error = Some(upstream_http_failure(p, status, &error_body, &pkey));
                     continue;
                 }
                 let ct = resp
@@ -1098,7 +1191,10 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                             )
                             .await
                             {
-                                Ok(retry) if retry.status().as_u16() < 500 => {
+                                Ok(retry)
+                                    if retry.status().as_u16() < 500
+                                        && retry.status().as_u16() != 429 =>
+                                {
                                     let retry_status = retry.status().as_u16();
                                     let retry_ct = retry
                                         .headers()
@@ -1122,26 +1218,34 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                                             );
                                         }
                                         InitialStream::Retry(_) => {
-                                            return Response::builder()
-                                                .status(StatusCode::BAD_REQUEST)
-                                                .body(Body::from(
-                                                    "upstream rejected both reasoning schemas",
-                                                ))
-                                                .unwrap();
+                                            return router_error_response(
+                                                StatusCode::BAD_REQUEST,
+                                                "upstream rejected both reasoning schemas",
+                                            );
                                         }
                                     }
                                 }
                                 Ok(retry) => {
-                                    return Response::builder()
-                                        .status(retry.status())
-                                        .body(Body::from(retry.bytes().await.unwrap_or_default()))
-                                        .unwrap();
+                                    let status = retry.status();
+                                    let bytes = read_upstream_error_body(retry).await;
+                                    return router_error_response(
+                                        status,
+                                        upstream_http_failure(
+                                            p,
+                                            status.as_u16(),
+                                            &bytes,
+                                            &pkey,
+                                        ),
+                                    );
                                 }
                                 Err(e) => {
-                                    return Response::builder()
-                                        .status(StatusCode::BAD_GATEWAY)
-                                        .body(Body::from(e.to_string()))
-                                        .unwrap();
+                                    return router_error_response(
+                                        StatusCode::BAD_GATEWAY,
+                                        format!(
+                                            "upstream {} ({}) transport error: {}",
+                                            p.name, p.id, e
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -1160,28 +1264,43 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
             }
             Err(e) => {
                 let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
-                last_error = Some(e.to_string());
+                last_status = None;
+                last_error = Some(format!(
+                    "upstream {} ({}) transport error: {}",
+                    p.name, p.id, e
+                ));
             }
         }
     }
+    let diagnostic = last_error.unwrap_or_else(|| {
+        if attempted.is_empty() {
+            "no usable upstream provider (missing key, incompatible provider, or breaker open)"
+                .to_string()
+        } else {
+            "all attempted upstream providers failed without a response".to_string()
+        }
+    });
     // 全部失败 → 记录日志 (失败请求)
     usage_stats::append_usage_log(UsageLogEntry {
         ts_ms: now_ms(),
-        provider_id: attempted.first().cloned().unwrap_or_default(),
-        provider_name: attempted.first().cloned().unwrap_or_default(),
+        provider_id: attempted
+            .first()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_default(),
+        provider_name: attempted
+            .first()
+            .map(|(_, name)| name.clone())
+            .unwrap_or_default(),
         model: None,
         wire_api: None,
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
         cost: None,
-        status: 0,
-        error: last_error,
+        status: last_status.unwrap_or(0),
+        error: Some(diagnostic.clone()),
     });
-    Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .body(Body::from("all upstream providers failed"))
-        .unwrap()
+    router_error_response(StatusCode::BAD_GATEWAY, diagnostic)
 }
 
 pub fn status() -> RouterStatus {
@@ -1243,6 +1362,13 @@ pub fn codex_may_depend_on_router() -> bool {
 /// 崩溃/旧版本遗留的 localhost 改写。
 pub fn shutdown() -> Result<(), String> {
     let mut s = load_state();
+    let resume_after_restart =
+        crate::session_manager::codex_running() && codex_may_depend_on_router();
+    let previous_automatic = s.automatic;
+    // 先落盘重启意图。即使随后还原配置或进程退出中断，下次启动仍知道
+    // 正在运行的 Codex 可能缓存了 localhost。
+    s.resume_after_restart = resume_after_restart;
+    save_state(&s)?;
     // 1. 先还原 base_url, 让 Codex 后续请求走真实中转 (不再依赖本地路由)
     restore_config(&mut s)?;
     // 2. 再停止本地代理服务
@@ -1252,7 +1378,12 @@ pub fn shutdown() -> Result<(), String> {
         }
     }
     s.enabled = false;
-    s.automatic = false;
+    s.automatic = if resume_after_restart {
+        previous_automatic
+    } else {
+        false
+    };
+    s.resume_after_restart = resume_after_restart;
     save_state(&s)?;
     Ok(())
 }
@@ -1265,6 +1396,7 @@ pub async fn disable_for_official() -> Result<RouterStatus, String> {
         s.rewritten = false;
         s.original_base_url = None;
         s.rewrote_profile = None;
+        s.resume_after_restart = false;
         save_state(&s)?;
     }
     set_enabled(false).await
@@ -1454,9 +1586,11 @@ pub async fn resume_or_recover_startup() -> Result<RouterStatus, String> {
             .as_deref()
             .is_some_and(|url| !is_local_router_url(url));
     let has_router_evidence = takeover_evidence || codex_points_at_router();
+    let codex_running = crate::session_manager::codex_running();
+    let restart_requested = state.resume_after_restart && codex_running;
     let active_profile = active_relay().map(|(profile, _)| profile);
     let active_relay_known = active_profile.is_some();
-    if has_router_evidence && !active_relay_known && crate::session_manager::codex_running() {
+    if (has_router_evidence || restart_requested) && !active_relay_known && codex_running {
         let mut failed = state.clone();
         failed.degraded = true;
         failed.recovery_message = Some(
@@ -1467,13 +1601,18 @@ pub async fn resume_or_recover_startup() -> Result<RouterStatus, String> {
         save_state(&failed).map_err(|e| format!("{message}; 降级状态保存失败: {e}"))?;
         return Err(message);
     }
-    let should_resume = active_relay_known && has_router_evidence;
+    let should_resume = should_resume_on_startup(
+        active_relay_known,
+        has_router_evidence,
+        state.resume_after_restart,
+        codex_running,
+    );
     if should_resume {
         if !active_profile
             .as_ref()
             .is_some_and(profile_supports_lossless_compatibility)
         {
-            if crate::session_manager::codex_running() && codex_may_depend_on_router() {
+            if codex_running && (codex_may_depend_on_router() || restart_requested) {
                 let mut failed = state.clone();
                 failed.degraded = true;
                 failed.recovery_message = Some(
@@ -1488,7 +1627,7 @@ pub async fn resume_or_recover_startup() -> Result<RouterStatus, String> {
         }
         match enable_with_mode(state.automatic).await {
             Ok(status) => Ok(status),
-            Err(e) if crate::session_manager::codex_running() => {
+            Err(e) if codex_running => {
                 let mut failed = load_state();
                 failed.degraded = true;
                 failed.recovery_message = Some(format!(
@@ -1526,6 +1665,7 @@ pub async fn set_enabled(enabled: bool) -> Result<RouterStatus, String> {
         restore_config(&mut s)?;
         s.enabled = false;
         s.automatic = false;
+        s.resume_after_restart = false;
         save_state(&s)?;
         if let Some(rt) = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take() {
             if let Some(tx) = rt.shutdown {
@@ -1893,5 +2033,56 @@ data: [DONE]
     fn cost_from_known_model() {
         let c = estimate_cost(Some("deepseek-chat"), Some(1_000_000), Some(1_000_000));
         assert_eq!(c, Some(10.0));
+    }
+
+    #[test]
+    fn upstream_error_diagnostic_extracts_message_and_redacts_key() {
+        let profile = profiles::RelayProfile {
+            id: "relay-1".into(),
+            name: "测试中转".into(),
+            ..Default::default()
+        };
+        let key = "sk-secret-value";
+        let body = br#"{"error":{"message":"gateway rejected sk-secret-value temporarily"}}"#;
+        let diagnostic = upstream_http_failure(&profile, 502, body, key);
+        assert_eq!(
+            diagnostic,
+            "upstream 测试中转 (relay-1) returned 502: gateway rejected [REDACTED] temporarily"
+        );
+        assert!(!diagnostic.contains(key));
+    }
+
+    #[test]
+    fn upstream_error_diagnostic_is_bounded_and_flattens_html() {
+        let body = format!("<html>\n  <body>{}</body>\n</html>", "x".repeat(2000));
+        let snippet = upstream_error_snippet(body.as_bytes(), "");
+        assert!(!snippet.contains('\n'));
+        assert!(snippet.chars().count() <= UPSTREAM_ERROR_TEXT_LIMIT + 1);
+        assert!(snippet.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn router_errors_use_codex_readable_json_shape() {
+        let response = router_error_response(StatusCode::BAD_GATEWAY, "upstream failed");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json; charset=utf-8"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["message"], "upstream failed");
+        assert_eq!(value["error"]["type"], "codexff_router_error");
+        assert_eq!(value["error"]["code"], "502");
+    }
+
+    #[test]
+    fn restart_marker_only_resumes_for_a_running_codex_and_known_relay() {
+        assert!(should_resume_on_startup(true, false, true, true));
+        assert!(!should_resume_on_startup(true, false, true, false));
+        assert!(!should_resume_on_startup(false, false, true, true));
+        assert!(should_resume_on_startup(true, true, false, false));
     }
 }

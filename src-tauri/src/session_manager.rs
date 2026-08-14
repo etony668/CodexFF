@@ -1242,18 +1242,10 @@ pub enum SessionError {
 /// 扫描所有会话, 按最后活动时间倒序
 /// 读取 ~/.codex/.codex-global-state.json 的 local-projects (root → 项目名)。
 /// 官方侧边栏按它给线程分组, 会话管理保持一致的分类。
-fn load_registered_projects() -> Vec<(String, String)> {
-    let path = codex_config::codex_config_dir().join(".codex-global-state.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return Vec::new();
-    };
+fn append_registered_projects(v: &Value, out: &mut Vec<(String, String)>) {
     let Some(projects) = v.get("local-projects").and_then(|p| p.as_object()) else {
-        return Vec::new();
+        return;
     };
-    let mut out = Vec::new();
     for p in projects.values() {
         let name = p
             .get("name")
@@ -1267,7 +1259,38 @@ fn load_registered_projects() -> Vec<(String, String)> {
         if let Some(roots) = p.get("rootPaths").and_then(|x| x.as_array()) {
             for r in roots {
                 if let Some(root) = r.as_str() {
-                    out.push((root.trim_end_matches('/').to_string(), name.clone()));
+                    let root = root.trim().trim_end_matches('/');
+                    if root.is_empty() {
+                        continue;
+                    }
+                    let item = (root.to_string(), name.clone());
+                    if !out.contains(&item) {
+                        out.push(item);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn load_registered_projects() -> Vec<(String, String)> {
+    let path = codex_config::codex_config_dir().join(".codex-global-state.json");
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            append_registered_projects(&v, &mut out);
+        }
+    }
+    // 隔离时项目注册信息会从全局状态移入按线程备份文件。
+    let backup_root = global_state_quarantine_root();
+    if let Ok(entries) = std::fs::read_dir(backup_root) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    append_registered_projects(&v, &mut out);
                 }
             }
         }
@@ -1275,32 +1298,48 @@ fn load_registered_projects() -> Vec<(String, String)> {
     out
 }
 
+fn load_thread_string_column(
+    conn: &Connection,
+    column: &str,
+    predicate: &str,
+) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for table in ["threads", THREADS_ISOLATED_TABLE] {
+        if table != "threads" && !table_exists(conn, table) {
+            continue;
+        }
+        let sql = format!("SELECT id, {column} FROM {table} WHERE {predicate}");
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            // 正常 threads 表优先；隔离表只补齐已被迁出的线程，避免异常中断
+            // 同时残留两份记录时让较旧备份覆盖当前元数据。
+            values.entry(row.0).or_insert(row.1);
+        }
+    }
+    values
+}
+
 /// 从 state_5.sqlite 读线程工作目录 (项目分组用)。
 pub(crate) fn load_thread_cwds() -> HashMap<String, String> {
-    let mut cwds = HashMap::new();
     let db_path = codex_config::codex_state_db_path();
     if !db_path.exists() {
-        return cwds;
+        return HashMap::new();
     }
     let Ok(conn) = Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) else {
-        return cwds;
+        return HashMap::new();
     };
     let _ = conn.busy_timeout(Duration::from_secs(2));
-    let Ok(mut stmt) = conn.prepare("SELECT id, cwd FROM threads WHERE cwd <> ''") else {
-        return cwds;
-    };
-    let Ok(rows) = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    }) else {
-        return cwds;
-    };
-    for row in rows.flatten() {
-        cwds.insert(row.0, row.1);
-    }
-    cwds
+    load_thread_string_column(&conn, "cwd", "cwd <> ''")
 }
 
 /// cwd 是否属于某个注册项目根目录 (路径边界匹配)。
@@ -1438,6 +1477,7 @@ fn parse_session(
     let mut thread_id = String::new();
     let mut model = String::new();
     let mut preview = String::new();
+    let mut file_cwd = String::new();
     let mut found = false;
 
     // 读前 200 行: 提取真实线程 ID (state DB 键)、标题、模型、首条用户消息
@@ -1474,6 +1514,15 @@ fn parse_session(
         if let Some(t) = v.get("payload").and_then(|p| p.get("model")) {
             if let Some(s) = t.as_str() {
                 model = s.to_string();
+            }
+        }
+        if file_cwd.is_empty() {
+            if let Some(cwd) = v
+                .get("payload")
+                .and_then(|p| p.get("cwd"))
+                .and_then(|c| c.as_str())
+            {
+                file_cwd = cwd.to_string();
             }
         }
         if preview.is_empty()
@@ -1536,7 +1585,7 @@ fn parse_session(
         .get(&thread_id)
         .cloned()
         .unwrap_or(model);
-    let cwd = cwds.get(&thread_id).cloned().unwrap_or_default();
+    let cwd = cwds.get(&thread_id).cloned().unwrap_or(file_cwd);
     let project = project_name_for_cwd(&cwd, projects);
 
     Ok(Some(SessionMeta {
@@ -1558,68 +1607,36 @@ fn parse_session(
 
 /// 从 state_5.sqlite 读 thread 标题 (codex 运行时占用 DB, 只读 + busy timeout)
 pub(crate) fn load_thread_titles() -> HashMap<String, String> {
-    let mut titles = HashMap::new();
     let db_path = codex_config::codex_state_db_path();
     if !db_path.exists() {
-        return titles;
+        return HashMap::new();
     }
 
     let Ok(conn) = Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) else {
-        return titles;
+        return HashMap::new();
     };
     let _ = conn.busy_timeout(Duration::from_secs(2));
-
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT id, title FROM threads \
-         WHERE title <> ''",
-    ) else {
-        return titles;
-    };
-    let Ok(rows) = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    }) else {
-        return titles;
-    };
-    for row in rows.flatten() {
-        titles.insert(row.0, row.1);
-    }
-    titles
+    load_thread_string_column(&conn, "title", "title <> ''")
 }
 
 /// 从 state_5.sqlite 读取线程当前绑定模型，供会话扫描与兼容性判断使用。
 pub(crate) fn load_thread_models() -> HashMap<String, String> {
-    let mut models = HashMap::new();
     let db_path = codex_config::codex_state_db_path();
     if !db_path.exists() {
-        return models;
+        return HashMap::new();
     }
 
     let Ok(conn) = Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) else {
-        return models;
+        return HashMap::new();
     };
     let _ = conn.busy_timeout(Duration::from_secs(2));
-
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT id, model FROM threads \
-         WHERE model IS NOT NULL AND model <> ''",
-    ) else {
-        return models;
-    };
-    let Ok(rows) = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    }) else {
-        return models;
-    };
-    for row in rows.flatten() {
-        models.insert(row.0, row.1);
-    }
-    models
+    load_thread_string_column(&conn, "model", "model IS NOT NULL AND model <> ''")
 }
 
 /// 会话详情: 返回原始 JSONL 行 (前端渲染)。限流防止大文件炸内存。
@@ -1963,6 +1980,111 @@ mod tests {
             )
             .unwrap();
         assert_eq!((main, backup), (1, 0));
+    }
+
+    #[test]
+    fn isolated_thread_metadata_is_loaded_with_active_threads() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT
+            );
+            CREATE TABLE threads_codexff_isolated (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT
+            );
+            INSERT INTO threads VALUES
+                ('active', '正常会话', '/work/active', 'gpt-5.6');
+            INSERT INTO threads_codexff_isolated VALUES
+                ('isolated', '隔离会话', '/work/isolated', 'deepseek-v4-pro'),
+                ('active', '旧备份标题', '/work/stale', 'gpt-5.5');
+            "#,
+        )
+        .unwrap();
+
+        let titles = load_thread_string_column(&conn, "title", "title <> ''");
+        let cwds = load_thread_string_column(&conn, "cwd", "cwd <> ''");
+        let models =
+            load_thread_string_column(&conn, "model", "model IS NOT NULL AND model <> ''");
+
+        assert_eq!(titles.get("active").map(String::as_str), Some("正常会话"));
+        assert_eq!(
+            cwds.get("active").map(String::as_str),
+            Some("/work/active")
+        );
+        assert_eq!(models.get("active").map(String::as_str), Some("gpt-5.6"));
+        assert_eq!(titles.get("isolated").map(String::as_str), Some("隔离会话"));
+        assert_eq!(
+            cwds.get("isolated").map(String::as_str),
+            Some("/work/isolated")
+        );
+        assert_eq!(
+            models.get("isolated").map(String::as_str),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn quarantined_global_state_keeps_project_name_mapping() {
+        let mut projects = Vec::new();
+        append_registered_projects(
+            &serde_json::json!({
+                "local-projects": {
+                    "project-1": {
+                        "name": "CodexFF",
+                        "rootPaths": ["", "/Users/test/codexff/", "/Users/test/codexff"]
+                    }
+                }
+            }),
+            &mut projects,
+        );
+        assert_eq!(
+            projects,
+            vec![("/Users/test/codexff".to_string(), "CodexFF".to_string())]
+        );
+        assert_eq!(
+            project_name_for_cwd("/Users/test/codexff/src-tauri", &projects),
+            "CodexFF"
+        );
+    }
+
+    #[test]
+    fn rollout_cwd_recovers_project_when_db_metadata_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-thread-1.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-1\",\"model\":\"gpt-5.6\",\"cwd\":\"/Users/test/codexff\"}}\n",
+                "{\"type\":\"user\",\"payload\":{\"text\":\"检查会话分类\"}}\n"
+            ),
+        )
+        .unwrap();
+        let projects = vec![("/Users/test/codexff".to_string(), "CodexFF".to_string())];
+        let session = parse_session(
+            &path,
+            dir.path(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &projects,
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(session.thread_id, "thread-1");
+        assert_eq!(session.cwd, "/Users/test/codexff");
+        assert_eq!(session.project, "CodexFF");
+        assert_eq!(session.model, "gpt-5.6");
+        assert!(session.isolated);
     }
 
     #[test]

@@ -46,6 +46,16 @@ interface Form {
 
 /** 官方模型默认上下文窗口 (GPT-5.6 Codex, 400K) — cc-switch 对齐 */
 const OFFICIAL_DEFAULT_CTX = 400000;
+const DEEPSEEK_V4_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
+
+function isDeepSeekOfficialBase(baseUrl: string) {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host === "api.deepseek.com" || host.endsWith(".deepseek.com");
+  } catch {
+    return baseUrl.toLowerCase().includes("deepseek.com");
+  }
+}
 /** 默认压缩阈值 = 90% 窗口 (cc-switch 同比例: 1000000/900000) */
 function defaultCompactLimit(ctx: number) {
   return Math.round(ctx * 0.9);
@@ -308,8 +318,15 @@ export function AddProviderPanel({
         use_common_config: form.useCommonConfig,
         supported_models:
           testResult && testResult.ok && testResult.models.length > 0
-            ? testResult.models
-            : null,
+            ? Array.from(
+                new Set([
+                  ...testResult.models,
+                  ...(isDeepSeekOfficialBase(form.baseUrl) ? DEEPSEEK_V4_MODELS : []),
+                ]),
+              )
+            : isDeepSeekOfficialBase(form.baseUrl)
+              ? DEEPSEEK_V4_MODELS
+              : null,
       };
       await onSave(input);
       onSaved();
@@ -327,6 +344,14 @@ export function AddProviderPanel({
   }
 
   if (!open) return null;
+
+  const modelChoices = Array.from(
+    new Set([
+      ...(testResult?.models ?? editing?.supported_models ?? []),
+      ...(isDeepSeekOfficialBase(form.baseUrl) ? DEEPSEEK_V4_MODELS : []),
+      ...(form.model ? [form.model] : []),
+    ]),
+  ).filter(Boolean);
 
   const set = (patch: Partial<Form>) =>
     setForm((f) => {
@@ -437,7 +462,22 @@ export function AddProviderPanel({
               </label>
               <label>
                 默认模型 (可选, 写入 config 顶层)
-                <input value={form.model} onChange={(e) => set({ model: e.target.value })} placeholder="gpt-5.6-codex" />
+                {modelChoices.length > 0 ? (
+                  <select value={form.model} onChange={(e) => set({ model: e.target.value })}>
+                    <option value="">使用供应商默认模型</option>
+                    {modelChoices.map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    value={form.model}
+                    onChange={(e) => set({ model: e.target.value })}
+                    placeholder="gpt-5.6-codex"
+                  />
+                )}
               </label>
               <label>
                 Wire API 格式
