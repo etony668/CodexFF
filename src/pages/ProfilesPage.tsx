@@ -253,6 +253,12 @@ export function ProfilesPage({
     const t = setInterval(() => void refreshRouter(), 15000);
     return () => clearInterval(t);
   }, []);
+  // 用量/缓存命中率自动刷新: 本地日志追加后 15s 内反映到卡片
+  // (会话扫描带 mtime+size 缓存, 重复拉取开销很小)
+  useEffect(() => {
+    const t = setInterval(() => void refreshUsage(), 15000);
+    return () => clearInterval(t);
+  }, []);
 
   async function toggleRouter() {
     if (routerBusy) return;
