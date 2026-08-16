@@ -218,6 +218,10 @@ export interface ProviderUsage {
     used: number | null;
   } | null;
   series: UsageDailyPoint[];
+  /** 前缀缓存命中 token (最近 30 天, 本地路由请求) */
+  cache_read_tokens: number;
+  /** 前缀缓存未命中 token (最近 30 天, 本地路由请求) */
+  cache_miss_tokens: number;
 }
 
 export interface UsageOverview {
@@ -226,6 +230,10 @@ export interface UsageOverview {
   total_tokens: number;
   estimated_cost: number;
   last_request_ms: number | null;
+  /** 前缀缓存命中 token (最近 30 天, 本地路由请求) */
+  cache_read_tokens: number;
+  /** 前缀缓存未命中 token (最近 30 天, 本地路由请求) */
+  cache_miss_tokens: number;
   /** 会话扫描统计 (Codex 会话文件, 最近 30 天) */
   session_requests: number;
   session_tokens: number;

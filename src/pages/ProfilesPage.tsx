@@ -645,7 +645,6 @@ export function ProfilesPage({
               <code className="mono">{p.base_url}</code>
               <span className="mono dim">
                 {p.model || "默认模型"} {p.wire_api ? `· ${p.wire_api}` : ""}
-                {p.disable_response_storage ? " · 不存响应" : ""}
               </span>
               {!p.has_key && (
                 <span className="warn">
@@ -679,6 +678,24 @@ export function ProfilesPage({
                   余额查询失败
                 </span>
               )}
+              {(() => {
+                const cache = usage?.providers.find((u) => u.provider_id === p.id);
+                if (!cache || cache.cache_read_tokens + cache.cache_miss_tokens === 0) {
+                  return null;
+                }
+                const rate = Math.round(
+                  (cache.cache_read_tokens /
+                    (cache.cache_read_tokens + cache.cache_miss_tokens)) *
+                    100,
+                );
+                return (
+                  <span className="ok">
+                    缓存命中率 {rate}% · 命中{" "}
+                    {cache.cache_read_tokens.toLocaleString()} / 未命中{" "}
+                    {cache.cache_miss_tokens.toLocaleString()} Token
+                  </span>
+                );
+              })()}
             </div>
             <div className="row-card-actions">
               <button onClick={() => queryBalance(p)} disabled={balanceLoading.has(p.id)}>
@@ -729,6 +746,19 @@ export function ProfilesPage({
                 <strong>{usage.total_tokens.toLocaleString()}</strong>
                 <span>Token</span>
               </div>
+              {usage.cache_read_tokens + usage.cache_miss_tokens > 0 && (
+                <div className="usage-metric">
+                  <strong>
+                    {Math.round(
+                      (usage.cache_read_tokens /
+                        (usage.cache_read_tokens + usage.cache_miss_tokens)) *
+                        100,
+                    )}
+                    %
+                  </strong>
+                  <span>缓存命中率</span>
+                </div>
+              )}
             </div>
             {usage.session_requests > 0 && (
               <p className="hint">

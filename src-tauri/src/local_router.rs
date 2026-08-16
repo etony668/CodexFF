@@ -5,7 +5,7 @@
 //! - 熔断: 连续失败 3 次 → 冷却 30 秒, 冷却期跳过该供应商
 //! - 用量日志: 从响应/SSE 流中提取 model 与 usage token, 写入 usage_stats
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{LazyLock, Mutex};
 use std::task::{Context, Poll};
@@ -28,6 +28,11 @@ const BREAKER_COOLDOWN_SECS: i64 = 30;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const UPSTREAM_ERROR_BODY_LIMIT: usize = 8 * 1024;
 const UPSTREAM_ERROR_TEXT_LIMIT: usize = 1200;
+/// 网关偶发返回 502/503/504 时，在尚未收到任何模型输出前给同一供应商
+/// 一个很短的恢复窗口。Responses 是 POST，请求一旦开始输出就绝不重发；
+/// 这里重试的只是明确的 HTTP 网关错误响应。
+const UPSTREAM_TRANSIENT_RETRIES: usize = 2;
+const UPSTREAM_RETRY_DELAYS_MS: [u64; UPSTREAM_TRANSIENT_RETRIES] = [150, 400];
 
 static RUNTIME: Mutex<Option<RuntimeState>> = Mutex::new(None);
 static BREAKER: LazyLock<Mutex<Breaker>> = LazyLock::new(|| Mutex::new(Breaker::default()));
@@ -36,6 +41,11 @@ static BREAKER: LazyLock<Mutex<Breaker>> = LazyLock::new(|| Mutex::new(Breaker::
 /// false = thinking 兼容形态（保留 reasoning_text，已空的旧条目直接丢弃）。
 /// 同一聚合站可能随上游模型切换规则，因此根据明确 400 响应动态学习。
 static REASONING_POLICY: LazyLock<Mutex<HashMap<String, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 某些供应商的 `/models` 清单包含当前 token 实际无权使用的模型。
+/// 收到明确 access forbidden 后只在本次 App 运行期记忆，不改用户配置；
+/// 后续任务级模型覆盖会自动回到 profile 默认模型。
+static DENIED_MODELS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct RuntimeState {
@@ -279,6 +289,26 @@ fn learn_reasoning_policy(provider_id: &str, empty_content: bool) {
     }
 }
 
+fn model_denied(provider_id: &str, model: &str) -> bool {
+    DENIED_MODELS
+        .lock()
+        .ok()
+        .and_then(|models| models.get(provider_id).map(|denied| denied.contains(model)))
+        .unwrap_or(false)
+}
+
+fn learn_denied_model(provider_id: &str, model: &str) -> bool {
+    DENIED_MODELS
+        .lock()
+        .map(|mut models| {
+            models
+                .entry(provider_id.to_string())
+                .or_default()
+                .insert(model.to_string())
+        })
+        .unwrap_or(false)
+}
+
 /// 只识别两类明确、互斥的 reasoning schema 错误。返回下一次重试策略；
 /// 其它 400 不重试，避免重复请求或掩盖真实错误。
 fn reasoning_error_policy(body: &[u8], current: bool) -> Option<bool> {
@@ -396,17 +426,23 @@ fn response_from_buffered_stream(
             }
         }
         let text = String::from_utf8_lossy(&sample);
-        let (model, prompt, completion, total) = extract_usage_from_text(&text);
-        let cost = estimate_cost(model.as_deref(), prompt, completion);
+        let usage = extract_usage_from_text(&text);
+        let cost = estimate_cost(
+            usage.model.as_deref(),
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        );
         usage_stats::append_usage_log(UsageLogEntry {
             ts_ms: now_ms(),
             provider_id: provider.id,
             provider_name: provider.name,
-            model,
+            model: usage.model,
             wire_api: provider.wire_api,
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_miss_tokens: usage.cache_miss_tokens,
             cost,
             status,
             error: None,
@@ -565,8 +601,40 @@ pub(crate) fn estimate_cost(
     Some(cost)
 }
 
-/// 从响应文本中提取 usage/model 字段 (兼容 SSE 与 JSON 响应)
-fn extract_usage_from_text(text: &str) -> (Option<String>, Option<u64>, Option<u64>, Option<u64>) {
+struct ExtractedUsage {
+    model: Option<String>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_miss_tokens: Option<u64>,
+}
+
+/// usage 对象里任何一个被识别的 token 字段。SSE 前面的 created/in_progress
+/// 事件会带 `"usage":null`，不能用 null 或空对象提前终止扫描。
+const USAGE_TOKEN_KEYS: &[&str] = &[
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+];
+
+fn usage_has_tokens(v: &serde_json::Value) -> bool {
+    v.as_object()
+        .is_some_and(|o| USAGE_TOKEN_KEYS.iter().any(|k| o.contains_key(*k)))
+}
+
+/// 从响应文本中提取 usage/model 字段 (兼容 SSE 与 JSON 响应)。
+///
+/// DeepSeek Responses 与 Chat Completions 命名不同:
+/// - Responses:  input_tokens / output_tokens, 缓存 =
+///   input_tokens_details.cached_tokens
+/// - Chat:       prompt_tokens / completion_tokens, 缓存 =
+///   prompt_cache_hit_tokens / prompt_cache_miss_tokens
+fn extract_usage_from_text(text: &str) -> ExtractedUsage {
     let mut model = None;
     let mut usage = None;
     for line in text.split('\n') {
@@ -601,7 +669,9 @@ fn extract_usage_from_text(text: &str) -> (Option<String>, Option<u64>, Option<u
                                     if let Ok(v) =
                                         serde_json::from_str::<serde_json::Value>(&rest[start..end])
                                     {
-                                        usage = Some(v);
+                                        if usage_has_tokens(&v) {
+                                            usage = Some(v);
+                                        }
                                     }
                                     break;
                                 }
@@ -616,16 +686,46 @@ fn extract_usage_from_text(text: &str) -> (Option<String>, Option<u64>, Option<u
             break;
         }
     }
-    let (prompt, completion, total) = usage
+    let (prompt, completion, total, cache_read, cache_miss) = usage
         .map(|u| {
-            (
-                u.get("prompt_tokens").and_then(|v| v.as_u64()),
-                u.get("completion_tokens").and_then(|v| v.as_u64()),
-                u.get("total_tokens").and_then(|v| v.as_u64()),
-            )
+            let prompt = u
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .or_else(|| u.get("input_tokens").and_then(|v| v.as_u64()));
+            let completion = u
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .or_else(|| u.get("output_tokens").and_then(|v| v.as_u64()));
+            let total = u.get("total_tokens").and_then(|v| v.as_u64());
+            let cached_details = u
+                .get("input_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    u.get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                });
+            let cache_read = cached_details
+                .or_else(|| u.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()));
+            let cache_miss = u
+                .get("prompt_cache_miss_tokens")
+                .and_then(|v| v.as_u64())
+                .or_else(|| match (prompt, cache_read) {
+                    (Some(input), Some(hit)) if hit <= input => Some(input - hit),
+                    _ => None,
+                });
+            (prompt, completion, total, cache_read, cache_miss)
         })
-        .unwrap_or((None, None, None));
-    (model, prompt, completion, total)
+        .unwrap_or((None, None, None, None, None));
+    ExtractedUsage {
+        model,
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
+        cache_read_tokens: cache_read,
+        cache_miss_tokens: cache_miss,
+    }
 }
 
 fn active_relay() -> Option<(profiles::RelayProfile, String)> {
@@ -688,6 +788,64 @@ async fn send_upstream_request(
     req.send().await
 }
 
+enum UpstreamAttempt {
+    Response(reqwest::Response),
+    HttpFailure { status: u16, body: Bytes },
+}
+
+fn retryable_upstream_status(status: u16, body: &[u8]) -> bool {
+    if !matches!(status, 502 | 503 | 504) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    // 这是供应商对模型/账号权限的确定性拒绝；重发同一个模型没有意义，
+    // 应交给上层切换到 profile 默认模型。
+    if text.contains("upstream access forbidden") {
+        return false;
+    }
+    // 502 可能是供应商明确拒绝当前请求，也可能只是其网关瞬态抖动。
+    // 两种情况都发生在响应阶段，短重试不会把已建立的 SSE 流重发。
+    // 503/504 没有稳定的错误正文要求，按标准网关瞬态错误处理。
+    status != 502 || body.is_empty() || text.contains("upstream")
+}
+
+/// 发送一个尚未开始输出的上游请求，并只对瞬态网关错误做有限重试。
+///
+/// 每次尝试都使用独立的 request body；最终失败时返回最后一次 HTTP 状态和
+/// 有限大小的错误正文，让上层继续执行原有熔断/备用供应商逻辑。
+async fn send_with_transient_retry(
+    http: &reqwest::Client,
+    method: &Method,
+    url: &str,
+    headers: &HeaderMap,
+    key: &str,
+    body: &Bytes,
+) -> Result<UpstreamAttempt, reqwest::Error> {
+    for attempt in 0..=UPSTREAM_TRANSIENT_RETRIES {
+        // 首次重试后新建连接池，避免持续复用上游网关中已经落到故障节点的
+        // keep-alive 连接；代理发现仍复用 client() 的统一逻辑。
+        let retry_client = (attempt > 0).then(client);
+        let attempt_http = retry_client.as_ref().unwrap_or(http);
+        let response =
+            send_upstream_request(attempt_http, method, url, headers, key, body.clone()).await?;
+        let status = response.status().as_u16();
+        if status < 500 || status == 501 || status == 505 {
+            return Ok(UpstreamAttempt::Response(response));
+        }
+
+        let error_body = read_upstream_error_body(response).await;
+        if !retryable_upstream_status(status, &error_body) || attempt == UPSTREAM_TRANSIENT_RETRIES
+        {
+            return Ok(UpstreamAttempt::HttpFailure {
+                status,
+                body: error_body,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(UPSTREAM_RETRY_DELAYS_MS[attempt])).await;
+    }
+    unreachable!("transient retry loop always returns")
+}
+
 async fn read_upstream_error_body(resp: reqwest::Response) -> Bytes {
     let mut stream = resp.bytes_stream();
     let mut body = Vec::new();
@@ -748,6 +906,19 @@ fn upstream_http_failure(
         status,
         upstream_error_snippet(body, api_key)
     )
+}
+
+fn request_model(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+}
+
+fn is_access_forbidden_failure(status: u16, body: &[u8]) -> bool {
+    status == 502
+        && String::from_utf8_lossy(body)
+            .to_ascii_lowercase()
+            .contains("upstream access forbidden")
 }
 
 fn router_error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -1032,6 +1203,7 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
             "session compatibility router only accepts Responses requests",
         );
     }
+    crate::prefix_diag::observe(&active_profile.id, &body);
     let chain: Vec<profiles::RelayProfile> = {
         let relays = profiles::list_relay_profiles().unwrap_or_default();
         let active = profiles::current_active().ok();
@@ -1069,12 +1241,21 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
         // 每个候选供应商用自己的默认模型/模型清单做请求层清洗+归一化
         // (fallback chain 里各供应商模型不同, 不能复用同一个 body)。
         let empty_reasoning_content = reasoning_policy_for(p);
+        let incoming_model = request_model(&body);
+        let supported_models = if incoming_model
+            .as_deref()
+            .is_some_and(|model| model_denied(&p.id, model))
+        {
+            &[][..]
+        } else {
+            p.supported_models.as_slice()
+        };
         let request_body = sanitize_responses_body(
             &body,
             &uri,
             Some(p.model.as_str()),
             p.model_reasoning_effort.as_deref(),
-            &p.supported_models,
+            supported_models,
             empty_reasoning_content,
         );
         // 本地路由 base_url 统一写成 http://127.0.0.1:PORT/v1, Codex 会请求
@@ -1085,8 +1266,9 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
         let forward_path = raw_path.strip_prefix("/v1").unwrap_or(raw_path);
         let url = format!("{}{}", p.base_url.trim_end_matches('/'), forward_path);
         let http = client();
-        match send_upstream_request(&http, &method, &url, &headers, &pkey, request_body).await {
-            Ok(resp) => {
+        match send_with_transient_retry(&http, &method, &url, &headers, &pkey, &request_body).await
+        {
+            Ok(UpstreamAttempt::Response(resp)) => {
                 let status = resp.status().as_u16();
                 if status == 400 {
                     let content_type = resp
@@ -1262,6 +1444,29 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                 }
                 return response_from_buffered_stream(status, ct, buffered, p.clone());
             }
+            Ok(UpstreamAttempt::HttpFailure {
+                status,
+                body: error_body,
+            }) => {
+                let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                last_status = Some(status);
+                if is_access_forbidden_failure(status, &error_body) {
+                    if let Some(model) = request_model(&request_body) {
+                        if model != p.model && learn_denied_model(&p.id, &model) {
+                            log::warn!(
+                                "relay {} rejected task model {}; retrying with default model {}",
+                                p.name,
+                                model,
+                                p.model
+                            );
+                            // 当前请求尚未产生任何 SSE 输出，可以安全地用刚学习的
+                            // 默认模型重新进入一次路由；DENIED_MODELS 保证不会递归循环。
+                            return Box::pin(forward(method, uri, headers, body)).await;
+                        }
+                    }
+                }
+                last_error = Some(upstream_http_failure(p, status, &error_body, &pkey));
+            }
             Err(e) => {
                 let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
                 last_status = None;
@@ -1291,11 +1496,13 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
             .first()
             .map(|(_, name)| name.clone())
             .unwrap_or_default(),
-        model: None,
+        model: request_model(&body),
         wire_api: None,
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cache_read_tokens: None,
+        cache_miss_tokens: None,
         cost: None,
         status: last_status.unwrap_or(0),
         error: Some(diagnostic.clone()),
@@ -2022,11 +2229,28 @@ data: {"id":"x","usage":{"prompt_tokens":100,"completion_tokens":50,"total_token
 
 data: [DONE]
 "#;
-        let (m, p, c, t) = extract_usage_from_text(sse);
-        assert_eq!(m.as_deref(), Some("deepseek-chat"));
-        assert_eq!(p, Some(100));
-        assert_eq!(c, Some(50));
-        assert_eq!(t, Some(150));
+        let u = extract_usage_from_text(sse);
+        assert_eq!(u.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(u.prompt_tokens, Some(100));
+        assert_eq!(u.completion_tokens, Some(50));
+        assert_eq!(u.total_tokens, Some(150));
+    }
+
+    #[test]
+    fn usage_extraction_reads_responses_cache_fields() {
+        let sse = r#"event: response.created
+data: {"type":"response.created","response":{"id":"r1","model":"deepseek-v4-pro","usage":null}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"r1","model":"deepseek-v4-pro","usage":{"input_tokens":584,"input_tokens_details":{"cached_tokens":512},"output_tokens":8,"total_tokens":592}}}
+"#;
+        let u = extract_usage_from_text(sse);
+        assert_eq!(u.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(u.prompt_tokens, Some(584));
+        assert_eq!(u.completion_tokens, Some(8));
+        assert_eq!(u.total_tokens, Some(592));
+        assert_eq!(u.cache_read_tokens, Some(512));
+        assert_eq!(u.cache_miss_tokens, Some(72));
     }
 
     #[test]
@@ -2059,6 +2283,19 @@ data: [DONE]
         assert!(!snippet.contains('\n'));
         assert!(snippet.chars().count() <= UPSTREAM_ERROR_TEXT_LIMIT + 1);
         assert!(snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn transient_retry_only_accepts_gateway_failures() {
+        assert!(!retryable_upstream_status(
+            502,
+            br#"{"error":{"message":"Upstream access forbidden, please contact administrator"}}"#
+        ));
+        assert!(retryable_upstream_status(503, b"service unavailable"));
+        assert!(retryable_upstream_status(504, b"gateway timeout"));
+        assert!(!retryable_upstream_status(500, b"internal error"));
+        assert!(!retryable_upstream_status(502, b"invalid account"));
+        assert!(!retryable_upstream_status(429, b"too many requests"));
     }
 
     #[tokio::test]

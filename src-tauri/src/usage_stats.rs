@@ -60,6 +60,12 @@ pub struct UsageLogEntry {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// 上游报告的前缀缓存命中 token (DeepSeek Responses =
+    /// input_tokens_details.cached_tokens; Chat Completions =
+    /// prompt_cache_hit_tokens)
+    pub cache_read_tokens: Option<u64>,
+    /// 前缀缓存未命中 token (上游直接给出, 或由 input-cached 推算)
+    pub cache_miss_tokens: Option<u64>,
     /// 成本估算 (元, 由模型单价表计算; 无单价为 None)
     pub cost: Option<f64>,
     pub status: u16,
@@ -79,6 +85,9 @@ pub struct ProviderUsage {
     pub latest: Option<BalanceSnapshot>,
     /// 最近 30 天逐日余额 (无当天数据则为 null)
     pub series: Vec<DailyPoint>,
+    /// 最近 30 天前缀缓存命中/未命中 token (无缓存指标时为 0)
+    pub cache_read_tokens: u64,
+    pub cache_miss_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +98,9 @@ pub struct UsageOverview {
     pub total_tokens: u64,
     pub estimated_cost: f64,
     pub last_request_ms: Option<i64>,
+    /// 前缀缓存命中/未命中 token (最近 30 天; 上游不支持缓存指标时为 0)
+    pub cache_read_tokens: u64,
+    pub cache_miss_tokens: u64,
     /// 会话扫描统计 (最近 30 天, Codex 会话文件)
     pub session_requests: u64,
     pub session_tokens: u64,
@@ -210,8 +222,11 @@ pub fn overview() -> UsageOverview {
     let snaps = read_snapshots();
     let logs = read_logs();
     let session = crate::session_usage::scan();
+    let cutoff = (now_ms() / 86_400_000 - LOG_KEEP_DAYS) * 86_400_000;
     let mut by_provider: Vec<ProviderUsage> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let mut cache_by_provider: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut name_by_provider: HashMap<String, String> = HashMap::new();
 
     for s in snaps.iter() {
         let pos = match index.get(&s.provider_id) {
@@ -223,6 +238,8 @@ pub fn overview() -> UsageOverview {
                     provider_name: s.provider_name.clone(),
                     latest: None,
                     series: Vec::new(),
+                    cache_read_tokens: 0,
+                    cache_miss_tokens: 0,
                 });
                 by_provider.len() - 1
             }
@@ -243,7 +260,37 @@ pub fn overview() -> UsageOverview {
         });
     }
 
+    for l in logs.iter().filter(|l| l.ts_ms >= cutoff) {
+        name_by_provider
+            .entry(l.provider_id.clone())
+            .or_insert_with(|| l.provider_name.clone());
+        if let (Some(read), Some(miss)) = (l.cache_read_tokens, l.cache_miss_tokens) {
+            let entry = cache_by_provider.entry(l.provider_id.clone()).or_default();
+            entry.0 += read;
+            entry.1 += miss;
+        }
+    }
+    for pid in cache_by_provider.keys() {
+        if !index.contains_key(pid) {
+            index.insert(pid.clone(), by_provider.len());
+            by_provider.push(ProviderUsage {
+                provider_id: pid.clone(),
+                provider_name: name_by_provider.get(pid).cloned().unwrap_or_default(),
+                latest: None,
+                series: Vec::new(),
+                cache_read_tokens: 0,
+                cache_miss_tokens: 0,
+            });
+        }
+    }
+
     for p in by_provider.iter_mut() {
+        let (read, miss) = cache_by_provider
+            .get(&p.provider_id)
+            .copied()
+            .unwrap_or((0, 0));
+        p.cache_read_tokens = read;
+        p.cache_miss_tokens = miss;
         p.series.sort_by(|a, b| a.date.cmp(&b.date));
         p.series.dedup_by(|a, b| a.date == b.date);
         // 补齐最近 30 天日期 (无数据为 null)
@@ -263,7 +310,6 @@ pub fn overview() -> UsageOverview {
         p.series = filled;
     }
 
-    let cutoff = (now_ms() / 86_400_000 - LOG_KEEP_DAYS) * 86_400_000;
     let recent: Vec<&UsageLogEntry> = logs.iter().filter(|l| l.ts_ms >= cutoff).collect();
     UsageOverview {
         providers: by_provider,
@@ -271,6 +317,14 @@ pub fn overview() -> UsageOverview {
         total_tokens: recent.iter().filter_map(|l| l.total_tokens).sum::<u64>() + session.tokens,
         estimated_cost: recent.iter().filter_map(|l| l.cost).sum::<f64>() + session.cost,
         last_request_ms: recent.iter().map(|l| l.ts_ms).max(),
+        cache_read_tokens: recent
+            .iter()
+            .filter_map(|l| l.cache_read_tokens)
+            .sum::<u64>(),
+        cache_miss_tokens: recent
+            .iter()
+            .filter_map(|l| l.cache_miss_tokens)
+            .sum::<u64>(),
         session_requests: session.requests,
         session_tokens: session.tokens,
         session_cost: session.cost,
@@ -331,6 +385,8 @@ mod tests {
             prompt_tokens: Some(100),
             completion_tokens: Some(50),
             total_tokens: Some(150),
+            cache_read_tokens: Some(40),
+            cache_miss_tokens: Some(60),
             cost: Some(0.01),
             status: 200,
             error: None,
@@ -338,6 +394,10 @@ mod tests {
         let ov = overview();
         assert_eq!(ov.requests, 1);
         assert_eq!(ov.total_tokens, 150);
+        assert_eq!(ov.cache_read_tokens, 40);
+        assert_eq!(ov.cache_miss_tokens, 60);
+        assert_eq!(ov.providers[0].cache_read_tokens, 40);
+        assert_eq!(ov.providers[0].cache_miss_tokens, 60);
         assert!((ov.estimated_cost - 0.01).abs() < 1e-9);
         *TEST_DIR.lock().unwrap() = None;
         *crate::session_usage::TEST_DIR.lock().unwrap() = None;
