@@ -30,6 +30,43 @@ Codex 供应商切换与本地安全小工具（macOS · Tauri 2 + React + Rust�
 部分实现参考 [CC Switch](https://github.com/farion1231/cc-switch)（MIT License, Copyright Jason Young）。
 宠物功能参考社区宠物生态，具体来源（作者/仓库名）见应用内宠物页。
 
+## 与 CodexFF Pro 的关系
+
+免费版是 CodexFF Pro 的功能子集，不含任务看板、DNS 守护（加密解析/防污染）等付费功能。
+
+体验完整版 CodexFF Pro：[https://code.etony.ccwu.cc/](https://code.etony.ccwu.cc/)
+
+### Pro 功能展示
+
+<table>
+  <tr>
+    <td colspan="2" align="center">
+      <strong>任务看板</strong><br>
+      <img src="images/任务看板.png" alt="任务看板" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <strong>开启 DNS 守护</strong><br>
+      <img src="screenshots/dns-guard-on.png" alt="开启 DNS 守护" width="100%">
+    </td>
+    <td align="center">
+      <strong>开启后第三方权威检测（无泄漏）</strong><br>
+      <img src="screenshots/dns-leak-check-on.png" alt="开启后第三方权威检测（无泄漏）" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <strong>关闭 DNS 守护</strong><br>
+      <img src="screenshots/dns-guard-off.png" alt="关闭 DNS 守护" width="100%">
+    </td>
+    <td align="center">
+      <strong>关闭后第三方权威检测（DNS 泄露）</strong><br>
+      <img src="screenshots/dns-leak-check-off.png" alt="关闭后第三方权威检测（DNS 泄露）" width="100%">
+    </td>
+  </tr>
+</table>
+
 ## 开发
 
 ```bash
