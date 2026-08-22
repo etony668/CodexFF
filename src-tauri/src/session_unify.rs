@@ -1,8 +1,7 @@
-//! 统一会话历史 — 把仍停留在 "openai" 桶的旧官方会话迁入共享 "custom" 桶。
-//!
-//! 官方与第三方共用 `model_provider = "custom"` 后历史列表互通; 旧官方会话
-//! 的 session_meta / state DB 仍记录 "openai", 需要改写桶字段才出现在共享
-//! 历史里。迁移前自动备份 jsonl + state DB 到金库, 支持按备份账本精确还原。
+//! 统一会话历史 — 仅在用户显式开启时把官方与第三方会话迁入共享
+//! `model_provider = "custom"` 桶；关闭时按归属账本恢复原始 provider。
+//! 迁移前自动备份 jsonl、state DB 与项目索引到金库，统一期间持续增量
+//! 快照，任何失败都优先回滚而不覆盖最新会话内容。
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -12,6 +11,7 @@ use std::time::Duration;
 use rusqlite::{backup::Backup, params_from_iter, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::codex_config;
 use crate::session_manager;
@@ -55,8 +55,560 @@ struct UnifyLedger {
     files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UnifiedState {
+    pub enabled: bool,
+    pub generation: Option<String>,
+    pub last_checkpoint_ms: i64,
+    pub backed_up_threads: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Provenance {
+    thread_id: String,
+    session_id: String,
+    path: String,
+    original_provider: String,
+    original_account: String,
+    #[serde(default)]
+    original_sha256: String,
+    #[serde(default)]
+    last_checkpoint_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UnifiedLedger {
+    timestamp: String,
+    codex_config_dir: String,
+    current_account: String,
+    files: Vec<Provenance>,
+    #[serde(default)]
+    state_hashes: HashMap<String, String>,
+}
+
 fn unify_backup_root() -> PathBuf {
     vault::vault_dir().join("session-unify-backup")
+}
+
+fn unified_state_path() -> PathBuf {
+    vault::vault_dir().join("session-unify-state.json")
+}
+
+fn project_visibility_backup_path(provider: &str) -> PathBuf {
+    vault::vault_dir()
+        .join("project-visibility-backup")
+        .join(format!("{provider}.json"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectVisibilityBackup {
+    version: u32,
+    provider: String,
+    created_at: String,
+    #[serde(default)]
+    source_sha256: String,
+    /// 只保存本次 provider 清理时移除的索引项，而不是整份 global-state。
+    /// 这样恢复时不会覆盖用户在当前 provider 下后来做出的修改。
+    removed: Value,
+}
+
+pub fn state() -> UnifiedState {
+    std::fs::read_to_string(unified_state_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn provider_cwds(provider: &str) -> Result<Vec<String>, session_manager::SessionError> {
+    let db = codex_config::codex_state_db_path();
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let has_threads = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'",
+            [],
+            |_| Ok(1),
+        )
+        .is_ok();
+    if !has_threads {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT cwd FROM threads
+         WHERE model_provider = ?1 AND archived = 0 AND cwd IS NOT NULL AND cwd <> ''",
+    )?;
+    let rows = stmt.query_map([provider], |row| row.get::<_, String>(0))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn provider_thread_ids(
+    provider: &str,
+) -> Result<Option<HashSet<String>>, session_manager::SessionError> {
+    let db = codex_config::codex_state_db_path();
+    if !db.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let has_threads = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'",
+            [],
+            |_| Ok(1),
+        )
+        .is_ok();
+    if !has_threads {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id FROM threads
+         WHERE model_provider = ?1 AND archived = 0 AND id IS NOT NULL AND id <> ''",
+    )?;
+    let rows = stmt.query_map([provider], |row| row.get::<_, String>(0))?;
+    Ok(Some(rows.filter_map(Result::ok).collect()))
+}
+
+fn project_has_visible_assignment(
+    project_id: &str,
+    project: &Value,
+    visible_threads: &HashSet<String>,
+    assignments: &serde_json::Map<String, Value>,
+    cwds: &[String],
+) -> bool {
+    let assigned: Vec<(&String, &Value)> = assignments
+        .iter()
+        .filter(|(_, value)| value.get("projectId").and_then(Value::as_str) == Some(project_id))
+        .collect();
+    if !assigned.is_empty() {
+        // Assignment 是比 cwd 更精确的归属来源；混合 provider 项目不会因共享 cwd
+        // 被错误地完整显示到另一个 provider。
+        return assigned
+            .iter()
+            .any(|(thread_id, _)| visible_threads.contains(thread_id.as_str()));
+    }
+    // 新 schema 里没有 assignment 的项目不能安全删除，避免用户手动创建但
+    // 尚未产生线程的项目被误删。只有整个索引没有 assignment 时，才回退到 cwd。
+    if assignments.is_empty() {
+        project_has_visible_cwd(project, cwds)
+    } else {
+        true
+    }
+}
+
+fn read_project_visibility_backup(
+    provider: &str,
+) -> Result<Option<ProjectVisibilityBackup>, session_manager::SessionError> {
+    let path = project_visibility_backup_path(provider);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    if let Ok(backup) = serde_json::from_value::<ProjectVisibilityBackup>(value.clone()) {
+        return Ok(Some(backup));
+    }
+    // 兼容此前写入的整份 global-state 备份：转换成恢复所需的“移除项”形态。
+    Ok(Some(ProjectVisibilityBackup {
+        version: 1,
+        provider: provider.to_string(),
+        created_at: chrono::Local::now().to_rfc3339(),
+        source_sha256: String::new(),
+        removed: value,
+    }))
+}
+
+fn merge_removed_value(existing: &mut Value, incoming: &Value) {
+    let (Some(dst), Some(src)) = (existing.as_object_mut(), incoming.as_object()) else {
+        return;
+    };
+    for (key, value) in src {
+        match key.as_str() {
+            "local-projects" | "thread-project-assignments" => {
+                let target = dst
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let (Some(target), Some(source)) = (target.as_object_mut(), value.as_object()) {
+                    for (id, item) in source {
+                        target.entry(id.clone()).or_insert_with(|| item.clone());
+                    }
+                }
+            }
+            "project-order" => {
+                let target = dst
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let (Some(target), Some(source)) = (target.as_array_mut(), value.as_array()) {
+                    for item in source {
+                        if !target.contains(item) {
+                            target.push(item.clone());
+                        }
+                    }
+                }
+            }
+            _ => {
+                dst.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+}
+
+fn save_project_visibility_backup(
+    provider: &str,
+    removed: Value,
+    source_sha256: String,
+) -> Result<(), session_manager::SessionError> {
+    let is_empty = removed
+        .as_object()
+        .map(|object| object.is_empty())
+        .unwrap_or(true);
+    if is_empty {
+        return Ok(());
+    }
+    if let Some(parent) = project_visibility_backup_path(provider).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut backup = read_project_visibility_backup(provider)?.unwrap_or(ProjectVisibilityBackup {
+        version: 2,
+        provider: provider.to_string(),
+        created_at: chrono::Local::now().to_rfc3339(),
+        source_sha256,
+        removed: Value::Object(serde_json::Map::new()),
+    });
+    merge_removed_value(&mut backup.removed, &removed);
+    vault::atomic_write_bytes(
+        &project_visibility_backup_path(provider),
+        &serde_json::to_vec_pretty(&backup)?,
+    )
+    .map_err(|e| {
+        session_manager::SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("备份项目索引失败: {e}"),
+        ))
+    })?;
+    Ok(())
+}
+
+fn project_has_visible_cwd(project: &Value, cwds: &[String]) -> bool {
+    let Some(roots) = project.get("rootPaths").and_then(Value::as_array) else {
+        return false;
+    };
+    roots.iter().any(|root| {
+        let Some(root) = root.as_str() else {
+            return false;
+        };
+        cwds.iter()
+            .any(|cwd| cwd == root || cwd.starts_with(&format!("{root}/")))
+    })
+}
+
+fn restore_project_visibility(
+    provider: &str,
+    root: &mut Value,
+) -> Result<(), session_manager::SessionError> {
+    let backup = project_visibility_backup_path(provider);
+    if !backup.exists() {
+        return Ok(());
+    }
+    let saved: Value = match read_project_visibility_backup(provider)? {
+        Some(backup) => backup.removed,
+        None => return Ok(()),
+    };
+    let Some(saved_obj) = saved.as_object() else {
+        return Ok(());
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(());
+    };
+
+    for key in ["local-projects", "thread-project-assignments"] {
+        let Some(source) = saved_obj.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        let target = obj
+            .entry(key.to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Some(target) = target.as_object_mut() else {
+            continue;
+        };
+        for (id, value) in source {
+            target.entry(id.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    if let Some(source) = saved_obj.get("project-order").and_then(Value::as_array) {
+        let target = obj
+            .entry("project-order".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(target) = target.as_array_mut() {
+            for value in source {
+                if !target.contains(value) {
+                    target.push(value.clone());
+                }
+            }
+        }
+    }
+    for (key, value) in saved_obj {
+        if key.starts_with("sidebar-project-expanded-v1-codex:") && !obj.contains_key(key) {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(value) = saved_obj.get("selected-project") {
+        let should_restore = obj
+            .get("selected-project")
+            .and_then(|v| v.get("projectId"))
+            .and_then(Value::as_str)
+            .is_none();
+        if should_restore {
+            obj.insert("selected-project".into(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+pub fn restore_project_visibility_for_provider(
+    provider: &str,
+) -> Result<(), session_manager::SessionError> {
+    if provider != OPENAI_BUCKET && provider != SHARED_BUCKET {
+        return Ok(());
+    }
+    let path = codex_config::codex_config_dir().join(".codex-global-state.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut root: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let before = root.clone();
+    restore_project_visibility(provider, &mut root)?;
+    if root != before {
+        vault::atomic_write_bytes(&path, &serde_json::to_vec_pretty(&root)?).map_err(|e| {
+            session_manager::SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("恢复项目索引失败: {e}"),
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// 按目标 provider 清理 Codex 侧边栏项目索引。
+/// 只移除没有该 provider 活跃线程的项目节点，并把清理前的完整 global-state
+/// 保存到 vault；切换回该 provider 时先合并恢复，避免项目名称和线程归属丢失。
+pub fn sync_project_visibility(provider: &str) -> Result<(), session_manager::SessionError> {
+    if provider != OPENAI_BUCKET && provider != SHARED_BUCKET {
+        return Ok(());
+    }
+    let Some(visible_threads) = provider_thread_ids(provider)? else {
+        // 没有可靠线程归属时不猜测、不删除任何项目。
+        return Ok(());
+    };
+    let cwds = provider_cwds(provider)?;
+    let path = codex_config::codex_config_dir().join(".codex-global-state.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let source_sha256 = sha256_file(&path)?;
+    let mut root: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    restore_project_visibility(provider, &mut root)?;
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(projects_snapshot) = obj
+        .get("local-projects")
+        .and_then(Value::as_object)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let assignments = obj
+        .get("thread-project-assignments")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut removed_snapshot = serde_json::Map::new();
+    let removed: HashSet<String> = {
+        projects_snapshot
+            .iter()
+            .filter_map(|(id, project)| {
+                (!project_has_visible_assignment(
+                    id,
+                    project,
+                    &visible_threads,
+                    &assignments,
+                    &cwds,
+                ))
+                .then(|| id.clone())
+            })
+            .collect()
+    };
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let mut removed_projects = serde_json::Map::new();
+    let Some(projects) = obj.get_mut("local-projects").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    for id in &removed {
+        if let Some(value) = projects.remove(id) {
+            removed_projects.insert(id.clone(), value);
+        }
+    }
+    removed_snapshot.insert("local-projects".into(), Value::Object(removed_projects));
+    if let Some(order) = obj.get_mut("project-order").and_then(Value::as_array_mut) {
+        let mut removed_order = Vec::new();
+        order.retain(|value| {
+            let remove = value
+                .as_str()
+                .map(|id| removed.contains(id))
+                .unwrap_or(false);
+            if remove {
+                removed_order.push(value.clone());
+            }
+            !remove
+        });
+        if !removed_order.is_empty() {
+            removed_snapshot.insert("project-order".into(), Value::Array(removed_order));
+        }
+    }
+    let expanded: Vec<String> = obj
+        .keys()
+        .filter(|key| {
+            key.starts_with("sidebar-project-expanded-v1-codex:")
+                && removed.iter().any(|id| key.contains(id))
+        })
+        .cloned()
+        .collect();
+    for key in expanded {
+        if let Some(value) = obj.remove(&key) {
+            removed_snapshot.insert(key, value);
+        }
+    }
+    if let Some(assignments) = obj
+        .get_mut("thread-project-assignments")
+        .and_then(Value::as_object_mut)
+    {
+        let mut removed_assignments = serde_json::Map::new();
+        assignments.retain(|thread_id, value| {
+            let remove = value
+                .get("projectId")
+                .and_then(Value::as_str)
+                .map(|id| removed.contains(id))
+                .unwrap_or(false);
+            if remove {
+                removed_assignments.insert(thread_id.clone(), value.clone());
+            }
+            !remove
+        });
+        if !removed_assignments.is_empty() {
+            removed_snapshot.insert(
+                "thread-project-assignments".into(),
+                Value::Object(removed_assignments),
+            );
+        }
+    }
+    if obj
+        .get("selected-project")
+        .and_then(|v| v.get("projectId"))
+        .and_then(Value::as_str)
+        .map(|id| removed.contains(id))
+        .unwrap_or(false)
+    {
+        if let Some(value) = obj.remove("selected-project") {
+            removed_snapshot.insert("selected-project".into(), value);
+        }
+    }
+    save_project_visibility_backup(provider, Value::Object(removed_snapshot), source_sha256)?;
+    vault::atomic_write_bytes(&path, &serde_json::to_vec_pretty(&root)?).map_err(|e| {
+        session_manager::SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("写入项目索引失败: {e}"),
+        ))
+    })?;
+    Ok(())
+}
+
+fn save_state(next: &UnifiedState) -> Result<(), session_manager::SessionError> {
+    vault::atomic_write_bytes(&unified_state_path(), &serde_json::to_vec_pretty(next)?).map_err(
+        |e| {
+            session_manager::SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("写入统一状态失败: {e}"),
+            ))
+        },
+    )
+}
+
+fn account_marker() -> String {
+    crate::profiles::active_account_marker()
+}
+
+fn sha256_file(path: &Path) -> Result<String, session_manager::SessionError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn copy_snapshot_file(src: &Path, dst: &Path) -> Result<(), session_manager::SessionError> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = dst.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::copy(src, &tmp)?;
+    std::fs::rename(tmp, dst)?;
+    Ok(())
+}
+
+fn all_session_files() -> Vec<(PathBuf, bool)> {
+    let paths = codex_config::codex_sessions_paths();
+    let mut out = Vec::new();
+    for (root, archived) in [(paths[0].clone(), false), (paths[1].clone(), true)] {
+        if !root.exists() {
+            continue;
+        }
+        let mut files = Vec::new();
+        walk_jsonl(&root, &mut files);
+        out.extend(files.into_iter().map(|p| (p, archived)));
+    }
+    out
+}
+
+fn current_ledger_path(generation: &str) -> PathBuf {
+    unify_backup_root().join(generation).join("ledger.json")
+}
+
+fn load_current_ledger(generation: &str) -> Result<UnifiedLedger, session_manager::SessionError> {
+    let text = std::fs::read_to_string(current_ledger_path(generation))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn write_ledger(
+    generation: &str,
+    ledger: &UnifiedLedger,
+) -> Result<(), session_manager::SessionError> {
+    vault::atomic_write_bytes(
+        &current_ledger_path(generation),
+        &serde_json::to_vec_pretty(ledger)?,
+    )
+    .map_err(|e| {
+        session_manager::SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("写入统一归属账本失败: {e}"),
+        ))
+    })
 }
 
 fn codex_dir() -> PathBuf {
@@ -206,6 +758,360 @@ fn validate_thread_ids(ids: &[String]) -> Result<(), session_manager::SessionErr
     Ok(())
 }
 
+fn relative_session_path(path: &Path) -> String {
+    path.strip_prefix(&codex_dir())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn rewrite_all_provider(
+    from: &str,
+    to: &str,
+    progress: &dyn Fn(&str),
+) -> Result<usize, session_manager::SessionError> {
+    let mut changed = 0;
+    for (path, _) in all_session_files() {
+        let rewrite = |line: &[u8]| {
+            let text = std::str::from_utf8(line).ok()?;
+            if !text.contains("\"session_meta\"") || !text.contains("\"model_provider\"") {
+                return None;
+            }
+            let trimmed = text.trim_end_matches(['\n', '\r']);
+            let mut value: Value = serde_json::from_str(trimmed).ok()?;
+            if value.get("type")?.as_str()? != "session_meta" {
+                return None;
+            }
+            let payload = value.get_mut("payload")?.as_object_mut()?;
+            if payload.get("model_provider")?.as_str()? != from {
+                return None;
+            }
+            payload.insert("model_provider".into(), Value::String(to.into()));
+            let mut out = serde_json::to_string(&value).ok()?;
+            out.push('\n');
+            Some(out.into_bytes())
+        };
+        if rewrite_jsonl_file(&path, &rewrite)? {
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        progress(&format!("已统一 {} 个会话文件的渠道桶…", changed));
+    }
+    Ok(changed)
+}
+
+fn snapshot_generation(
+    generation: &str,
+    progress: &dyn Fn(&str),
+) -> Result<UnifiedLedger, session_manager::SessionError> {
+    let root = unify_backup_root().join(generation);
+    let mut files = Vec::new();
+    let account = account_marker();
+    for (path, _) in all_session_files() {
+        let Some((session_id, thread_id, provider)) = file_meta(&path) else {
+            continue;
+        };
+        let rel = relative_session_path(&path);
+        let dst = root.join("original").join(&rel);
+        copy_snapshot_file(&path, &dst)?;
+        let hash = sha256_file(&path)?;
+        files.push(Provenance {
+            thread_id,
+            session_id,
+            path: rel,
+            original_provider: provider,
+            original_account: account.clone(),
+            original_sha256: hash.clone(),
+            last_checkpoint_sha256: hash,
+        });
+    }
+    let mut state_hashes = HashMap::new();
+    let db = codex_config::codex_state_db_path();
+    if db.exists() {
+        backup_state_db(&db, &root.join("original-state").join("state_5.sqlite"))?;
+        state_hashes.insert("state_5.sqlite".to_string(), sha256_file(&db)?);
+    }
+    for (name, path) in [
+        (
+            "global-state.json",
+            codex_config::codex_config_dir().join(".codex-global-state.json"),
+        ),
+        (
+            "session_index.jsonl",
+            codex_config::codex_config_dir().join("session_index.jsonl"),
+        ),
+    ] {
+        if path.exists() {
+            copy_snapshot_file(&path, &root.join("original-state").join(name))?;
+            state_hashes.insert(name.to_string(), sha256_file(&path)?);
+        }
+    }
+    progress(&format!("已备份 {} 个会话文件和索引…", files.len()));
+    let ledger = UnifiedLedger {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        codex_config_dir: canonical_dir_string(&codex_dir()),
+        current_account: account,
+        files,
+        state_hashes,
+    };
+    write_ledger(generation, &ledger)?;
+    Ok(ledger)
+}
+
+fn checkpoint_generation(
+    generation: &str,
+    progress: &dyn Fn(&str),
+) -> Result<UnifiedState, session_manager::SessionError> {
+    let mut ledger = load_current_ledger(generation)?;
+    let root = unify_backup_root().join(generation);
+    let known: HashSet<String> = ledger.files.iter().map(|f| f.path.clone()).collect();
+    let mut added = 0;
+    let mut changed = 0;
+    for (path, _) in all_session_files() {
+        let rel = relative_session_path(&path);
+        let Some((session_id, thread_id, provider)) = file_meta(&path) else {
+            continue;
+        };
+        // 新增文件只进入增量安全副本；原始归属标记为当前统一状态下的 custom，
+        // 关闭统一时不会被错误改回 openai。
+        let hash = sha256_file(&path)?;
+        if !known.contains(&rel) {
+            let dst = root.join("incremental").join(&rel);
+            copy_snapshot_file(&path, &dst)?;
+            ledger.files.push(Provenance {
+                thread_id,
+                session_id,
+                path: rel,
+                original_provider: provider,
+                original_account: account_marker(),
+                original_sha256: hash.clone(),
+                last_checkpoint_sha256: hash,
+            });
+            added += 1;
+        } else if let Some(item) = ledger.files.iter_mut().find(|f| f.path == rel) {
+            // 只在内容变化时刷新增量副本，不用旧快照覆盖统一期间的新内容。
+            if item.last_checkpoint_sha256 != hash {
+                let dst = root.join("incremental").join(&rel);
+                copy_snapshot_file(&path, &dst)?;
+                item.last_checkpoint_sha256 = hash;
+                changed += 1;
+            }
+        }
+    }
+    for (name, path) in [
+        ("state_5.sqlite", codex_config::codex_state_db_path()),
+        (
+            "global-state.json",
+            codex_config::codex_config_dir().join(".codex-global-state.json"),
+        ),
+        (
+            "session_index.jsonl",
+            codex_config::codex_config_dir().join("session_index.jsonl"),
+        ),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        let hash = sha256_file(&path)?;
+        if ledger.state_hashes.get(name) != Some(&hash) {
+            if name == "state_5.sqlite" {
+                backup_state_db(&path, &root.join("incremental-state").join(name))?;
+            } else {
+                copy_snapshot_file(&path, &root.join("incremental-state").join(name))?;
+            }
+            ledger.state_hashes.insert(name.to_string(), hash);
+        }
+    }
+    write_ledger(generation, &ledger)?;
+    let mut next = state();
+    next.enabled = true;
+    next.generation = Some(generation.to_string());
+    next.last_checkpoint_ms = chrono::Utc::now().timestamp_millis();
+    next.backed_up_threads = ledger
+        .files
+        .iter()
+        .map(|f| f.thread_id.clone())
+        .collect::<HashSet<_>>()
+        .len();
+    next.error = None;
+    if added > 0 || changed > 0 {
+        progress(&format!(
+            "已增量备份 {} 个新会话文件、{} 个变更会话文件…",
+            added, changed
+        ));
+    }
+    save_state(&next)?;
+    Ok(next)
+}
+
+pub fn checkpoint_if_enabled() -> Result<(), session_manager::SessionError> {
+    let current = state();
+    if !current.enabled {
+        return Ok(());
+    }
+    let Some(generation) = current.generation else {
+        return Ok(());
+    };
+    checkpoint_generation(&generation, &|_| {}).map(|_| ())
+}
+
+pub fn set_enabled(
+    enabled: bool,
+    progress: &dyn Fn(&str),
+) -> Result<UnifiedState, session_manager::SessionError> {
+    let current = state();
+    if current.enabled == enabled {
+        if enabled {
+            let Some(generation) = current.generation.as_deref() else {
+                return Err(session_manager::SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "统一状态缺少安全快照 generation；请关闭并重新开启会话统一",
+                )));
+            };
+            return checkpoint_generation(generation, progress);
+        }
+        return Ok(current);
+    }
+    if session_manager::codex_running() {
+        return Err(blocked());
+    }
+    if enabled {
+        let generation = format!("unified-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+        progress("创建会话统一安全快照…");
+        let ledger = snapshot_generation(&generation, progress)?;
+        let result = (|| -> Result<UnifiedState, session_manager::SessionError> {
+            rewrite_all_provider(OPENAI_BUCKET, SHARED_BUCKET, progress)?;
+            let db = codex_config::codex_state_db_path();
+            if db.exists() {
+                update_state_db(
+                    &db,
+                    &ledger
+                        .files
+                        .iter()
+                        .map(|f| f.thread_id.clone())
+                        .collect::<Vec<_>>(),
+                    OPENAI_BUCKET,
+                    SHARED_BUCKET,
+                )?;
+            }
+            // 配置桶与文件/SQLite 迁移在同一事务边界内提交；失败由外层回滚。
+            codex_config::set_session_unify_provider(true).map_err(|e| {
+                session_manager::SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("切换统一会话配置桶失败: {e}"),
+                ))
+            })?;
+            let mut next = UnifiedState {
+                enabled: true,
+                generation: Some(generation.clone()),
+                last_checkpoint_ms: chrono::Utc::now().timestamp_millis(),
+                backed_up_threads: ledger
+                    .files
+                    .iter()
+                    .map(|f| f.thread_id.clone())
+                    .collect::<HashSet<_>>()
+                    .len(),
+                error: None,
+            };
+            save_state(&next)?;
+            next = checkpoint_generation(&generation, progress)?;
+            Ok(next)
+        })();
+        match result {
+            Ok(next) => Ok(next),
+            Err(error) => {
+                progress("统一开启失败，正在恢复原始会话与索引…");
+                let _ = codex_config::set_session_unify_provider(false);
+                let rollback = rollback_generation(&generation, &ledger);
+                let _ = save_state(&UnifiedState {
+                    enabled: false,
+                    error: Some(format!("{error}")),
+                    ..UnifiedState::default()
+                });
+                if let Err(rollback_error) = rollback {
+                    return Err(session_manager::SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{error}; 自动回滚失败: {rollback_error}"),
+                    )));
+                }
+                Err(error)
+            }
+        }
+    } else {
+        let Some(generation) = current.generation.clone() else {
+            return Ok(UnifiedState::default());
+        };
+        progress("备份并校验当前会话状态…");
+        let _ = checkpoint_generation(&generation, progress)?;
+        let ledger = load_current_ledger(&generation)?;
+        let result = (|| -> Result<UnifiedState, session_manager::SessionError> {
+            for (path, _) in all_session_files() {
+                let rel = relative_session_path(&path);
+                let Some(provenance) = ledger.files.iter().find(|f| f.path == rel) else {
+                    continue;
+                };
+                let rewrite = |line: &[u8]| {
+                    rewrite_meta_bucket(
+                        line,
+                        &HashSet::from([provenance.session_id.clone()]),
+                        false,
+                        SHARED_BUCKET,
+                        &provenance.original_provider,
+                    )
+                };
+                let _ = rewrite_jsonl_file(&path, &rewrite)?;
+            }
+            let db = codex_config::codex_state_db_path();
+            if db.exists() {
+                let mut by_provider: HashMap<String, Vec<String>> = HashMap::new();
+                for file in &ledger.files {
+                    by_provider
+                        .entry(file.original_provider.clone())
+                        .or_default()
+                        .push(file.thread_id.clone());
+                }
+                for (provider, ids) in by_provider {
+                    update_state_db(&db, &ids, SHARED_BUCKET, &provider)?;
+                }
+            }
+            codex_config::set_session_unify_provider(false).map_err(|e| {
+                session_manager::SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("恢复官方会话配置桶失败: {e}"),
+                ))
+            })?;
+            let target_provider = match codex_config::current_profile_kind() {
+                Ok(codex_config::CurrentProfile::Official) => OPENAI_BUCKET,
+                Ok(codex_config::CurrentProfile::Relay) => SHARED_BUCKET,
+                _ => "",
+            };
+            if !target_provider.is_empty() {
+                sync_project_visibility(target_provider)?;
+            }
+            let next = UnifiedState::default();
+            save_state(&next)?;
+            progress("会话统一已关闭，归属已恢复；最新会话内容保留在原文件中。");
+            Ok(next)
+        })();
+        match result {
+            Ok(next) => Ok(next),
+            Err(error) => {
+                progress("统一关闭失败，正在恢复统一前的最新会话快照…");
+                let _ = codex_config::set_session_unify_provider(true);
+                let rollback = restore_latest_generation_snapshot(&generation, &ledger);
+                let _ = save_state(&current);
+                if let Err(rollback_error) = rollback {
+                    return Err(session_manager::SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{error}; 自动回滚失败: {rollback_error}"),
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
 fn blocked() -> session_manager::SessionError {
     session_manager::SessionError::Io(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
@@ -338,6 +1244,111 @@ fn backup_state_db(
     )?;
     let backup = Backup::new(&src, &mut dst)?;
     backup.run_to_completion(5, Duration::from_millis(25), None)?;
+    Ok(())
+}
+
+fn restore_state_db(
+    backup_path: &Path,
+    db_path: &Path,
+) -> Result<(), session_manager::SessionError> {
+    if !backup_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let src = Connection::open_with_flags(
+        backup_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut dst = Connection::open(db_path)?;
+    dst.busy_timeout(Duration::from_secs(5))?;
+    let backup = Backup::new(&src, &mut dst)?;
+    backup.run_to_completion(5, Duration::from_millis(25), None)?;
+    Ok(())
+}
+
+/// 开启统一的任一步骤失败时恢复启用前的完整文件/索引快照。
+/// Codex 在 set_enabled 中已被强制退出，因此用原始快照覆盖当前文件不会
+/// 与正在写入的 rollout 竞争，也不会丢失用户在开启前的内容。
+fn rollback_generation(
+    generation: &str,
+    ledger: &UnifiedLedger,
+) -> Result<(), session_manager::SessionError> {
+    let root = unify_backup_root().join(generation);
+    for file in &ledger.files {
+        let src = root.join("original").join(&file.path);
+        if src.exists() {
+            copy_snapshot_file(&src, &codex_dir().join(&file.path))?;
+        }
+    }
+    restore_state_db(
+        &root.join("original-state").join("state_5.sqlite"),
+        &codex_config::codex_state_db_path(),
+    )?;
+    for (name, path) in [
+        (
+            "global-state.json",
+            codex_config::codex_config_dir().join(".codex-global-state.json"),
+        ),
+        (
+            "session_index.jsonl",
+            codex_config::codex_config_dir().join("session_index.jsonl"),
+        ),
+    ] {
+        let src = root.join("original-state").join(name);
+        if src.exists() {
+            copy_snapshot_file(&src, &path)?;
+        }
+    }
+    let _ = std::fs::remove_file(unified_state_path());
+    Ok(())
+}
+
+fn restore_latest_generation_snapshot(
+    generation: &str,
+    ledger: &UnifiedLedger,
+) -> Result<(), session_manager::SessionError> {
+    let root = unify_backup_root().join(generation);
+    for file in &ledger.files {
+        let incremental = root.join("incremental").join(&file.path);
+        let original = root.join("original").join(&file.path);
+        let source = if incremental.exists() {
+            incremental
+        } else {
+            original
+        };
+        if source.exists() {
+            copy_snapshot_file(&source, &codex_dir().join(&file.path))?;
+        }
+    }
+    for (name, path) in [
+        ("state_5.sqlite", codex_config::codex_state_db_path()),
+        (
+            "global-state.json",
+            codex_config::codex_config_dir().join(".codex-global-state.json"),
+        ),
+        (
+            "session_index.jsonl",
+            codex_config::codex_config_dir().join("session_index.jsonl"),
+        ),
+    ] {
+        let incremental = root.join("incremental-state").join(name);
+        let original = root.join("original-state").join(name);
+        let source = if incremental.exists() {
+            incremental
+        } else {
+            original
+        };
+        if !source.exists() {
+            continue;
+        }
+        if name == "state_5.sqlite" {
+            restore_state_db(&source, &path)?;
+        } else {
+            copy_snapshot_file(&source, &path)?;
+        }
+    }
     Ok(())
 }
 
@@ -677,5 +1688,89 @@ mod tests {
         assert_eq!(custom, 3);
         drop(conn);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn project_visibility_uses_path_boundaries() {
+        let project = serde_json::json!({
+            "rootPaths": ["/Users/test/DeepSeek Harness Glass"]
+        });
+        assert!(project_has_visible_cwd(
+            &project,
+            &["/Users/test/DeepSeek Harness Glass/src".to_string()]
+        ));
+        assert!(!project_has_visible_cwd(
+            &project,
+            &["/Users/test/DeepSeek Harness Glass-old".to_string()]
+        ));
+    }
+
+    #[test]
+    fn project_visibility_uses_thread_assignments_for_mixed_projects() {
+        let project = serde_json::json!({
+            "rootPaths": ["/Users/test/shared"]
+        });
+        let assignments = serde_json::json!({
+            "thread-official": {"projectId": "p1"},
+            "thread-relay": {"projectId": "p1"}
+        });
+        let assignments = assignments.as_object().expect("object");
+        let official = HashSet::from(["thread-official".to_string()]);
+        let relay = HashSet::from(["thread-relay".to_string()]);
+        assert!(project_has_visible_assignment(
+            "p1",
+            &project,
+            &official,
+            assignments,
+            &["/Users/test/shared".to_string()]
+        ));
+        assert!(project_has_visible_assignment(
+            "p1",
+            &project,
+            &relay,
+            assignments,
+            &["/Users/test/shared".to_string()]
+        ));
+        assert!(!project_has_visible_assignment(
+            "p1",
+            &project,
+            &HashSet::new(),
+            assignments,
+            &["/Users/test/shared".to_string()]
+        ));
+    }
+
+    #[test]
+    fn unassigned_project_is_preserved_when_assignments_are_available() {
+        let project = serde_json::json!({"rootPaths": ["/Users/test/unknown"]});
+        let assignments = serde_json::json!({
+            "thread-1": {"projectId": "other"}
+        });
+        assert!(project_has_visible_assignment(
+            "unassigned",
+            &project,
+            &HashSet::new(),
+            assignments.as_object().expect("object"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn project_visibility_backup_merge_keeps_first_snapshot() {
+        let mut existing = serde_json::json!({
+            "local-projects": {"p1": {"name": "original"}},
+            "project-order": ["p1"]
+        });
+        let incoming = serde_json::json!({
+            "local-projects": {
+                "p1": {"name": "changed"},
+                "p2": {"name": "new"}
+            },
+            "project-order": ["p2"]
+        });
+        merge_removed_value(&mut existing, &incoming);
+        assert_eq!(existing["local-projects"]["p1"]["name"], "original");
+        assert_eq!(existing["local-projects"]["p2"]["name"], "new");
+        assert_eq!(existing["project-order"], serde_json::json!(["p1", "p2"]));
     }
 }

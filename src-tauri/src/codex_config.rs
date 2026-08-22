@@ -3,7 +3,7 @@
 //! 核心原则:
 //! - config.toml 用 toml_edit 原地修改, 不动用户自定义字段
 //! - auth.json 是凭证物理隔离的关键: 官方凭证只在官方 profile 激活时出现
-//! - sessions/ 目录永不接触 — 会话跨 provider 共享
+//! - sessions/ 目录仅由显式“会话统一”开关管理；关闭时保留官方/第三方归属
 
 use std::path::PathBuf;
 
@@ -25,9 +25,8 @@ pub const CODEXFF_MODEL_CATALOG_FILENAME: &str = "codexff-model-catalog.json";
 
 /// 官方原生 provider 名 (codex 内置, 老配置/手动配置用)
 pub const OFFICIAL_MODEL_PROVIDER: &str = "openai";
-/// 共享 provider 桶 (统一会话历史): 官方与中转都以 "custom" 身份运行,
-/// codex CLI 按 model_provider 分桶 → 互切时续聊列表互通 (cc-switch 同机制)。
-/// 切换 = 覆写 [model_providers.custom] 表内容 (官方形态 ↔ 中转形态)。
+/// 共享 provider 桶 (统一会话历史)。只有用户显式开启会话统一时，
+/// 官方才使用此桶；中转始终使用此桶。
 pub const SHARED_MODEL_PROVIDER: &str = "custom";
 
 /// 官方形态 custom 表: 认证走 auth.json ChatGPT 登录, 无 base_url → 直连官方后端
@@ -127,8 +126,8 @@ pub fn read_auth_json() -> Result<Option<Value>, CodexConfigError> {
     Ok(Some(serde_json::from_str(&text)?))
 }
 
-/// 官方 profile 激活: 写共享 custom 桶 + 官方形态表 (统一会话历史),
-/// 官方/中转互切时 codex CLI 续聊列表互通; 认证仍走 auth.json 官方登录。
+/// 官方 profile 激活: 会话统一开启时写共享 custom 桶；关闭时写原生 openai 桶。
+/// 认证仍走 auth.json 官方登录。
 /// 清掉我们写过的中转表 (codexff_relay 标记) 和遗留中转形态 custom 表。
 /// 保留用户自己的其他 provider 配置。
 /// `restore` 来自切换前快照 (RelayState): 还原/清理顶层 model 等字段。
@@ -139,7 +138,12 @@ pub fn write_official_config(
 ) -> Result<(), CodexConfigError> {
     let mut doc = parse_or_default(&read_config_text()?)?;
 
-    doc["model_provider"] = value(SHARED_MODEL_PROVIDER);
+    let unify_enabled = crate::session_unify::state().enabled;
+    doc["model_provider"] = value(if unify_enabled {
+        SHARED_MODEL_PROVIDER
+    } else {
+        OFFICIAL_MODEL_PROVIDER
+    });
     // 顶层字段还原: Some(Some(v)) → 写回; Some(None) → 删除 (切换前没有)
     match restore_model {
         Some(Some(v)) => doc["model"] = value(v),
@@ -216,7 +220,9 @@ pub fn write_official_config(
         for key in ours {
             table.remove(&key);
         }
-        table.insert(SHARED_MODEL_PROVIDER, Item::Table(official_custom_table()));
+        if unify_enabled {
+            table.insert(SHARED_MODEL_PROVIDER, Item::Table(official_custom_table()));
+        }
     }
 
     // 切官方: 移除我们写过的模型目录字段 (DeepSeek catalog 只在 relay 态生效;
@@ -846,7 +852,7 @@ pub(crate) fn write_config_text(text: &str) -> Result<(), CodexConfigError> {
 }
 
 /// 当前激活的 profile 类型 (从 config.toml 推断)。
-/// 官方与中转共用 custom 桶, 按表形态区分: 官方形态 (无 base_url) → Official;
+/// 官方关闭统一时使用原生 openai 桶；开启统一时使用官方形态 custom 表。
 /// codexff_relay 标记或带 base_url (cc-switch 遗留) → Relay。
 pub fn current_profile_kind() -> Result<CurrentProfile, CodexConfigError> {
     let text = read_config_text()?;
@@ -882,6 +888,54 @@ pub fn current_profile_kind() -> Result<CurrentProfile, CodexConfigError> {
         }
         _ => Ok(CurrentProfile::None),
     }
+}
+
+/// 仅切换当前配置的会话桶，不触碰凭证、模型或用户其它字段。
+/// 用于会话统一开关在当前 profile 已经生效时立即更新 Codex 的列表分桶。
+pub fn set_session_unify_provider(enabled: bool) -> Result<(), CodexConfigError> {
+    let mut doc = parse_or_default(&read_config_text()?)?;
+    let current = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if enabled && current == OFFICIAL_MODEL_PROVIDER {
+        doc["model_provider"] = value(SHARED_MODEL_PROVIDER);
+        let providers = doc
+            .entry("model_providers")
+            .or_insert_with(|| Item::Table(Table::new()));
+        let table = providers
+            .as_table_mut()
+            .ok_or_else(|| CodexConfigError::TomlParse("model_providers 不是表".into()))?;
+        let needs_official = table
+            .get(SHARED_MODEL_PROVIDER)
+            .and_then(Item::as_table)
+            .map(|t| !is_official_custom_table(t))
+            .unwrap_or(true);
+        if needs_official {
+            table.insert(SHARED_MODEL_PROVIDER, Item::Table(official_custom_table()));
+        }
+    } else if !enabled && current == SHARED_MODEL_PROVIDER {
+        let official_shape = doc
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|t| t.get(SHARED_MODEL_PROVIDER))
+            .and_then(Item::as_table)
+            .is_some_and(is_official_custom_table);
+        if official_shape {
+            doc["model_provider"] = value(OFFICIAL_MODEL_PROVIDER);
+        }
+    }
+
+    let next = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .unwrap_or("");
+    if next != current {
+        write_config_text(&doc.to_string())?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]

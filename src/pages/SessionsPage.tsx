@@ -2,14 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   SessionMeta,
-  UnifySessionMeta,
   errMsg,
-  hasUnifyBackup,
+  getSessionUnifyState,
   isCodexRunning,
-  listUnifiableSessions,
   listSessions,
-  migrateSessionsToShared,
-  restoreUnifiedSessions,
+  setSessionUnifyEnabled,
   sessionDetail,
   setSessionIsolated,
 } from "../api";
@@ -40,13 +37,22 @@ export function SessionsPage({ onToast }: Props) {
   const [isolateStep, setIsolateStep] = useState("");
   // null 表示首次加载：所有项目默认折叠。
   const [collapsed, setCollapsed] = useState<Set<string> | null>(null);
-  // 统一会话历史迁移 (旧官方 "openai" 桶 → 共享 "custom" 桶, 迁移前自动备份)
-  const [unifyList, setUnifyList] = useState<UnifySessionMeta[] | null>(null);
-  const [unifyBackup, setUnifyBackup] = useState(false);
-  const [unifyOpen, setUnifyOpen] = useState(false);
-  const [unifySelected, setUnifySelected] = useState<Set<string>>(new Set());
+  // 统一会话历史：由用户显式开关控制，开启前备份，期间增量备份，关闭按账本恢复
   const [unifyBusy, setUnifyBusy] = useState(false);
   const [unifyStep, setUnifyStep] = useState("");
+  const [unifyState, setUnifyState] = useState<{
+    enabled: boolean;
+    generation: string | null;
+    last_checkpoint_ms: number;
+    backed_up_threads: number;
+    error: string | null;
+  }>({
+    enabled: false,
+    generation: null,
+    last_checkpoint_ms: 0,
+    backed_up_threads: 0,
+    error: null,
+  });
   // 请求序号: 快速点 A→B 时, A 的响应晚到不能覆盖 B 的内容
   const detailReq = useRef(0);
 
@@ -67,7 +73,7 @@ export function SessionsPage({ onToast }: Props) {
 
   useEffect(() => {
     load();
-    void refreshUnify();
+    void refreshUnifyState();
   }, []);
 
   // 统一历史迁移进度事件
@@ -201,96 +207,54 @@ export function SessionsPage({ onToast }: Props) {
     });
   }
 
-  async function refreshUnify() {
+  async function refreshUnifyState() {
     try {
-      const [list, backup] = await Promise.all([listUnifiableSessions(), hasUnifyBackup()]);
-      setUnifyList(list);
-      setUnifyBackup(backup);
+      setUnifyState(await getSessionUnifyState());
     } catch {
-      // 扫描失败不阻塞会话列表
+      // 旧版本后端没有该命令时保持关闭，避免静默执行统一。
     }
   }
 
-  function requestOpenUnify() {
-    if (unifyBusy || !unifyList || unifyList.length === 0) return;
+  function requestToggleUnify(enabled: boolean) {
+    if (unifyBusy || enabled === unifyState.enabled) return;
     onToast?.({
       kind: "confirm",
-      title: "迁入共享历史？",
-      message: `将把所选旧官方会话迁入共享历史（当前共 ${unifyList.length} 个线程）。迁移前会自动备份，之后可随时还原；跨供应商继续旧会话时，对方后端可能无法解密部分推理内容。`,
-      confirmLabel: "选择会话",
+      title: enabled ? "开启会话统一？" : "关闭会话统一并恢复归属？",
+      message: enabled
+        ? "开启前会完整备份当前会话、项目索引和状态库，并记录每个会话的渠道/账号归属。开启期间会持续增量备份。请先完全退出 Codex / ChatGPT 桌面端与命令行；任何失败都会保留原状态，不会删除会话。"
+        : "关闭前会先备份最新会话内容，再按归属账本恢复渠道/账号标识。统一期间新建会话不会被错误改回旧渠道；恢复失败会保留统一状态并提示，不会静默覆盖。",
+      confirmLabel: enabled ? "确认开启" : "确认关闭并恢复",
       cancelLabel: "取消",
       onConfirm: () => {
-        setUnifySelected(new Set(unifyList.map((u) => u.thread_id)));
-        setUnifyOpen(true);
+        void toggleUnify(enabled);
       },
     });
   }
 
-  async function startMigrate() {
-    if (unifyBusy || unifySelected.size === 0) return;
+  async function toggleUnify(enabled: boolean) {
     setUnifyBusy(true);
-    setUnifyStep("准备迁移…");
+    setUnifyStep(enabled ? "准备安全备份…" : "准备恢复归属…");
     try {
-      await migrateSessionsToShared([...unifySelected]);
-      setUnifyOpen(false);
-      await Promise.all([load(), refreshUnify()]);
+      const next = await setSessionUnifyEnabled(enabled);
+      setUnifyState(next);
+      await load();
       onToast?.({
-        title: "迁移完成",
-        message: "所选旧官方会话已迁入共享历史。",
-      });
-    } catch (e) {
-      const msg = errMsg(e);
-      onToast?.({
-        title: msg.includes("Codex") ? "无法迁移" : "迁移失败",
-        message: msg,
-      });
-    } finally {
-      setUnifyBusy(false);
-      setUnifyStep("");
-    }
-  }
-
-  function requestRestore() {
-    if (unifyBusy) return;
-    onToast?.({
-      kind: "confirm",
-      title: "从备份还原旧官方会话？",
-      message:
-        "将按迁移时的备份账本，把已迁入共享历史的旧官方会话还原为独立历史；开启统一后新建的会话不受影响。还原前也会自动备份当前状态。",
-      confirmLabel: "确认还原",
-      cancelLabel: "取消",
-      onConfirm: () => {
-        void restoreUnified();
-      },
-    });
-  }
-
-  async function restoreUnified() {
-    setUnifyBusy(true);
-    setUnifyStep("准备还原…");
-    try {
-      await restoreUnifiedSessions();
-      await Promise.all([load(), refreshUnify()]);
-      onToast?.({
-        title: "还原完成",
-        message: "旧官方会话已还原为独立历史。",
+        title: enabled ? "会话统一已开启" : "会话统一已关闭",
+        message: enabled
+          ? `已备份 ${next.backed_up_threads} 个线程，后续会持续增量备份。`
+          : "已按最新归属账本恢复；统一期间新增内容已保留。",
       });
     } catch (e) {
       onToast?.({
-        title: "还原失败",
+        title: enabled ? "开启会话统一失败" : "关闭会话统一失败",
         message: errMsg(e),
+        kind: "warn",
       });
+      await refreshUnifyState();
     } finally {
       setUnifyBusy(false);
       setUnifyStep("");
     }
-  }
-
-  function fmtSize(bytes: number) {
-    if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB";
-    if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + " KB";
-    return bytes + " B";
   }
 
   function fmt(ms: number) {
@@ -346,81 +310,39 @@ export function SessionsPage({ onToast }: Props) {
           <div className="unify-copy">
             <h2>统一会话历史</h2>
             <p className="hint">
-              官方与第三方共享同一会话历史列表。旧官方会话（独立历史）可迁入共享列表，
-              迁移前自动备份，随时可还原。
+              默认关闭。开启后官方与第三方共享会话列表；开启前完整备份，期间持续增量备份，
+              关闭时按最新归属账本恢复。
             </p>
           </div>
           <div className="unify-actions">
-            {unifyList && unifyList.length > 0 && (
-              <button onClick={requestOpenUnify} disabled={unifyBusy}>
-                迁入旧官方会话 ({unifyList.length})
-              </button>
-            )}
-            {unifyBackup && (
-              <button className="link-btn" onClick={requestRestore} disabled={unifyBusy}>
-                从备份还原
-              </button>
-            )}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={unifyState.enabled}
+              className={`switch${unifyState.enabled ? " on" : ""}`}
+              onClick={() => requestToggleUnify(!unifyState.enabled)}
+              disabled={unifyBusy}
+              title={unifyState.enabled ? "关闭统一会话历史" : "开启统一会话历史"}
+            >
+              <span className="switch-knob" />
+            </button>
+            <span className={unifyState.enabled ? "ok" : "dim"}>
+              {unifyBusy
+                ? unifyState.enabled
+                  ? "关闭中…"
+                  : "开启中…"
+                : unifyState.enabled
+                  ? "已开启"
+                  : "已关闭"}
+            </span>
           </div>
         </div>
-        {unifyStep && <p className="hint">迁移进度：{unifyStep}</p>}
-        {unifyOpen && unifyList && unifyList.length > 0 && (
-          <div className="unify-select">
-            <div className="unify-select-head">
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={unifySelected.size === unifyList.length}
-                  onChange={(e) =>
-                    setUnifySelected(
-                      e.target.checked
-                        ? new Set(unifyList.map((u) => u.thread_id))
-                        : new Set(),
-                    )
-                  }
-                />
-                全选
-              </label>
-              <span className="hint">选择要迁入共享历史的旧官方会话</span>
-            </div>
-            <div className="unify-rows">
-              {unifyList.map((u) => (
-                <label key={u.thread_id} className="row-card unify-row">
-                  <input
-                    type="checkbox"
-                    checked={unifySelected.has(u.thread_id)}
-                    onChange={(e) => {
-                      const next = new Set(unifySelected);
-                      if (e.target.checked) next.add(u.thread_id);
-                      else next.delete(u.thread_id);
-                      setUnifySelected(next);
-                    }}
-                  />
-                  <div className="row-card-main">
-                    <strong>{truncate(u.title, 60)}</strong>
-                    <span className="mono dim">
-                      {u.id} · {fmtSize(u.size)}
-                      {u.rollups > 1 ? ` · ${u.rollups} 条` : ""}
-                      {u.archived ? " · 归档" : ""}
-                    </span>
-                  </div>
-                </label>
-              ))}
-            </div>
-            <div className="unify-actions">
-              <button
-                className="primary"
-                disabled={unifySelected.size === 0 || unifyBusy}
-                onClick={() => void startMigrate()}
-              >
-                迁移所选（{unifySelected.size}）
-              </button>
-              <button disabled={unifyBusy} onClick={() => setUnifyOpen(false)}>
-                取消
-              </button>
-            </div>
-          </div>
+        {unifyState.enabled && (
+          <p className="hint">
+            已备份 {unifyState.backed_up_threads} 个线程；会话统一期间会持续保护最新会话内容。
+          </p>
         )}
+        {unifyStep && <p className="hint">迁移进度：{unifyStep}</p>}
       </section>
 
       <div className="sessions-layout">
@@ -428,7 +350,7 @@ export function SessionsPage({ onToast }: Props) {
         <h2>会话 ({sessions.length})</h2>
         <p className="hint">
           与官方一致按项目目录/名称分组，默认折叠可展开；勾选 = 该项目下所有
-          线程在官方订阅下不可见，切换官方时自动迁移，切回第三方后自动恢复。
+          线程在官方订阅下不可见；会话统一仅在上方开关开启后生效。
           同线程已合并为一条，点击查看最新一条。
         </p>
         <input
@@ -548,9 +470,10 @@ export function SessionsPage({ onToast }: Props) {
       <section className="card session-detail">
         <h2>{selected ? truncate(selected.title, 80) : "会话内容"}</h2>
         {!selected && (
-          <p className="hint">
-            点左侧会话查看内容。会话跨 provider 共享；标记隔离的会话官方订阅不可见。
-          </p>
+        <p className="hint">
+          点左侧会话查看内容。会话是否跨官方/第三方共享由上方“统一会话历史”开关决定；
+          标记隔离的会话官方订阅不可见。
+        </p>
         )}
         {selected && detailLoading && (
           <p className="hint">加载中…</p>

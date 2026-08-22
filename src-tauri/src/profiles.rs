@@ -481,6 +481,16 @@ pub fn load_profiles() -> Result<ProfilesFile, ProfilesError> {
     Ok(profiles)
 }
 
+/// 会话归属账本使用的稳定账号标识：官方固定为 official，中转使用 profile_id。
+/// 只记录本地 profile 标识，不记录 API key 或任何凭证内容。
+pub fn active_account_marker() -> String {
+    match load_profiles().ok().and_then(|p| p.active) {
+        Some(ActiveSelection::Relay { profile_id }) => format!("relay:{profile_id}"),
+        Some(ActiveSelection::Official) => "official".to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
 fn save_profiles(profiles: &ProfilesFile) -> Result<(), ProfilesError> {
     let path = profiles_path();
     if let Some(parent) = path.parent() {
@@ -1191,6 +1201,9 @@ pub fn activate_official_with_progress(
     progress: &dyn Fn(&str),
 ) -> Result<ActiveSelection, ProfilesError> {
     let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = crate::session_unify::checkpoint_if_enabled() {
+        log::warn!("会话统一增量备份失败，继续切换但保留统一状态: {e}");
+    }
     let mut profiles = load_profiles()?;
     let prev_active = profiles.active.clone();
 
@@ -1276,6 +1289,19 @@ pub fn activate_official_with_progress(
             "官方激活时会话隔离同步失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
         )));
     }
+    if !crate::session_unify::state().enabled {
+        if let Err(e) = crate::session_unify::sync_project_visibility(
+            crate::codex_config::OFFICIAL_MODEL_PROVIDER,
+        ) {
+            restore_config_or_remove(&backup);
+            let auth_ok = rollback_auth(&prev_active);
+            let isolation_ok =
+                crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
+            return Err(ProfilesError::RolledBack(format!(
+                "官方项目索引同步失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+            )));
+        }
+    }
     vault::clear_relay_state();
     profiles.active = Some(ActiveSelection::Official);
     if let Err(e) = save_profiles(&profiles) {
@@ -1283,6 +1309,15 @@ pub fn activate_official_with_progress(
         // 否则 UI 仍显示旧中转、实际已切官方，既不一致也可能暴露未隔离会话。
         restore_config_or_remove(&backup);
         let auth_ok = rollback_auth(&prev_active);
+        let previous_provider = match &prev_active {
+            Some(ActiveSelection::Official) => crate::codex_config::OFFICIAL_MODEL_PROVIDER,
+            Some(ActiveSelection::Relay { .. }) => crate::codex_config::SHARED_MODEL_PROVIDER,
+            None => "",
+        };
+        if !previous_provider.is_empty() {
+            let _ =
+                crate::session_unify::restore_project_visibility_for_provider(previous_provider);
+        }
         let isolation_ok =
             crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
         if matches!(prev_active, Some(ActiveSelection::Relay { .. })) {
@@ -1312,6 +1347,9 @@ pub fn activate_relay_with_progress(
     progress: &dyn Fn(&str),
 ) -> Result<ActiveSelection, ProfilesError> {
     let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = crate::session_unify::checkpoint_if_enabled() {
+        log::warn!("会话统一增量备份失败，继续切换但保留统一状态: {e}");
+    }
     let mut profiles = load_profiles()?;
     let Some(profile) = profiles.relays.iter().find(|p| p.id == profile_id) else {
         return Err(ProfilesError::NotFound(profile_id.to_string()));
@@ -1425,12 +1463,35 @@ pub fn activate_relay_with_progress(
             "第三方激活时会话恢复失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
         )));
     }
+    if !crate::session_unify::state().enabled {
+        if let Err(e) = crate::session_unify::sync_project_visibility(
+            crate::codex_config::SHARED_MODEL_PROVIDER,
+        ) {
+            restore_config_or_remove(&backup);
+            let auth_ok = rollback_auth(&prev_active);
+            let isolation_ok =
+                crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
+            let _ = vault::save_relay_state(&relay_state_before);
+            return Err(ProfilesError::RolledBack(format!(
+                "第三方项目索引同步失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+            )));
+        }
+    }
     profiles.active = Some(ActiveSelection::Relay {
         profile_id: profile_id.to_string(),
     });
     if let Err(e) = save_profiles(&profiles) {
         restore_config_or_remove(&backup);
         let auth_ok = rollback_auth(&prev_active);
+        let previous_provider = match &prev_active {
+            Some(ActiveSelection::Official) => crate::codex_config::OFFICIAL_MODEL_PROVIDER,
+            Some(ActiveSelection::Relay { .. }) => crate::codex_config::SHARED_MODEL_PROVIDER,
+            None => "",
+        };
+        if !previous_provider.is_empty() {
+            let _ =
+                crate::session_unify::restore_project_visibility_for_provider(previous_provider);
+        }
         let isolation_ok =
             crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
         let _ = vault::save_relay_state(&relay_state_before);

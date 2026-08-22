@@ -345,25 +345,75 @@ pub(crate) fn state_db_conn_ro() -> Result<Connection, SessionError> {
     Ok(conn)
 }
 
-/// 确保隔离备份表存在 (同结构空表; 仅存隔离期间, 不复制触发器/索引)
-fn ensure_db_backup_tables(conn: &Connection) -> Result<(), SessionError> {
+/// 读取表列名 (保持定义顺序; 表不存在时返回空)
+fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+    conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default()
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// 确保隔离备份表存在且结构与主表一致 (同结构空表; 仅存隔离期间, 不复制触发器/索引)。
+///
+/// 官方 Codex 升级可能给主表新增列 (如 threads.project_id), 而备份表仍是隔离
+/// 时的旧结构; 列数不一致后 `INSERT ... SELECT *` 搬运会报
+/// "table threads has 38 columns but 37 values were supplied"。
+/// 检测到列集漂移时按主表当前结构重建备份表: 同名列回填旧数据,
+/// 主表新增列取建表默认值, 与重新隔离一次的语义一致。
+fn ensure_db_backup_tables(conn: &mut Connection) -> Result<(), SessionError> {
     for (src, dst) in [
         ("threads", THREADS_ISOLATED_TABLE),
         ("thread_sections", SECTIONS_ISOLATED_TABLE),
         ("thread_dynamic_tools", TOOLS_ISOLATED_TABLE),
     ] {
-        let exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                [src],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        if !exists {
+        if !table_exists(conn, src) {
             continue;
         }
-        let sql = format!("CREATE TABLE IF NOT EXISTS {dst} AS SELECT * FROM {src} WHERE 1=0");
-        conn.execute(&sql, [])?;
+        if !table_exists(conn, dst) {
+            conn.execute(
+                &format!("CREATE TABLE {dst} AS SELECT * FROM {src} WHERE 1=0"),
+                [],
+            )?;
+            continue;
+        }
+        let src_cols = table_columns(conn, src);
+        let dst_cols = table_columns(conn, dst);
+        let drifted = src_cols.len() != dst_cols.len()
+            || src_cols.iter().any(|col| !dst_cols.contains(col))
+            || dst_cols.iter().any(|col| !src_cols.contains(col));
+        if !drifted {
+            continue;
+        }
+        let tx = conn.transaction()?;
+        let staging = format!("{dst}_codexff_rebuild");
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {staging}; \
+             CREATE TABLE {staging} AS SELECT * FROM {src} WHERE 1=0;"
+        ))?;
+        // 只回填两张表共有的列, 主表新增列由默认值补齐
+        let common: Vec<&String> = src_cols.iter().filter(|c| dst_cols.contains(c)).collect();
+        if !common.is_empty() {
+            let cols = common
+                .iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tx.execute(
+                &format!("INSERT INTO {staging} ({cols}) SELECT {cols} FROM {dst}"),
+                [],
+            )?;
+        }
+        tx.execute_batch(&format!(
+            "DROP TABLE {dst}; \
+             ALTER TABLE {staging} RENAME TO {dst};"
+        ))?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -1916,6 +1966,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 0, 1, 0, 1, 0));
+    }
+
+    #[test]
+    fn db_isolation_survives_main_table_schema_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.sqlite");
+        let setup = Connection::open(&db_path).unwrap();
+        setup
+            .execute_batch(
+                r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    model_provider TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    sandbox_policy TEXT NOT NULL,
+                    approval_mode TEXT NOT NULL
+                );
+                INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode)
+                VALUES ('t1', '/x/r.jsonl', 1, 1, 'user', 'custom', '/tmp', 'Hi', 'read-only', 'on-failure');
+                "#,
+            )
+            .unwrap();
+
+        // 隔离后官方 Codex 升级: 主表新增列, 备份表仍是旧结构
+        let mut conn = Connection::open(&db_path).unwrap();
+        db_thread_to_backup(&mut conn, "t1").unwrap();
+        conn.execute_batch("ALTER TABLE threads ADD COLUMN project_id TEXT;")
+            .unwrap();
+
+        // 旧实现在这里报 "table threads has 38 columns but 37 values were supplied"
+        db_thread_from_backup(&mut conn, "t1").unwrap();
+        let main: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads WHERE id='t1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let backup: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads_codexff_isolated WHERE id='t1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((main, backup), (1, 0));
+
+        // 反向搬运 (再次隔离) 也必须在同一结构下正常工作
+        db_thread_to_backup(&mut conn, "t1").unwrap();
+        let main: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads WHERE id='t1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(main, 0);
     }
 
     #[test]

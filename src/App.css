@@ -231,7 +231,31 @@ button.danger.armed:hover:not(:disabled) {
 }
 .unify-copy h2 { margin: 0 0 6px; }
 .unify-copy p { margin: 0; }
-.unify-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.unify-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  align-self: center;
+  flex-shrink: 0;
+}
+.switch-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.switch-label input {
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.switch-label input:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
 .unify-select {
   border-top: 1px solid var(--border);
   padding-top: 12px;

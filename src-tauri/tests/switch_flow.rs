@@ -190,18 +190,31 @@ fn official_activation_restores_credentials() {
         Some("test-access-token")
     );
 
-    // 2. config 回到官方形态的共享 custom 桶 (统一会话历史)
+    // 2. 默认关闭会话统一时，config 回到官方原生 openai 桶。
+    //    只有用户在会话管理页显式开启统一后，官方才使用 custom 桶。
     let config = fs::read_to_string(codexff_lib::codex_config::codex_config_path()).unwrap();
-    assert!(config.contains("model_provider = \"custom\""));
-    assert!(config.contains("name = \"OpenAI\""));
-    assert!(config.contains("requires_openai_auth"));
-    assert!(config.contains("supports_websockets"));
+    assert!(config.contains("model_provider = \"openai\""));
     // 3. 中转痕迹清掉 (relay 表/base_url/标记), 用户自己的 model 字段保留
     assert!(!config.contains("codexff_relay"));
     assert!(!config.contains("relay.example.com"));
     assert!(config.contains("gpt-5.2-codex"));
 
     vault::delete_relay_key(&profile.id).unwrap();
+}
+
+#[test]
+fn session_unify_bucket_is_explicitly_toggleable() {
+    let (_dir, _guard) = temp_env("session_unify_bucket");
+    seed_official_config();
+
+    codexff_lib::codex_config::set_session_unify_provider(true).expect("enable unify bucket");
+    let config = fs::read_to_string(codexff_lib::codex_config::codex_config_path()).unwrap();
+    assert!(config.contains("model_provider = \"custom\""));
+    assert!(config.contains("name = \"OpenAI\""));
+
+    codexff_lib::codex_config::set_session_unify_provider(false).expect("disable unify bucket");
+    let config = fs::read_to_string(codexff_lib::codex_config::codex_config_path()).unwrap();
+    assert!(config.contains("model_provider = \"openai\""));
 }
 
 #[test]

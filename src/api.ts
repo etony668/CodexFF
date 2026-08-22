@@ -110,6 +110,14 @@ export interface UnifyOutcome {
   thread_ids: string[];
 }
 
+export interface SessionUnifyState {
+  enabled: boolean;
+  generation: string | null;
+  last_checkpoint_ms: number;
+  backed_up_threads: number;
+  error: string | null;
+}
+
 /** Codex 自定义宠物包元信息 */
 export interface PetMeta {
   id: string;
@@ -348,6 +356,16 @@ export function listUnifiableSessions(): Promise<UnifySessionMeta[]> {
 /** 是否存在统一历史迁移备份 */
 export function hasUnifyBackup(): Promise<boolean> {
   return invoke("has_unify_backup");
+}
+
+export function getSessionUnifyState(): Promise<SessionUnifyState> {
+  return invoke("get_session_unify_state");
+}
+
+export function setSessionUnifyEnabled(
+  enabled: boolean,
+): Promise<SessionUnifyState> {
+  return invoke("set_session_unify_enabled", { enabled });
 }
 
 /** 迁移选中线程到共享 "custom" 桶 (迁移前自动备份) */

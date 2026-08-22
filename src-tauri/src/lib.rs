@@ -539,7 +539,26 @@ async fn activate_relay(
 
 #[tauri::command]
 fn list_sessions() -> Result<Vec<session_manager::SessionMeta>, ApiError> {
+    let _ = session_unify::checkpoint_if_enabled();
     Ok(session_manager::scan_sessions()?)
+}
+
+#[tauri::command]
+fn get_session_unify_state() -> Result<session_unify::UnifiedState, ApiError> {
+    Ok(session_unify::state())
+}
+
+#[tauri::command]
+fn set_session_unify_enabled(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<session_unify::UnifiedState, ApiError> {
+    use tauri::Emitter;
+    let result = session_unify::set_enabled(enabled, &|step| {
+        let _ = app.emit("session-unify-progress", step);
+    });
+    let _ = app.emit("session-unify-progress", "完成");
+    result.map_err(ApiError::from)
 }
 
 #[tauri::command]
@@ -1053,6 +1072,8 @@ pub fn run() {
             activate_official,
             activate_relay,
             list_sessions,
+            get_session_unify_state,
+            set_session_unify_enabled,
             session_detail,
             set_session_isolated,
             list_unifiable_sessions,
