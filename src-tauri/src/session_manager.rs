@@ -1392,6 +1392,54 @@ pub(crate) fn load_thread_cwds() -> HashMap<String, String> {
     load_thread_string_column(&conn, "cwd", "cwd <> ''")
 }
 
+/// 从 state_5.sqlite 读取线程预览。会话正文可能是 GB 级，列表页不应
+/// 为了展示首条消息而重新扫描 rollout 文件。
+pub(crate) fn load_thread_previews() -> HashMap<String, String> {
+    let db_path = codex_config::codex_state_db_path();
+    if !db_path.exists() {
+        return HashMap::new();
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return HashMap::new();
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let mut values = HashMap::new();
+    for table in ["threads", THREADS_ISOLATED_TABLE] {
+        if table != "threads" && !table_exists(&conn, table) {
+            continue;
+        }
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT id, preview, first_user_message FROM {table}"
+        )) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, String>(2).unwrap_or_default(),
+            ))
+        }) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            let (id, preview, first_user_message) = row;
+            let value = if !preview.trim().is_empty() {
+                preview
+            } else {
+                first_user_message
+            };
+            if !value.trim().is_empty() {
+                values.entry(id).or_insert(value);
+            }
+        }
+    }
+    values
+}
+
 /// cwd 是否属于某个注册项目根目录 (路径边界匹配)。
 fn project_name_for_cwd(cwd: &str, projects: &[(String, String)]) -> String {
     if cwd.is_empty() {
@@ -1406,34 +1454,46 @@ fn project_name_for_cwd(cwd: &str, projects: &[(String, String)]) -> String {
 }
 
 pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
-    // 自愈: 按当前激活模式把标记会话放到正确位置 (官方 ↔ 金库隔离区)
-    sync_session_isolation()?;
-    let titles = load_thread_titles();
-    let models = load_thread_models();
-    let cwds = load_thread_cwds();
+    // 列表读取必须保持纯只读。隔离迁移与索引自愈会逐线程更新多个数据库，
+    // 只能在供应商切换或用户明确修改隔离状态时执行，不能阻塞页面刷新。
     let projects = load_registered_projects();
-    let mut sessions = Vec::new();
+    // 新版 Codex 的 threads 表已经包含标题、模型、cwd、预览与 rollout_path。
+    // 常规列表只查询一次 SQLite，避免为 1000+ 线程重复全表扫描四次。
+    let empty = HashMap::new();
+    let mut sessions = scan_sessions_from_state_db(&empty, &empty, &empty, &empty, &projects)?;
 
-    // 只扫活跃会话: 归档会话 (archived_sessions / 金库归档区) 不展示在会话管理。
-    let roots: [(std::path::PathBuf, bool, bool); 2] = [
-        (codex_config::codex_sessions_paths()[0].clone(), false, false),
-        (quarantine_root(false), false, true),
-    ];
-    for (root, archived, isolated) in roots {
-        if !root.exists() {
-            continue;
+    // SQLite 是 Codex 当前版本的列表索引源。只有旧版本没有可用索引时，
+    // 才回退到有限的 JSONL 文件头扫描，避免每次刷新读取几十 GB 正文。
+    if sessions.is_empty() {
+        let titles = load_thread_titles();
+        let models = load_thread_models();
+        let cwds = load_thread_cwds();
+        let previews = load_thread_previews();
+        let roots: [(std::path::PathBuf, bool, bool); 2] = [
+            (
+                codex_config::codex_sessions_paths()[0].clone(),
+                false,
+                false,
+            ),
+            (quarantine_root(false), false, true),
+        ];
+        for (root, archived, isolated) in roots {
+            if !root.exists() {
+                continue;
+            }
+            collect_jsonl(
+                &root,
+                &root,
+                &titles,
+                &models,
+                &cwds,
+                &projects,
+                archived,
+                isolated,
+                &previews,
+                &mut sessions,
+            )?;
         }
-        collect_jsonl(
-            &root,
-            &root,
-            &titles,
-            &models,
-            &cwds,
-            &projects,
-            archived,
-            isolated,
-            &mut sessions,
-        )?;
     }
 
     // 按线程合并: 同一 thread_id 的多个 rollout (续聊/子任务) 只保留最新一条,
@@ -1465,6 +1525,166 @@ pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
     Ok(merged)
 }
 
+fn db_column_expr(columns: &[String], name: &str, fallback: &str) -> String {
+    if columns.iter().any(|column| column == name) {
+        quote_ident(name)
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn resolve_db_rollout_path(
+    raw: &str,
+    isolated: bool,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let normal = codex_config::codex_sessions_paths()[0].clone();
+    let quarantine = quarantine_root(false);
+    let raw_path = Path::new(raw);
+    let candidates = if isolated {
+        vec![
+            quarantine.join(raw_path.file_name()?),
+            raw_path.to_path_buf(),
+        ]
+    } else {
+        vec![raw_path.to_path_buf(), normal.join(raw_path.file_name()?)]
+    };
+    candidates.into_iter().find_map(|path| {
+        if !path.exists() {
+            return None;
+        }
+        let root = if path.starts_with(&quarantine) {
+            quarantine.clone()
+        } else {
+            normal.clone()
+        };
+        Some((path, root))
+    })
+}
+
+/// SQLite-first 会话列表。Codex 当前版本已经把标题、项目、预览和 rollout
+/// 路径维护在 state_5.sqlite；列表不应重新扫描 JSONL 正文。
+fn scan_sessions_from_state_db(
+    titles: &HashMap<String, String>,
+    models: &HashMap<String, String>,
+    cwds: &HashMap<String, String>,
+    previews: &HashMap<String, String>,
+    projects: &[(String, String)],
+) -> Result<Vec<SessionMeta>, SessionError> {
+    let db_path = codex_config::codex_state_db_path();
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = state_db_conn_ro()?;
+    let mut out = Vec::new();
+    for (table, isolated) in [("threads", false), (THREADS_ISOLATED_TABLE, true)] {
+        if !table_exists(&conn, table) {
+            continue;
+        }
+        let columns = table_columns(&conn, table);
+        let sql = format!(
+            "SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM {} WHERE {} = 0",
+            db_column_expr(&columns, "id", "''"),
+            db_column_expr(&columns, "rollout_path", "''"),
+            db_column_expr(&columns, "title", "''"),
+            db_column_expr(&columns, "model", "''"),
+            db_column_expr(&columns, "cwd", "''"),
+            db_column_expr(&columns, "preview", "''"),
+            db_column_expr(&columns, "first_user_message", "''"),
+            db_column_expr(&columns, "updated_at_ms", "0"),
+            db_column_expr(&columns, "updated_at", "0"),
+            db_column_expr(&columns, "archived", "0"),
+            db_column_expr(&columns, "model_provider", "''"),
+            quote_ident(table),
+            db_column_expr(&columns, "archived", "0"),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7).unwrap_or(0),
+                row.get::<_, i64>(8).unwrap_or(0),
+                row.get::<_, i64>(9).unwrap_or(0),
+                row.get::<_, String>(10).unwrap_or_default(),
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (
+                thread_id,
+                rollout_path,
+                db_title,
+                db_model,
+                db_cwd,
+                db_preview,
+                first_user_message,
+                updated_at_ms,
+                updated_at,
+                _archived,
+                _provider,
+            ) = row;
+            let Some((path, root)) = resolve_db_rollout_path(&rollout_path, isolated) else {
+                continue;
+            };
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&thread_id)
+                .to_string();
+            let title = titles
+                .get(&thread_id)
+                .cloned()
+                .or_else(|| (!db_title.trim().is_empty()).then_some(db_title))
+                .unwrap_or_else(|| id.clone());
+            let model = models
+                .get(&thread_id)
+                .cloned()
+                .or_else(|| (!db_model.trim().is_empty()).then_some(db_model))
+                .unwrap_or_default();
+            let cwd = cwds
+                .get(&thread_id)
+                .cloned()
+                .or_else(|| (!db_cwd.trim().is_empty()).then_some(db_cwd))
+                .unwrap_or_default();
+            let preview = previews
+                .get(&thread_id)
+                .cloned()
+                .or_else(|| (!db_preview.trim().is_empty()).then_some(db_preview))
+                .or_else(|| (!first_user_message.trim().is_empty()).then_some(first_user_message))
+                .unwrap_or_default();
+            let rel = path
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+            let last_active_ms = if updated_at_ms > 0 {
+                updated_at_ms
+            } else {
+                updated_at.saturating_mul(1000)
+            };
+            out.push(SessionMeta {
+                id,
+                thread_id: thread_id.clone(),
+                provider: "codex".to_string(),
+                title: normalize_title(&title),
+                model,
+                last_active_ms,
+                path: rel,
+                archived: false,
+                isolated,
+                preview,
+                rollups: 1,
+                cwd: cwd.clone(),
+                project: project_name_for_cwd(&cwd, projects),
+            });
+        }
+    }
+    Ok(out)
+}
+
 fn collect_jsonl(
     root: &Path,
     dir: &Path,
@@ -1474,6 +1694,7 @@ fn collect_jsonl(
     projects: &[(String, String)],
     archived: bool,
     isolated: bool,
+    previews: &HashMap<String, String>,
     out: &mut Vec<SessionMeta>,
 ) -> Result<(), SessionError> {
     for entry in std::fs::read_dir(dir)? {
@@ -1485,17 +1706,12 @@ fn collect_jsonl(
         let path = entry.path();
         let meta = entry.metadata()?;
         if meta.is_dir() {
-            collect_jsonl(root, &path, titles, models, cwds, projects, archived, isolated, out)?;
+            collect_jsonl(
+                root, &path, titles, models, cwds, projects, archived, isolated, previews, out,
+            )?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             if let Some(session) = parse_session(
-                &path,
-                root,
-                titles,
-                models,
-                cwds,
-                projects,
-                archived,
-                isolated,
+                &path, root, titles, models, cwds, projects, archived, isolated, previews,
             )? {
                 out.push(session);
             }
@@ -1513,6 +1729,7 @@ fn parse_session(
     projects: &[(String, String)],
     archived: bool,
     isolated: bool,
+    previews: &HashMap<String, String>,
 ) -> Result<Option<SessionMeta>, SessionError> {
     let id = path
         .file_stem()
@@ -1521,8 +1738,11 @@ fn parse_session(
         .to_string();
 
     let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
+    // rollout 正文可能达到 GB 级；列表扫描只读取最多 1 MiB 的文件头。
+    // session_meta 位于文件开头，预览优先从 state_5.sqlite 获取。
+    let mut header = Vec::new();
+    file.take(1024 * 1024).read_to_end(&mut header)?;
+    let header_text = String::from_utf8_lossy(&header);
     let mut title = None;
     let mut thread_id = String::new();
     let mut model = String::new();
@@ -1530,12 +1750,8 @@ fn parse_session(
     let mut file_cwd = String::new();
     let mut found = false;
 
-    // 读前 200 行: 提取真实线程 ID (state DB 键)、标题、模型、首条用户消息
-    for _ in 0..200 {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
+    // 只解析头部已完整结束的行，避免读取超大正文行。
+    for line in header_text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
@@ -1584,9 +1800,8 @@ fn parse_session(
                 }
             }
         }
-        // 现代会话文件内没有 title 字段 (标题在 state DB), 收集到
-        // 线程 ID + 模型 + 首条用户消息即可提前结束
-        if !thread_id.is_empty() && !model.is_empty() && !preview.is_empty() {
+        // 现代会话文件内没有 title 字段 (标题在 state DB)，拿到头部元数据即可结束。
+        if !thread_id.is_empty() && !model.is_empty() {
             break;
         }
     }
@@ -1629,6 +1844,9 @@ fn parse_session(
     } else {
         thread_id
     };
+    if preview.is_empty() {
+        preview = previews.get(&thread_id).cloned().unwrap_or_default();
+    }
     // 模型以 state DB 的 threads.model 为准（rollout 里的 payload.model 可能
     // 残留早期/瞬时设置，不代表当前线程绑定）。
     let model = models
@@ -2184,6 +2402,7 @@ mod tests {
             &projects,
             false,
             true,
+            &HashMap::new(),
         )
         .unwrap()
         .unwrap();

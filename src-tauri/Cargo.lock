@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "codexff"
-version = "1.2.227"
+version = "1.2.228"
 dependencies = [
  "aes-gcm",
  "axum",

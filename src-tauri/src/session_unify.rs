@@ -4,6 +4,7 @@
 //! 快照，任何失败都优先回滚而不覆盖最新会话内容。
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -75,6 +76,16 @@ struct Provenance {
     original_sha256: String,
     #[serde(default)]
     last_checkpoint_sha256: String,
+    #[serde(default)]
+    last_checkpoint_size: u64,
+    #[serde(default)]
+    last_checkpoint_mtime_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+struct FileFingerprint {
+    size: u64,
+    mtime_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +96,8 @@ struct UnifiedLedger {
     files: Vec<Provenance>,
     #[serde(default)]
     state_hashes: HashMap<String, String>,
+    #[serde(default)]
+    state_fingerprints: HashMap<String, FileFingerprint>,
 }
 
 fn unify_backup_root() -> PathBuf {
@@ -99,6 +112,203 @@ fn project_visibility_backup_path(provider: &str) -> PathBuf {
     vault::vault_dir()
         .join("project-visibility-backup")
         .join(format!("{provider}.json"))
+}
+
+#[derive(Debug, Clone)]
+struct ProjectBinding {
+    id: String,
+    name: String,
+    roots: Vec<String>,
+    position: i64,
+}
+
+fn load_project_bindings() -> Vec<ProjectBinding> {
+    let path = codex_config::codex_config_dir().join(".codex-global-state.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(projects) = root.get("local-projects").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let order = root
+        .get("project-order")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    projects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (id, project))| {
+            let name = project.get("name").and_then(Value::as_str)?.to_string();
+            let roots = project
+                .get("rootPaths")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|root| root.trim_end_matches('/').to_string())
+                        .filter(|root| !root.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if roots.is_empty() {
+                return None;
+            }
+            let position = order
+                .iter()
+                .position(|item| item == id)
+                .map(|value| value as i64)
+                .unwrap_or(index as i64);
+            Some(ProjectBinding {
+                id: id.clone(),
+                name,
+                roots,
+                position,
+            })
+        })
+        .collect()
+}
+
+fn cwd_matches_root(cwd: &str, root: &str) -> bool {
+    cwd == root || cwd.starts_with(&format!("{root}/"))
+}
+
+fn project_id_for_thread(
+    thread_id: &str,
+    cwd: &str,
+    assignments: &HashMap<String, String>,
+    projects: &[ProjectBinding],
+) -> Option<String> {
+    if let Some(project_id) = assignments.get(thread_id) {
+        if projects.iter().any(|project| project.id == *project_id) {
+            return Some(project_id.clone());
+        }
+    }
+    projects
+        .iter()
+        .find(|project| project.roots.iter().any(|root| cwd_matches_root(cwd, root)))
+        .map(|project| project.id.clone())
+}
+
+/// 把 Codex 新版 SQLite 的 project_id 补齐到 global-state 的项目索引。
+///
+/// 新版桌面端仍从 global-state 渲染项目名称，但会话列表改为使用
+/// `threads.project_id` 过滤。旧代码只维护 thread-project-assignments，
+/// 导致项目名称存在而每个项目显示“暂无聊天”。该同步是幂等的，只更新
+/// 能从线程归属或 cwd 明确推导出的项目，不删除任何线程。
+pub fn sync_sqlite_project_bindings() -> Result<(), session_manager::SessionError> {
+    let db_path = codex_config::codex_state_db_path();
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let projects = load_project_bindings();
+    if projects.is_empty() {
+        return Ok(());
+    }
+    let config_path = codex_config::codex_config_dir().join(".codex-global-state.json");
+    let assignments = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|root| {
+            root.get("thread-project-assignments")
+                .and_then(Value::as_object)
+                .cloned()
+        })
+        .map(|items| {
+            items
+                .into_iter()
+                .filter_map(|(thread_id, value)| {
+                    value
+                        .get("projectId")
+                        .and_then(Value::as_str)
+                        .map(|project_id| (thread_id, project_id.to_string()))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut conn = Connection::open(&db_path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let has_threads = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'",
+            [],
+            |_| Ok(1),
+        )
+        .is_ok();
+    if !has_threads {
+        return Ok(());
+    }
+    let has_project_id = conn
+        .prepare("PRAGMA table_info(threads)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .any(|name| name == "project_id");
+    if !has_project_id {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    let has_projects = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'",
+            [],
+            |_| Ok(1),
+        )
+        .is_ok();
+    let now = chrono::Utc::now().timestamp_millis();
+    if has_projects {
+        for project in &projects {
+            tx.execute(
+                "INSERT INTO projects (id, name, metadata, position, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, '{}', ?3, ?4, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                   name = excluded.name,
+                   position = excluded.position,
+                   updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![project.id, project.name, project.position, now],
+            )?;
+        }
+    }
+
+    let mut updates = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT id, cwd, project_id FROM threads")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let Some(project_id) = project_id_for_thread(&row.0, &row.1, &assignments, &projects)
+            else {
+                continue;
+            };
+            if row.2.as_deref() != Some(project_id.as_str()) {
+                updates.push((row.0, project_id));
+            }
+        }
+    }
+    for (thread_id, project_id) in &updates {
+        tx.execute(
+            "UPDATE threads SET project_id = ?1 WHERE id = ?2",
+            rusqlite::params![project_id, thread_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,14 +772,61 @@ fn sha256_file(path: &Path) -> Result<String, session_manager::SessionError> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn file_fingerprint(path: &Path) -> Result<FileFingerprint, session_manager::SessionError> {
+    let metadata = std::fs::metadata(path)?;
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(FileFingerprint {
+        size: metadata.len(),
+        mtime_ms,
+    })
+}
+
 fn copy_snapshot_file(src: &Path, dst: &Path) -> Result<(), session_manager::SessionError> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = dst.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::copy(src, &tmp)?;
+    #[cfg(target_os = "macos")]
+    {
+        let src_c = CString::new(src.as_os_str().as_encoded_bytes()).map_err(|e| {
+            session_manager::SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("备份源路径无效: {e}"),
+            ))
+        })?;
+        let tmp_c = CString::new(tmp.as_os_str().as_encoded_bytes()).map_err(|e| {
+            session_manager::SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("备份目标路径无效: {e}"),
+            ))
+        })?;
+        // APFS 上 clonefile 是 Copy-on-Write，首次快照几乎只写元数据；
+        // 不支持或跨文件系统时回退到普通 copy，不能因此阻断会话统一。
+        let cloned = unsafe { clonefile(src_c.as_ptr(), tmp_c.as_ptr(), 0) } == 0;
+        if !cloned {
+            std::fs::copy(src, &tmp)?;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::copy(src, &tmp)?;
+    }
     std::fs::rename(tmp, dst)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn clonefile(
+        src: *const std::os::raw::c_char,
+        dst: *const std::os::raw::c_char,
+        flags: u32,
+    ) -> i32;
 }
 
 fn all_session_files() -> Vec<(PathBuf, bool)> {
@@ -771,26 +1028,7 @@ fn rewrite_all_provider(
 ) -> Result<usize, session_manager::SessionError> {
     let mut changed = 0;
     for (path, _) in all_session_files() {
-        let rewrite = |line: &[u8]| {
-            let text = std::str::from_utf8(line).ok()?;
-            if !text.contains("\"session_meta\"") || !text.contains("\"model_provider\"") {
-                return None;
-            }
-            let trimmed = text.trim_end_matches(['\n', '\r']);
-            let mut value: Value = serde_json::from_str(trimmed).ok()?;
-            if value.get("type")?.as_str()? != "session_meta" {
-                return None;
-            }
-            let payload = value.get_mut("payload")?.as_object_mut()?;
-            if payload.get("model_provider")?.as_str()? != from {
-                return None;
-            }
-            payload.insert("model_provider".into(), Value::String(to.into()));
-            let mut out = serde_json::to_string(&value).ok()?;
-            out.push('\n');
-            Some(out.into_bytes())
-        };
-        if rewrite_jsonl_file(&path, &rewrite)? {
+        if rewrite_provider_in_place(&path, from, to)? {
             changed += 1;
         }
     }
@@ -800,6 +1038,55 @@ fn rewrite_all_provider(
     Ok(changed)
 }
 
+/// 更新 rollout 首部的 provider 元数据而不重写整个 JSONL。
+///
+/// Codex 的 `session_meta` 位于 rollout 文件头部，且当前统一涉及的
+/// `openai`/`custom` 桶长度相同。原位替换可以避免为数百 MB/GB 的
+/// rollout 创建临时副本；会话正文完全不触碰，失败时调用方仍可回滚
+/// SQLite/配置快照。
+fn rewrite_provider_in_place(
+    path: &Path,
+    from: &str,
+    to: &str,
+) -> Result<bool, session_manager::SessionError> {
+    if from.len() != to.len() {
+        return Err(session_manager::SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "会话 provider 原位替换要求新旧值长度一致",
+        )));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let mut head = vec![0u8; 1024 * 1024];
+    let n = file.read(&mut head)?;
+    head.truncate(n);
+    let marker = format!("\"model_provider\":\"{from}\"").into_bytes();
+    let spaced_marker = format!("\"model_provider\": \"{from}\"").into_bytes();
+    let offset = if let Some(offset) = find_subslice(&head, &marker) {
+        offset + marker.len() - from.len() - 1
+    } else if let Some(offset) = find_subslice(&head, &spaced_marker) {
+        offset + spaced_marker.len() - from.len() - 1
+    } else {
+        return Ok(false);
+    };
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(offset as u64))?;
+    file.write_all(to.as_bytes())?;
+    file.sync_data()?;
+    Ok(true)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 fn snapshot_generation(
     generation: &str,
     progress: &dyn Fn(&str),
@@ -807,29 +1094,44 @@ fn snapshot_generation(
     let root = unify_backup_root().join(generation);
     let mut files = Vec::new();
     let account = account_marker();
-    for (path, _) in all_session_files() {
+    let session_files = all_session_files();
+    let total = session_files.len();
+    for (index, (path, _)) in session_files.into_iter().enumerate() {
         let Some((session_id, thread_id, provider)) = file_meta(&path) else {
             continue;
         };
         let rel = relative_session_path(&path);
         let dst = root.join("original").join(&rel);
         copy_snapshot_file(&path, &dst)?;
-        let hash = sha256_file(&path)?;
+        let fingerprint = file_fingerprint(&path)?;
         files.push(Provenance {
             thread_id,
             session_id,
             path: rel,
             original_provider: provider,
             original_account: account.clone(),
-            original_sha256: hash.clone(),
-            last_checkpoint_sha256: hash,
+            // APFS clonefile 已生成可独立恢复的写时复制快照。同步计算
+            // 数十 GB rollout 的 SHA-256 只会阻塞开启流程，不增加恢复能力；
+            // 文件变化由 size + mtime 指纹检测。
+            original_sha256: String::new(),
+            last_checkpoint_sha256: String::new(),
+            last_checkpoint_size: fingerprint.size,
+            last_checkpoint_mtime_ms: fingerprint.mtime_ms,
         });
+        if (index + 1) % 100 == 0 || index + 1 == total {
+            progress(&format!(
+                "正在创建会话快照 {}/{}（不会复制会话正文）…",
+                index + 1,
+                total
+            ));
+        }
     }
-    let mut state_hashes = HashMap::new();
+    let state_hashes = HashMap::new();
+    let mut state_fingerprints = HashMap::new();
     let db = codex_config::codex_state_db_path();
     if db.exists() {
         backup_state_db(&db, &root.join("original-state").join("state_5.sqlite"))?;
-        state_hashes.insert("state_5.sqlite".to_string(), sha256_file(&db)?);
+        state_fingerprints.insert("state_5.sqlite".to_string(), file_fingerprint(&db)?);
     }
     for (name, path) in [
         (
@@ -843,7 +1145,7 @@ fn snapshot_generation(
     ] {
         if path.exists() {
             copy_snapshot_file(&path, &root.join("original-state").join(name))?;
-            state_hashes.insert(name.to_string(), sha256_file(&path)?);
+            state_fingerprints.insert(name.to_string(), file_fingerprint(&path)?);
         }
     }
     progress(&format!("已备份 {} 个会话文件和索引…", files.len()));
@@ -853,6 +1155,7 @@ fn snapshot_generation(
         current_account: account,
         files,
         state_hashes,
+        state_fingerprints,
     };
     write_ledger(generation, &ledger)?;
     Ok(ledger)
@@ -872,9 +1175,9 @@ fn checkpoint_generation(
         let Some((session_id, thread_id, provider)) = file_meta(&path) else {
             continue;
         };
+        let fingerprint = file_fingerprint(&path)?;
         // 新增文件只进入增量安全副本；原始归属标记为当前统一状态下的 custom，
         // 关闭统一时不会被错误改回 openai。
-        let hash = sha256_file(&path)?;
         if !known.contains(&rel) {
             let dst = root.join("incremental").join(&rel);
             copy_snapshot_file(&path, &dst)?;
@@ -884,18 +1187,32 @@ fn checkpoint_generation(
                 path: rel,
                 original_provider: provider,
                 original_account: account_marker(),
-                original_sha256: hash.clone(),
-                last_checkpoint_sha256: hash,
+                original_sha256: String::new(),
+                last_checkpoint_sha256: String::new(),
+                last_checkpoint_size: fingerprint.size,
+                last_checkpoint_mtime_ms: fingerprint.mtime_ms,
             });
             added += 1;
         } else if let Some(item) = ledger.files.iter_mut().find(|f| f.path == rel) {
-            // 只在内容变化时刷新增量副本，不用旧快照覆盖统一期间的新内容。
-            if item.last_checkpoint_sha256 != hash {
-                let dst = root.join("incremental").join(&rel);
-                copy_snapshot_file(&path, &dst)?;
-                item.last_checkpoint_sha256 = hash;
-                changed += 1;
+            // 兼容 1.2.227 以前没有文件指纹的账本：先把当前元数据种入账本，
+            // 不重新读取几十 GB 正文；从下一次 checkpoint 起按指纹检测变化。
+            if item.last_checkpoint_size == 0 && item.last_checkpoint_mtime_ms == 0 {
+                item.last_checkpoint_size = fingerprint.size;
+                item.last_checkpoint_mtime_ms = fingerprint.mtime_ms;
+                continue;
             }
+            // 只在内容变化时刷新增量副本，不用旧快照覆盖统一期间的新内容。
+            if item.last_checkpoint_size == fingerprint.size
+                && item.last_checkpoint_mtime_ms == fingerprint.mtime_ms
+            {
+                continue;
+            }
+            let dst = root.join("incremental").join(&rel);
+            copy_snapshot_file(&path, &dst)?;
+            item.last_checkpoint_sha256.clear();
+            changed += 1;
+            item.last_checkpoint_size = fingerprint.size;
+            item.last_checkpoint_mtime_ms = fingerprint.mtime_ms;
         }
     }
     for (name, path) in [
@@ -912,15 +1229,25 @@ fn checkpoint_generation(
         if !path.exists() {
             continue;
         }
-        let hash = sha256_file(&path)?;
-        if ledger.state_hashes.get(name) != Some(&hash) {
-            if name == "state_5.sqlite" {
-                backup_state_db(&path, &root.join("incremental-state").join(name))?;
-            } else {
-                copy_snapshot_file(&path, &root.join("incremental-state").join(name))?;
-            }
-            ledger.state_hashes.insert(name.to_string(), hash);
+        let fingerprint = file_fingerprint(&path)?;
+        if !ledger.state_fingerprints.contains_key(name) {
+            ledger
+                .state_fingerprints
+                .insert(name.to_string(), fingerprint);
+            continue;
         }
+        if ledger.state_fingerprints.get(name) == Some(&fingerprint) {
+            continue;
+        }
+        if name == "state_5.sqlite" {
+            backup_state_db(&path, &root.join("incremental-state").join(name))?;
+        } else {
+            copy_snapshot_file(&path, &root.join("incremental-state").join(name))?;
+        }
+        ledger.state_hashes.remove(name);
+        ledger
+            .state_fingerprints
+            .insert(name.to_string(), fingerprint);
     }
     write_ledger(generation, &ledger)?;
     let mut next = state();
@@ -949,9 +1276,18 @@ pub fn checkpoint_if_enabled() -> Result<(), session_manager::SessionError> {
     if !current.enabled {
         return Ok(());
     }
+    // 项目归属修复是轻量的、幂等的，即使会话备份被节流也要先执行，
+    // 否则新版 Codex 会出现“项目名存在但项目内暂无聊天”。
+    sync_sqlite_project_bindings()?;
     let Some(generation) = current.generation else {
         return Ok(());
     };
+    let now = chrono::Utc::now().timestamp_millis();
+    // 列表刷新、供应商切换和前端轮询可能在短时间内重复触发 checkpoint。
+    // 首次开启仍做完整快照，后续 8 秒内跳过重复 hash/copy，避免磁盘抖动。
+    if current.last_checkpoint_ms > 0 && now - current.last_checkpoint_ms < 8_000 {
+        return Ok(());
+    }
     checkpoint_generation(&generation, &|_| {}).map(|_| ())
 }
 
@@ -1001,6 +1337,7 @@ pub fn set_enabled(
                     format!("切换统一会话配置桶失败: {e}"),
                 ))
             })?;
+            sync_sqlite_project_bindings()?;
             let mut next = UnifiedState {
                 enabled: true,
                 generation: Some(generation.clone()),
@@ -1042,6 +1379,9 @@ pub fn set_enabled(
             return Ok(UnifiedState::default());
         };
         progress("备份并校验当前会话状态…");
+        // 先补齐新版 Codex 的项目归属，避免关闭过程较慢时官方侧边栏
+        // 继续显示项目名但项目内没有会话。
+        sync_sqlite_project_bindings()?;
         let _ = checkpoint_generation(&generation, progress)?;
         let ledger = load_current_ledger(&generation)?;
         let result = (|| -> Result<UnifiedState, session_manager::SessionError> {
@@ -1050,16 +1390,28 @@ pub fn set_enabled(
                 let Some(provenance) = ledger.files.iter().find(|f| f.path == rel) else {
                     continue;
                 };
-                let rewrite = |line: &[u8]| {
-                    rewrite_meta_bucket(
-                        line,
-                        &HashSet::from([provenance.session_id.clone()]),
-                        false,
+                // 统一开启期间正文可能达到数百 MB/GB；关闭时只需恢复
+                // 首部 session_meta 的 provider，禁止再创建整文件临时副本。
+                if provenance.original_provider.len() == SHARED_BUCKET.len() {
+                    let _ = rewrite_provider_in_place(
+                        &path,
                         SHARED_BUCKET,
                         &provenance.original_provider,
-                    )
-                };
-                let _ = rewrite_jsonl_file(&path, &rewrite)?;
+                    )?;
+                } else {
+                    // 兼容未来长度不同的 provider；该路径只应出现在
+                    // 非标准桶，标准 openai/custom 永远走原位更新。
+                    let rewrite = |line: &[u8]| {
+                        rewrite_meta_bucket(
+                            line,
+                            &HashSet::from([provenance.session_id.clone()]),
+                            false,
+                            SHARED_BUCKET,
+                            &provenance.original_provider,
+                        )
+                    };
+                    let _ = rewrite_jsonl_file(&path, &rewrite)?;
+                }
             }
             let db = codex_config::codex_state_db_path();
             if db.exists() {
@@ -1088,6 +1440,7 @@ pub fn set_enabled(
             if !target_provider.is_empty() {
                 sync_project_visibility(target_provider)?;
             }
+            sync_sqlite_project_bindings()?;
             let next = UnifiedState::default();
             save_state(&next)?;
             progress("会话统一已关闭，归属已恢复；最新会话内容保留在原文件中。");
@@ -1651,6 +2004,31 @@ mod tests {
         );
         assert_eq!(v["payload"]["session_id"].as_str(), Some("t1"));
         assert!(text.len() > 70 * 1024 * 1024);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provider_rewrite_updates_rollout_header_in_place() {
+        let dir =
+            std::env::temp_dir().join(format!("codexff-provider-in-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("rollout.jsonl");
+        let body = br#"{"type":"session_meta","payload":{"model_provider":"openai","id":"s1"}}
+{"type":"response_item","payload":{"text":"body"}}
+"#;
+        std::fs::write(&path, body).expect("write file");
+
+        assert!(rewrite_provider_in_place(&path, OPENAI_BUCKET, SHARED_BUCKET).unwrap());
+        let updated = std::fs::read(&path).expect("read back");
+        assert!(updated.starts_with(
+            br#"{"type":"session_meta","payload":{"model_provider":"custom","id":"s1"}}"#
+        ));
+        assert!(updated.ends_with(
+            br#"{"type":"response_item","payload":{"text":"body"}}
+"#
+        ));
+        assert!(!rewrite_provider_in_place(&path, OPENAI_BUCKET, SHARED_BUCKET).unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

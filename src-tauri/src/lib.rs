@@ -538,9 +538,13 @@ async fn activate_relay(
 }
 
 #[tauri::command]
-fn list_sessions() -> Result<Vec<session_manager::SessionMeta>, ApiError> {
-    let _ = session_unify::checkpoint_if_enabled();
-    Ok(session_manager::scan_sessions()?)
+async fn list_sessions() -> Result<Vec<session_manager::SessionMeta>, ApiError> {
+    tauri::async_runtime::spawn_blocking(session_manager::scan_sessions)
+        .await
+        .map_err(|e| ApiError {
+            message: format!("加载会话任务失败: {e}"),
+        })?
+        .map_err(ApiError::from)
 }
 
 #[tauri::command]
@@ -549,16 +553,24 @@ fn get_session_unify_state() -> Result<session_unify::UnifiedState, ApiError> {
 }
 
 #[tauri::command]
-fn set_session_unify_enabled(
+async fn set_session_unify_enabled(
     app: tauri::AppHandle,
     enabled: bool,
 ) -> Result<session_unify::UnifiedState, ApiError> {
     use tauri::Emitter;
-    let result = session_unify::set_enabled(enabled, &|step| {
-        let _ = app.emit("session-unify-progress", step);
-    });
-    let _ = app.emit("session-unify-progress", "完成");
-    result.map_err(ApiError::from)
+    let progress_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = session_unify::set_enabled(enabled, &|step| {
+            let _ = progress_app.emit("session-unify-progress", step);
+        });
+        let _ = progress_app.emit("session-unify-progress", "完成");
+        result
+    })
+    .await
+    .map_err(|e| ApiError {
+        message: format!("会话统一后台任务失败: {e}"),
+    })?
+    .map_err(ApiError::from)
 }
 
 #[tauri::command]

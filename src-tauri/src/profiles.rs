@@ -1302,6 +1302,9 @@ pub fn activate_official_with_progress(
             )));
         }
     }
+    if let Err(e) = crate::session_unify::sync_sqlite_project_bindings() {
+        log::warn!("官方切换后同步 SQLite 项目归属失败: {e}");
+    }
     vault::clear_relay_state();
     profiles.active = Some(ActiveSelection::Official);
     if let Err(e) = save_profiles(&profiles) {
@@ -1476,6 +1479,9 @@ pub fn activate_relay_with_progress(
                 "第三方项目索引同步失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
             )));
         }
+    }
+    if let Err(e) = crate::session_unify::sync_sqlite_project_bindings() {
+        log::warn!("第三方切换后同步 SQLite 项目归属失败: {e}");
     }
     profiles.active = Some(ActiveSelection::Relay {
         profile_id: profile_id.to_string(),
