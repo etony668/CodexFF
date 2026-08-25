@@ -3,7 +3,7 @@
 //! 会话目录默认跨 profile 共享; 用户可标记“隔离”的会话, 在官方订阅激活时
 //! 物理移入金库隔离区 (官方 CLI 扫不到 = 官方账号不可见), 切回中转时移回。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -428,8 +428,10 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
 }
 
 /// 把线程索引从主表搬入隔离备份表 (官方订阅激活时; Codex 侧边栏即不可见)
-fn db_thread_to_backup(conn: &mut Connection, thread_id: &str) -> Result<(), SessionError> {
-    ensure_db_backup_tables(conn)?;
+fn db_thread_to_backup_prepared(
+    conn: &mut Connection,
+    thread_id: &str,
+) -> Result<(), SessionError> {
     let tx = conn.transaction()?;
     let has_tools = table_exists(&tx, "thread_dynamic_tools");
     let has_sections = table_exists(&tx, "thread_sections");
@@ -495,9 +497,16 @@ fn db_thread_to_backup(conn: &mut Connection, thread_id: &str) -> Result<(), Ses
     Ok(())
 }
 
-/// 把线程索引从隔离备份表搬回主表 (切回第三方/取消隔离时)
-fn db_thread_from_backup(conn: &mut Connection, thread_id: &str) -> Result<(), SessionError> {
+fn db_thread_to_backup(conn: &mut Connection, thread_id: &str) -> Result<(), SessionError> {
     ensure_db_backup_tables(conn)?;
+    db_thread_to_backup_prepared(conn, thread_id)
+}
+
+/// 把线程索引从隔离备份表搬回主表 (切回第三方/取消隔离时)
+fn db_thread_from_backup_prepared(
+    conn: &mut Connection,
+    thread_id: &str,
+) -> Result<(), SessionError> {
     let tx = conn.transaction()?;
     let has_tools = table_exists(&tx, "thread_dynamic_tools");
     let has_sections = table_exists(&tx, "thread_sections");
@@ -569,6 +578,11 @@ fn db_thread_from_backup(conn: &mut Connection, thread_id: &str) -> Result<(), S
     Ok(())
 }
 
+fn db_thread_from_backup(conn: &mut Connection, thread_id: &str) -> Result<(), SessionError> {
+    ensure_db_backup_tables(conn)?;
+    db_thread_from_backup_prepared(conn, thread_id)
+}
+
 /// 按当前模式同步某线程的 Codex 索引: 官方→搬入备份表, 非官方→搬回主表
 fn sync_db_thread(thread_id: &str, official: bool) -> Result<(), SessionError> {
     let db_path = codex_config::codex_state_db_path();
@@ -581,6 +595,147 @@ fn sync_db_thread(thread_id: &str, official: bool) -> Result<(), SessionError> {
     } else {
         db_thread_from_backup(&mut conn, thread_id)
     }
+}
+
+/// 批量同步线程索引。整轮只打开一次 state_5.sqlite、只检查一次备份表结构，
+/// 并在单个事务中提交全部线程；任一失败都会回滚整个 DB 批次。
+fn sync_db_threads(thread_ids: &[String], official: bool) -> Result<(), SessionError> {
+    let db_path = codex_config::codex_state_db_path();
+    if !db_path.exists() || thread_ids.is_empty() {
+        return Ok(());
+    }
+    let mut conn = state_db_conn_rw()?;
+    ensure_db_backup_tables(&mut conn)?;
+    let tx = conn.transaction()?;
+    let has_tools = table_exists(&tx, "thread_dynamic_tools");
+    let has_sections = table_exists(&tx, "thread_sections");
+    for thread_id in thread_ids {
+        if official {
+            let in_main: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM threads WHERE id=?1)",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if !in_main {
+                continue;
+            }
+            let section_id: Option<String> = tx
+                .query_row(
+                    "SELECT thread_section_id FROM threads WHERE id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            tx.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO {THREADS_ISOLATED_TABLE} SELECT * FROM threads WHERE id=?1"
+                ),
+                [thread_id],
+            )?;
+            if has_tools {
+                tx.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO {TOOLS_ISOLATED_TABLE} SELECT * FROM thread_dynamic_tools WHERE thread_id=?1"
+                    ),
+                    [thread_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM thread_dynamic_tools WHERE thread_id=?1",
+                    [thread_id],
+                )?;
+            }
+            tx.execute("DELETE FROM threads WHERE id=?1", [thread_id])?;
+            if has_sections {
+                if let Some(section_id) = section_id {
+                    let refs: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM threads WHERE thread_section_id=?1",
+                            [&section_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(0);
+                    if refs == 0 {
+                        tx.execute(
+                            &format!(
+                                "INSERT OR IGNORE INTO {SECTIONS_ISOLATED_TABLE} SELECT * FROM thread_sections WHERE id=?1"
+                            ),
+                            [&section_id],
+                        )?;
+                        tx.execute("DELETE FROM thread_sections WHERE id=?1", [&section_id])?;
+                    }
+                }
+            }
+        } else {
+            let in_backup: bool = tx
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {THREADS_ISOLATED_TABLE} WHERE id=?1)"),
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if !in_backup {
+                continue;
+            }
+            let section_id: Option<String> = tx
+                .query_row(
+                    &format!("SELECT thread_section_id FROM {THREADS_ISOLATED_TABLE} WHERE id=?1"),
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            if has_sections {
+                if let Some(section_id) = section_id {
+                    let in_main: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM thread_sections WHERE id=?1)",
+                            [&section_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(false);
+                    if !in_main {
+                        tx.execute(
+                            &format!(
+                                "INSERT OR IGNORE INTO thread_sections SELECT * FROM {SECTIONS_ISOLATED_TABLE} WHERE id=?1"
+                            ),
+                            [&section_id],
+                        )?;
+                        tx.execute(
+                            &format!("DELETE FROM {SECTIONS_ISOLATED_TABLE} WHERE id=?1"),
+                            [&section_id],
+                        )?;
+                    }
+                }
+            }
+            tx.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO threads SELECT * FROM {THREADS_ISOLATED_TABLE} WHERE id=?1"
+                ),
+                [thread_id],
+            )?;
+            tx.execute(
+                &format!("DELETE FROM {THREADS_ISOLATED_TABLE} WHERE id=?1"),
+                [thread_id],
+            )?;
+            if has_tools {
+                tx.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO thread_dynamic_tools SELECT * FROM {TOOLS_ISOLATED_TABLE} WHERE thread_id=?1"
+                    ),
+                    [thread_id],
+                )?;
+                tx.execute(
+                    &format!("DELETE FROM {TOOLS_ISOLATED_TABLE} WHERE thread_id=?1"),
+                    [thread_id],
+                )?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// 读取线程的 cwd (从会话文件 session_meta 获取, 文件在正常目录或金库都能读到)
@@ -964,6 +1119,103 @@ fn sync_session_index(thread_id: &str, official: bool) -> Result<(), SessionErro
     Ok(())
 }
 
+/// 批量同步 session_index。旧实现每个隔离线程都完整读取、解析并可能重写
+/// 同一份 JSONL；隔离会话较多时会把一次供应商切换放大成数十次重复 I/O。
+fn sync_session_index_many(thread_ids: &[String], official: bool) -> Result<(), SessionError> {
+    let path = session_index_path();
+    if !path.exists() || thread_ids.is_empty() {
+        return Ok(());
+    }
+    let targets: HashSet<&str> = thread_ids.iter().map(String::as_str).collect();
+    let text = std::fs::read_to_string(&path)?;
+    let backup_root = session_index_quarantine_root();
+
+    if official {
+        let mut keep = String::with_capacity(text.len());
+        let mut removed: HashMap<String, String> = HashMap::new();
+        for line in text.lines() {
+            let thread_id = serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|v| v.get("id").and_then(Value::as_str).map(ToOwned::to_owned));
+            if let Some(thread_id) = thread_id.filter(|id| targets.contains(id.as_str())) {
+                let entry = removed.entry(thread_id).or_default();
+                entry.push_str(line);
+                entry.push('\n');
+            } else {
+                keep.push_str(line);
+                keep.push('\n');
+            }
+        }
+        if removed.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&backup_root)?;
+        for (thread_id, lines) in &removed {
+            std::fs::write(
+                backup_root.join(format!("{thread_id}.jsonl")),
+                lines.as_bytes(),
+            )?;
+        }
+        vault::atomic_write_bytes(&path, keep.as_bytes()).map_err(|e| {
+            SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("批量写入 session_index 失败: {e}"),
+            ))
+        })?;
+        isolation_log(&format!(
+            "session_index batch removed threads={}",
+            removed.len()
+        ));
+        return Ok(());
+    }
+
+    let mut existing = text
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|v| v.get("id").and_then(Value::as_str).map(ToOwned::to_owned))
+        })
+        .collect::<HashSet<_>>();
+    let mut merged = text;
+    if !merged.is_empty() && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    let mut restored = Vec::new();
+    for thread_id in thread_ids {
+        let backup = backup_root.join(format!("{thread_id}.jsonl"));
+        if !backup.exists() {
+            continue;
+        }
+        if !existing.contains(thread_id) {
+            let restore_text = std::fs::read_to_string(&backup)?;
+            merged.push_str(&restore_text);
+            if !restore_text.ends_with('\n') {
+                merged.push('\n');
+            }
+            existing.insert(thread_id.clone());
+        }
+        restored.push((thread_id.clone(), backup));
+    }
+    if restored.is_empty() {
+        return Ok(());
+    }
+    vault::atomic_write_bytes(&path, merged.as_bytes()).map_err(|e| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("批量恢复 session_index 失败: {e}"),
+        ))
+    })?;
+    for (_, backup) in &restored {
+        std::fs::remove_file(backup)?;
+    }
+    isolation_log(&format!(
+        "session_index batch restored threads={}",
+        restored.len()
+    ));
+    Ok(())
+}
+
 /// 清除 Codex 其它本地缓存里该线程的摘要/目录行 (官方订阅下不可见);
 /// 这些是派生缓存, 切回第三方后 Codex 会从会话文件自动重建, 无需恢复。
 fn purge_aux_db_rows(thread_id: &str) {
@@ -993,6 +1245,46 @@ fn purge_aux_db_rows(thread_id: &str) {
     }
 }
 
+fn purge_aux_db_rows_many(thread_ids: &[String]) {
+    if thread_ids.is_empty() {
+        return;
+    }
+    for (db_path, table) in [
+        (
+            codex_config::codex_config_dir().join("sqlite/codex-dev.db"),
+            "local_thread_catalog",
+        ),
+        (
+            codex_config::codex_config_dir().join("memories_1.sqlite"),
+            "stage1_outputs",
+        ),
+    ] {
+        if !db_path.exists() {
+            continue;
+        }
+        let Ok(mut conn) = Connection::open(&db_path) else {
+            continue;
+        };
+        let _ = conn.busy_timeout(Duration::from_secs(2));
+        let Ok(tx) = conn.transaction() else {
+            continue;
+        };
+        let sql = format!("DELETE FROM {table} WHERE thread_id=?1");
+        let mut removed = 0usize;
+        for thread_id in thread_ids {
+            if let Ok(rows) = tx.execute(&sql, [thread_id]) {
+                removed += rows;
+            }
+        }
+        if tx.commit().is_ok() && removed > 0 {
+            isolation_log(&format!(
+                "aux db batch purged {table} threads={} rows={removed}",
+                thread_ids.len()
+            ));
+        }
+    }
+}
+
 /// 同步 Codex 本地派生索引: session_index + ambient-suggestions + 摘要缓存
 fn sync_local_aux(thread_id: &str, official: bool) -> Result<(), SessionError> {
     if official {
@@ -1002,6 +1294,27 @@ fn sync_local_aux(thread_id: &str, official: bool) -> Result<(), SessionError> {
     sync_session_index(thread_id, official)?;
     if let Some(cwd) = thread_cwd(thread_id) {
         sync_ambient_suggestions(&cwd, official)?;
+    }
+    Ok(())
+}
+
+/// 批量同步派生索引：全局状态仍逐线程应用精确的可恢复补丁，但重复的
+/// session_index 解析、摘要库连接和同项目 ambient 扫描合并为一次。
+fn sync_local_aux_many(thread_ids: &[String], official: bool) -> Result<(), SessionError> {
+    if official {
+        purge_aux_db_rows_many(thread_ids);
+    }
+    for thread_id in thread_ids {
+        sync_global_state(thread_id, official)?;
+    }
+    sync_session_index_many(thread_ids, official)?;
+    let mut seen_cwds = HashSet::new();
+    for thread_id in thread_ids {
+        if let Some(cwd) = thread_cwd(thread_id) {
+            if seen_cwds.insert(cwd.clone()) {
+                sync_ambient_suggestions(&cwd, official)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1062,36 +1375,48 @@ pub fn sync_session_isolation_for(
     official: bool,
     progress: &dyn Fn(&str),
 ) -> Result<(), SessionError> {
+    let started = std::time::Instant::now();
     let items = load_isolated();
     isolation_log(&format!(
         "sync start official={official} isolated_items={}",
         items.len()
     ));
-    for it in &items {
-        if it.thread_id.is_empty() || it.thread_id.contains('/') || it.thread_id.contains("..") {
-            continue;
-        }
-        let files = thread_files(&it.thread_id);
-        // 防御: 即使上层漏检, 只要有文件需要迁移且 Codex/ChatGPT 仍在运行,
-        // 也拒绝迁移 — 防止从运行中的桌面端下方搬走会话 (它会继续显示/写回)。
-        let needs_move = files
-            .iter()
-            .any(|(_, _, in_normal)| (official && *in_normal) || (!official && !*in_normal));
-        if needs_move && codex_running() {
-            isolation_log(&format!(
-                "sync blocked thread={} needs_move=true codex_running=true",
-                it.thread_id
-            ));
-            return Err(SessionError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "Codex / ChatGPT 桌面端正在运行，请先完全退出后再切换供应商",
-            )));
-        }
+    let plans = items
+        .iter()
+        .filter(|it| {
+            !it.thread_id.is_empty() && !it.thread_id.contains('/') && !it.thread_id.contains("..")
+        })
+        .map(|it| {
+            let files = thread_files(&it.thread_id);
+            let needs_move = files
+                .iter()
+                .any(|(_, _, in_normal)| (official && *in_normal) || (!official && !*in_normal));
+            (it.thread_id.clone(), files, needs_move)
+        })
+        .collect::<Vec<_>>();
+    let any_needs_move = plans.iter().any(|(_, _, needs_move)| *needs_move);
+    // 进程检测包含 7 个 pgrep。旧实现对每个隔离会话至少执行一次，
+    // 76 个会话会无意义地启动 500+ 个子进程；整轮检测一次即可保持同一安全边界。
+    let running = any_needs_move && codex_running();
+    if running {
+        isolation_log("sync blocked needs_move=true codex_running=true");
+        return Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Codex / ChatGPT 桌面端正在运行，请先完全退出后再切换供应商",
+        )));
+    }
+    isolation_log(&format!(
+        "sync planned threads={} any_needs_move={any_needs_move} codex_running={running}",
+        plans.len()
+    ));
+
+    let mut moved_all: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for (thread_id, files, needs_move) in &plans {
         isolation_log(&format!(
             "sync thread={} files={} needs_move={needs_move} codex_running={}",
-            it.thread_id,
+            thread_id,
             files.len(),
-            codex_running()
+            running
         ));
         let total = files.len();
         let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
@@ -1109,44 +1434,45 @@ pub fn sync_session_isolation_for(
                     for (s, d) in moved.iter().rev() {
                         let _ = move_file_safe(d, s, &|_| {});
                     }
-                    isolation_log(&format!(
-                        "sync thread={} file move error: {e}",
-                        it.thread_id
-                    ));
+                    isolation_log(&format!("sync thread={} file move error: {e}", thread_id));
                     return Err(e);
                 }
             }
         }
         isolation_log(&format!(
             "sync thread={} moved_files={}",
-            it.thread_id,
+            thread_id,
             moved.len()
         ));
-        // 文件移动完成后, 同步 Codex 线程索引 (侧边栏的项目/目录/会话名)
-        if let Err(e) = sync_db_thread(&it.thread_id, official) {
-            for (s, d) in moved.iter().rev() {
-                let _ = move_file_safe(d, s, &|_| {});
-            }
-            isolation_log(&format!(
-                "sync thread={} db error: {e}",
-                it.thread_id
-            ));
-            return Err(e);
-        }
-        isolation_log(&format!("sync thread={} db ok", it.thread_id));
-        // 同步本地派生索引 (ambient-suggestions / session_index / 摘要缓存)
-        if let Err(e) = sync_local_aux(&it.thread_id, official) {
-            for (s, d) in moved.iter().rev() {
-                let _ = move_file_safe(d, s, &|_| {});
-            }
-            let _ = sync_db_thread(&it.thread_id, !official);
-            let _ = sync_local_aux(&it.thread_id, !official);
-            isolation_log(&format!("sync thread={} aux error: {e}", it.thread_id));
-            return Err(e);
-        }
-        isolation_log(&format!("sync thread={} aux ok", it.thread_id));
+        moved_all.extend(moved);
     }
-    isolation_log("sync done");
+
+    let thread_ids = plans
+        .iter()
+        .map(|(thread_id, _, _)| thread_id.clone())
+        .collect::<Vec<_>>();
+    // 文件移动完成后批量同步 Codex 线程索引和派生索引。
+    if let Err(e) = sync_db_threads(&thread_ids, official) {
+        for (src, dst) in moved_all.iter().rev() {
+            let _ = move_file_safe(dst, src, &|_| {});
+        }
+        isolation_log(&format!("sync batch db error: {e}"));
+        return Err(e);
+    }
+    isolation_log(&format!("sync batch db ok threads={}", thread_ids.len()));
+    if let Err(e) = sync_local_aux_many(&thread_ids, official) {
+        for (src, dst) in moved_all.iter().rev() {
+            let _ = move_file_safe(dst, src, &|_| {});
+        }
+        let _ = sync_db_threads(&thread_ids, !official);
+        let _ = sync_local_aux_many(&thread_ids, !official);
+        isolation_log(&format!("sync batch aux error: {e}"));
+        return Err(e);
+    }
+    isolation_log(&format!(
+        "sync done elapsed_ms={}",
+        started.elapsed().as_millis()
+    ));
     Ok(())
 }
 

@@ -172,6 +172,7 @@ function App() {
       // 确认提示 (不自动消失), 用户确认后 force 调用。
       setSwitchStep("检测出口 IP…");
       const ip = await checkIp();
+      const ipVerified = Boolean(ip.current_ip);
       if (ip.current_ip) {
         setSwitchStep("比对官方激活基线…");
         if (ip.changed && ip.last_official_ip) {
@@ -192,7 +193,10 @@ function App() {
       }
       setSwitching(false);
       setSwitchStep(null);
-      await performSwitch("official", false);
+      // 前端刚完成了同一套出口 IP 与官方基线比对，结果有效时直接把已验证
+      // 结论交给切换事务，避免后端再次访问最多 3 个 IP 服务（最坏约 18 秒）。
+      // 若本次没有取得 IP，仍让后端执行权威检查，不能静默跳过风控保护。
+      await performSwitch("official", ipVerified);
     } catch (e) {
       setSwitching(false);
       setSwitchStep(null);
