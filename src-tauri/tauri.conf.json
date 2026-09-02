@@ -30,6 +30,16 @@
       }
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "codexff",
+          "ccswitch"
+        ]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

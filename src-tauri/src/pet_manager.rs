@@ -566,6 +566,7 @@ pub fn install_from_command(
     cmd.env("npm_config_yes", "true");
     cmd.env("NPM_CONFIG_YES", "true");
     cmd.env("npm_config_fund", "false");
+    crate::process_utils::hide_console_window(&mut cmd);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

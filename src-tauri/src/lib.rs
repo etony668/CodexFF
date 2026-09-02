@@ -10,6 +10,7 @@ pub mod local_router;
 pub mod official_quota;
 pub mod pet_manager;
 pub mod prefix_diag;
+pub mod process_utils;
 pub mod profiles;
 pub mod session_manager;
 pub mod session_model;
