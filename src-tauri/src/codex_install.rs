@@ -113,12 +113,31 @@ pub fn codex_cli_binary() -> Option<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".local/bin/codex"));
     }
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            candidates.push(PathBuf::from(app_data).join("npm/codex.cmd"));
+            candidates.push(PathBuf::from(app_data).join("npm/codex.exe"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local_app_data).join("Programs/codex/codex.exe"));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            for directory in std::env::split_paths(&path) {
+                candidates.push(directory.join("codex.cmd"));
+                candidates.push(directory.join("codex.exe"));
+                candidates.push(directory.join("codex"));
+            }
+        }
+    }
     candidates.extend(embedded_cli_candidates());
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 fn command_version(binary: &Path) -> Option<String> {
-    let output = Command::new(binary).arg("--version").output().ok()?;
+    let mut command = Command::new(binary);
+    crate::process_utils::hide_console_window(&mut command);
+    let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -315,8 +334,7 @@ fn free_disk_bytes() -> u64 {
 
 #[cfg(not(unix))]
 fn free_disk_bytes() -> u64 {
-    // Windows 构建不依赖 Unix statvfs；安装器仍会由系统在下载/安装阶段
-    // 返回明确的磁盘空间错误。
+    // Windows 不依赖 Unix statvfs；系统会在下载/安装阶段报告磁盘错误。
     0
 }
 
@@ -652,7 +670,9 @@ pub fn install_cli(
     });
     if prefer_latest {
         if let Some(npm) = npm_binary() {
-            let output = Command::new(npm)
+            let mut command = Command::new(npm);
+            crate::process_utils::hide_console_window(&mut command);
+            let output = command
                 .args(["install", "--global", "@openai/codex@latest"])
                 .output()
                 .map_err(|e| format!("无法运行 npm: {e}"))?;

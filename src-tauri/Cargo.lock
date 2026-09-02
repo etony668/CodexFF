@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "codexff"
-version = "1.2.229"
+version = "1.2.235"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -4535,6 +4535,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tauri",
+ "tauri-plugin-deep-link",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
