@@ -219,12 +219,6 @@ pub fn restore_switch_snapshot(snapshot: &SwitchSnapshot) -> Result<(), Profiles
     ) {
         errors.push(format!("relay state: {e}"));
     }
-    if let Err(e) = crate::session_manager::sync_session_isolation_for(
-        matches!(snapshot.active, Some(ActiveSelection::Official)),
-        &|_| {},
-    ) {
-        errors.push(format!("session isolation: {e}"));
-    }
     let auth_validation = match &snapshot.active {
         Some(ActiveSelection::Relay { .. }) => vault::validate_relay_auth_file(),
         Some(ActiveSelection::Official) => vault::validate_official_auth_file(),
@@ -437,6 +431,15 @@ pub fn load_profiles() -> Result<ProfilesFile, ProfilesError> {
         migrated = true;
     }
     for profile in &mut profiles.relays {
+        // 皮卡丘已停止提供 Luna；旧版本缓存的 /models 清单不能继续
+        // 把它声明为可用，否则旧会话会被原样转发并返回 502/503。
+        if profile.base_url.contains("sub.pikaqiu.shop") {
+            let before = profile.supported_models.len();
+            profile
+                .supported_models
+                .retain(|model| model != "gpt-5.6-luna");
+            migrated |= before != profile.supported_models.len();
+        }
         let canonical_wire = match profile.wire_api.as_deref() {
             Some("openai_responses") => Some("responses".to_string()),
             Some("openai_chat") => Some("chat".to_string()),
@@ -532,6 +535,7 @@ pub fn update_relay_supported_models(
         .into_iter()
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
+        .filter(|m| !(profile.base_url.contains("sub.pikaqiu.shop") && m == "gpt-5.6-luna"))
         .collect();
     save_profiles(&profiles)
 }
@@ -1201,20 +1205,8 @@ pub fn activate_official_with_progress(
     progress: &dyn Fn(&str),
 ) -> Result<ActiveSelection, ProfilesError> {
     let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = crate::session_unify::checkpoint_if_enabled() {
-        log::warn!("会话统一增量备份失败，继续切换但保留统一状态: {e}");
-    }
     let mut profiles = load_profiles()?;
     let prev_active = profiles.active.clone();
-
-    // 0. 有标记隔离的会话需要迁移时, Codex 必须完全退出 —
-    //    移动正在写入的 GB 级会话文件会造成会话分裂/损坏。
-    if crate::session_manager::has_isolated_sessions() && crate::session_manager::codex_running() {
-        return Err(ProfilesError::Blocked(
-            "有标记隔离的会话需要迁移，请先完全退出 Codex / ChatGPT 桌面端与命令行再切换官方订阅"
-                .into(),
-        ));
-    }
 
     // 1. 备份 config.toml (回滚用) + 读切换前快照
     progress("备份当前配置…");
@@ -1270,41 +1262,20 @@ pub fn activate_official_with_progress(
         )));
     }
 
-    // 4. 会话隔离: 标记的会话移入金库隔离区, 官方 CLI 扫不到
-    progress("隔离标记会话…");
-    if let Err(e) = crate::session_manager::sync_session_isolation_with_progress(progress) {
-        // 官方切换的安全边界是“配置、凭证、会话可见性”同时成立。若隔离
-        // 同步失败，必须回到切换前的中转状态，不能留下官方配置却仍可见
-        // 非官方会话的半完成状态。
-        restore_config_or_remove(&backup);
-        let auth_ok = rollback_auth(&prev_active);
-        let isolation_ok =
-            crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
-        if matches!(prev_active, Some(ActiveSelection::Relay { .. })) {
-            let _ = vault::save_relay_state(&state);
-        } else {
-            vault::clear_relay_state();
-        }
-        return Err(ProfilesError::RolledBack(format!(
-            "官方激活时会话隔离同步失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
-        )));
-    }
-    if !crate::session_unify::state().enabled {
+    let project_scope_changed = !matches!(prev_active, Some(ActiveSelection::Official));
+    if project_scope_changed {
+        progress("同步官方项目索引…");
         if let Err(e) = crate::session_unify::sync_project_visibility(
             crate::codex_config::OFFICIAL_MODEL_PROVIDER,
         ) {
             restore_config_or_remove(&backup);
             let auth_ok = rollback_auth(&prev_active);
-            let isolation_ok =
-                crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
             return Err(ProfilesError::RolledBack(format!(
-                "官方项目索引同步失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+                "官方项目索引同步失败: {e}; 凭证回滚={auth_ok}"
             )));
         }
     }
-    if let Err(e) = crate::session_unify::sync_sqlite_project_bindings() {
-        log::warn!("官方切换后同步 SQLite 项目归属失败: {e}");
-    }
+
     vault::clear_relay_state();
     profiles.active = Some(ActiveSelection::Official);
     if let Err(e) = save_profiles(&profiles) {
@@ -1312,24 +1283,21 @@ pub fn activate_official_with_progress(
         // 否则 UI 仍显示旧中转、实际已切官方，既不一致也可能暴露未隔离会话。
         restore_config_or_remove(&backup);
         let auth_ok = rollback_auth(&prev_active);
-        let previous_provider = match &prev_active {
-            Some(ActiveSelection::Official) => crate::codex_config::OFFICIAL_MODEL_PROVIDER,
-            Some(ActiveSelection::Relay { .. }) => crate::codex_config::SHARED_MODEL_PROVIDER,
-            None => "",
-        };
-        if !previous_provider.is_empty() {
-            let _ =
-                crate::session_unify::restore_project_visibility_for_provider(previous_provider);
-        }
-        let isolation_ok =
-            crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
         if matches!(prev_active, Some(ActiveSelection::Relay { .. })) {
             let _ = vault::save_relay_state(&state);
         } else {
             vault::clear_relay_state();
         }
+        let previous_provider = match &prev_active {
+            Some(ActiveSelection::Official) => crate::codex_config::OFFICIAL_MODEL_PROVIDER,
+            Some(ActiveSelection::Relay { .. }) => crate::codex_config::SHARED_MODEL_PROVIDER,
+            None => "",
+        };
+        if project_scope_changed && !previous_provider.is_empty() {
+            let _ = crate::session_unify::sync_project_visibility(previous_provider);
+        }
         return Err(ProfilesError::RolledBack(format!(
-            "保存官方切换状态失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+            "保存官方切换状态失败: {e}; 凭证回滚={auth_ok}"
         )));
     }
     Ok(ActiveSelection::Official)
@@ -1350,9 +1318,6 @@ pub fn activate_relay_with_progress(
     progress: &dyn Fn(&str),
 ) -> Result<ActiveSelection, ProfilesError> {
     let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = crate::session_unify::checkpoint_if_enabled() {
-        log::warn!("会话统一增量备份失败，继续切换但保留统一状态: {e}");
-    }
     let mut profiles = load_profiles()?;
     let Some(profile) = profiles.relays.iter().find(|p| p.id == profile_id) else {
         return Err(ProfilesError::NotFound(profile_id.to_string()));
@@ -1360,13 +1325,6 @@ pub fn activate_relay_with_progress(
     if !profile.has_key {
         return Err(ProfilesError::NotFound(
             "该 profile 未保存中转 key".to_string(),
-        ));
-    }
-    // 0. 有标记隔离的会话需要从金库移回时, Codex 必须完全退出 (防止写坏会话文件)
-    if crate::session_manager::has_isolated_sessions() && crate::session_manager::codex_running() {
-        return Err(ProfilesError::Blocked(
-            "有标记隔离的会话需要恢复，请先完全退出 Codex / ChatGPT 桌面端与命令行再切换第三方"
-                .into(),
         ));
     }
     // 切换前状态 — 回滚时按它恢复 auth.json (relay→relay 失败要重写旧中转 key)
@@ -1452,57 +1410,38 @@ pub fn activate_relay_with_progress(
         )));
     }
 
-    // 4. 会话恢复: 标记的会话从金库隔离区移回 codex 目录
-    progress("恢复标记会话…");
-    if let Err(e) = crate::session_manager::sync_session_isolation_with_progress(progress) {
-        // 切回第三方同样要求“配置、凭证、会话位置”一致。恢复失败不能
-        // 留下中转配置但会话仍在官方隔离区的半完成状态。
-        restore_config_or_remove(&backup);
-        let auth_ok = rollback_auth(&prev_active);
-        let isolation_ok =
-            crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
-        let _ = vault::save_relay_state(&relay_state_before);
-        return Err(ProfilesError::RolledBack(format!(
-            "第三方激活时会话恢复失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
-        )));
-    }
-    if !crate::session_unify::state().enabled {
+    let project_scope_changed = !matches!(prev_active, Some(ActiveSelection::Relay { .. }));
+    if project_scope_changed {
+        progress("同步第三方项目索引…");
         if let Err(e) = crate::session_unify::sync_project_visibility(
             crate::codex_config::SHARED_MODEL_PROVIDER,
         ) {
             restore_config_or_remove(&backup);
             let auth_ok = rollback_auth(&prev_active);
-            let isolation_ok =
-                crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
             let _ = vault::save_relay_state(&relay_state_before);
             return Err(ProfilesError::RolledBack(format!(
-                "第三方项目索引同步失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+                "第三方项目索引同步失败: {e}; 凭证回滚={auth_ok}"
             )));
         }
     }
-    if let Err(e) = crate::session_unify::sync_sqlite_project_bindings() {
-        log::warn!("第三方切换后同步 SQLite 项目归属失败: {e}");
-    }
+
     profiles.active = Some(ActiveSelection::Relay {
         profile_id: profile_id.to_string(),
     });
     if let Err(e) = save_profiles(&profiles) {
         restore_config_or_remove(&backup);
         let auth_ok = rollback_auth(&prev_active);
+        let _ = vault::save_relay_state(&relay_state_before);
         let previous_provider = match &prev_active {
             Some(ActiveSelection::Official) => crate::codex_config::OFFICIAL_MODEL_PROVIDER,
             Some(ActiveSelection::Relay { .. }) => crate::codex_config::SHARED_MODEL_PROVIDER,
             None => "",
         };
-        if !previous_provider.is_empty() {
-            let _ =
-                crate::session_unify::restore_project_visibility_for_provider(previous_provider);
+        if project_scope_changed && !previous_provider.is_empty() {
+            let _ = crate::session_unify::sync_project_visibility(previous_provider);
         }
-        let isolation_ok =
-            crate::session_manager::sync_session_isolation_with_progress(&|_| {}).is_ok();
-        let _ = vault::save_relay_state(&relay_state_before);
         return Err(ProfilesError::RolledBack(format!(
-            "保存第三方切换状态失败: {e}; 凭证回滚={auth_ok}; 会话回滚={isolation_ok}"
+            "保存第三方切换状态失败: {e}; 凭证回滚={auth_ok}"
         )));
     }
     Ok(ActiveSelection::Relay {

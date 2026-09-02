@@ -537,115 +537,6 @@ async fn activate_relay(
     Ok(result)
 }
 
-#[tauri::command]
-async fn list_sessions() -> Result<Vec<session_manager::SessionMeta>, ApiError> {
-    tauri::async_runtime::spawn_blocking(session_manager::scan_sessions)
-        .await
-        .map_err(|e| ApiError {
-            message: format!("加载会话任务失败: {e}"),
-        })?
-        .map_err(ApiError::from)
-}
-
-#[tauri::command]
-fn get_session_unify_state() -> Result<session_unify::UnifiedState, ApiError> {
-    Ok(session_unify::state())
-}
-
-#[tauri::command]
-async fn set_session_unify_enabled(
-    app: tauri::AppHandle,
-    enabled: bool,
-) -> Result<session_unify::UnifiedState, ApiError> {
-    use tauri::Emitter;
-    let progress_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let result = session_unify::set_enabled(enabled, &|step| {
-            let _ = progress_app.emit("session-unify-progress", step);
-        });
-        let _ = progress_app.emit("session-unify-progress", "完成");
-        result
-    })
-    .await
-    .map_err(|e| ApiError {
-        message: format!("会话统一后台任务失败: {e}"),
-    })?
-    .map_err(ApiError::from)
-}
-
-#[tauri::command]
-fn session_detail(
-    path: String,
-    max_lines: Option<usize>,
-) -> Result<Vec<serde_json::Value>, ApiError> {
-    Ok(session_manager::session_detail(
-        &path,
-        max_lines.unwrap_or(500),
-    )?)
-}
-
-/// 标记/取消标记线程“官方订阅不可见” (该线程所有 rollout 文件一起隔离)。
-/// 隔离前必须完全退出 Codex (桌面/CLI), 防止移动正在写入的会话文件;
-/// 隔离过程逐步 emit 进度事件。
-#[tauri::command]
-fn set_session_isolated(
-    app: tauri::AppHandle,
-    thread_id: String,
-    isolated: bool,
-) -> Result<(), ApiError> {
-    use tauri::Emitter;
-    if isolated && session_manager::codex_running() {
-        return Err(ApiError {
-            message: "请先完全退出 Codex / ChatGPT 桌面端与命令行后再隔离会话".into(),
-        });
-    }
-    let result =
-        session_manager::set_session_isolated_with_progress(&thread_id, isolated, &|step| {
-            let _ = app.emit("session-isolate-progress", step);
-        });
-    let _ = app.emit("session-isolate-progress", "完成");
-    result.map_err(ApiError::from)
-}
-
-/// 扫描仍停留在 "openai" 桶的旧官方会话 (统一历史迁移候选)
-#[tauri::command]
-fn list_unifiable_sessions() -> Result<Vec<session_unify::UnifySessionMeta>, ApiError> {
-    Ok(session_unify::scan_openai_sessions()?)
-}
-
-/// 是否存在统一历史迁移备份 (前端据此显示"从备份还原")
-#[tauri::command]
-fn has_unify_backup() -> Result<bool, ApiError> {
-    Ok(session_unify::has_backup())
-}
-
-/// 迁移选中线程的旧官方会话到共享 "custom" 桶 (迁移前自动备份)
-#[tauri::command]
-fn migrate_sessions_to_shared(
-    app: tauri::AppHandle,
-    thread_ids: Vec<String>,
-) -> Result<session_unify::UnifyOutcome, ApiError> {
-    use tauri::Emitter;
-    let result = session_unify::migrate_selected(&thread_ids, &|step| {
-        let _ = app.emit("session-unify-progress", step);
-    });
-    let _ = app.emit("session-unify-progress", "完成");
-    result.map_err(ApiError::from)
-}
-
-/// 按迁移备份账本还原旧官方会话到 "openai" 桶
-#[tauri::command]
-fn restore_unified_sessions(
-    app: tauri::AppHandle,
-) -> Result<session_unify::UnifyOutcome, ApiError> {
-    use tauri::Emitter;
-    let result = session_unify::restore_from_backup(&|step| {
-        let _ = app.emit("session-unify-progress", step);
-    });
-    let _ = app.emit("session-unify-progress", "完成");
-    result.map_err(ApiError::from)
-}
-
 /// 扫描 ~/.codex/pets 下已安装的自定义宠物
 #[tauri::command]
 fn list_pets() -> Result<Vec<pet_manager::PetMeta>, ApiError> {
@@ -777,7 +668,7 @@ fn is_codex_installed() -> Result<bool, ApiError> {
 async fn install_codex(app: tauri::AppHandle) -> Result<(), ApiError> {
     use tauri::Emitter;
     let handle = app.clone();
-    codex_install::install_desktop(move |p| {
+    codex_install::install_desktop(true, move |p| {
         let _ = handle.emit("codex-install-progress", &p);
     })
     .await
@@ -1083,15 +974,6 @@ pub fn run() {
             delete_relay,
             activate_official,
             activate_relay,
-            list_sessions,
-            get_session_unify_state,
-            set_session_unify_enabled,
-            session_detail,
-            set_session_isolated,
-            list_unifiable_sessions,
-            has_unify_backup,
-            migrate_sessions_to_shared,
-            restore_unified_sessions,
             list_pets,
             import_pet_zip,
             import_pet_folder,
@@ -1157,6 +1039,13 @@ pub fn run() {
                 tauri::async_runtime::block_on(local_router::resume_or_recover_startup())
             {
                 log::warn!("启动恢复会话兼容路由失败: {e}");
+            }
+            // 会话管理已退役：仅在 Codex/ChatGPT 完全退出时执行一次轻量归属恢复，
+            // 后续不再迁移、隔离或持续备份会话正文。
+            if let Err(e) = session_unify::retire_session_management(&|step| {
+                log::info!("session management retirement: {step}");
+            }) {
+                log::warn!("会话管理退役迁移失败，将在下次启动重试: {e}");
             }
 
             Ok(())

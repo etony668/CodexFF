@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, UNIX_EPOCH};
@@ -31,10 +32,16 @@ const UPSTREAM_ERROR_TEXT_LIMIT: usize = 1200;
 /// 网关偶发返回 502/503/504 时，在尚未收到任何模型输出前给同一供应商
 /// 一个很短的恢复窗口。Responses 是 POST，请求一旦开始输出就绝不重发；
 /// 这里重试的只是明确的 HTTP 网关错误响应。
-const UPSTREAM_TRANSIENT_RETRIES: usize = 2;
-const UPSTREAM_RETRY_DELAYS_MS: [u64; UPSTREAM_TRANSIENT_RETRIES] = [150, 400];
+const UPSTREAM_TRANSIENT_RETRIES: usize = 3;
+// 中转站的 502/503/504 经常是入口节点短暂切换；150/400ms 对跨境链路
+// 基本没有恢复窗口。只在尚未收到任何响应内容时退避，避免重复已开始的 SSE。
+const UPSTREAM_RETRY_DELAYS_MS: [u64; UPSTREAM_TRANSIENT_RETRIES] = [300, 1_000, 2_500];
+const UPSTREAM_RETRY_AFTER_MAX_MS: u64 = 10_000;
 
 static RUNTIME: Mutex<Option<RuntimeState>> = Mutex::new(None);
+/// 用户本次运行期内明确关闭路由后，暂停 30 秒自愈重新拉起。
+/// 仅保存在内存中：手动重新开启或 App 重启后自动清除。
+static MANUALLY_PAUSED: AtomicBool = AtomicBool::new(false);
 static BREAKER: LazyLock<Mutex<Breaker>> = LazyLock::new(|| Mutex::new(Breaker::default()));
 /// 各中转对 Responses reasoning 条目的实际校验策略。
 /// true = OpenAI 严格形态（encrypted_content 存在时 content=[]）；
@@ -53,7 +60,7 @@ struct RuntimeState {
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterState {
     pub enabled: bool,
     pub port: u16,
@@ -75,6 +82,36 @@ pub struct RouterState {
     /// 监听与接管，不能仅依赖已经还原为真实地址的磁盘配置。
     #[serde(default)]
     pub resume_after_restart: bool,
+    /// 已确认当前供应商不可用的模型。跨 App 重启持久化，避免旧会话
+    /// 每次请求再次尝试已经下线的模型。
+    #[serde(default)]
+    pub denied_models: HashMap<String, HashSet<String>>,
+    /// 是否启用故障自动切换/熔断保护；默认关闭，由用户主动开启。
+    #[serde(default)]
+    pub auto_failover_enabled: bool,
+    /// 1.2.230 前没有用户开关，历史 `true` 仅代表旧默认值而非用户选择。
+    /// 缺失时强制按新默认关闭，首次用户点击后才持久化为显式配置。
+    #[serde(default)]
+    auto_failover_configured: bool,
+}
+
+impl Default for RouterState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: DEFAULT_PORT,
+            automatic: false,
+            rewritten: false,
+            original_base_url: None,
+            rewrote_profile: None,
+            degraded: false,
+            recovery_message: None,
+            resume_after_restart: false,
+            denied_models: HashMap::new(),
+            auto_failover_enabled: false,
+            auto_failover_configured: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +120,8 @@ pub struct RouterStatus {
     pub port: u16,
     pub rewritten: bool,
     pub automatic: bool,
+    /// 用户是否在本次 App 运行期手动暂停了自动恢复。
+    pub manually_paused: bool,
     pub degraded: bool,
     pub recovery_message: Option<String>,
     pub active_provider: Option<String>,
@@ -90,6 +129,7 @@ pub struct RouterStatus {
     /// 前端据此提示用户当前走的是备用中转。
     #[serde(default)]
     pub last_fallback: Option<(String, i64)>,
+    pub auto_failover_enabled: bool,
 }
 
 static LAST_FALLBACK: Mutex<Option<(String, i64)>> = Mutex::new(None);
@@ -104,15 +144,35 @@ fn state_path() -> std::path::PathBuf {
 }
 
 pub fn load_state() -> RouterState {
-    std::fs::read_to_string(state_path())
+    let mut state = std::fs::read_to_string(state_path())
         .ok()
         .and_then(|t| serde_json::from_str::<RouterState>(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !state.auto_failover_configured {
+        state.auto_failover_enabled = false;
+    }
+    state
 }
 
 fn save_state(s: &RouterState) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?;
     vault::atomic_write_bytes(&state_path(), &bytes).map_err(|e| e.to_string())
+}
+
+pub fn set_auto_failover_enabled(enabled: bool) -> Result<RouterStatus, String> {
+    let mut state = load_state();
+    state.auto_failover_enabled = enabled;
+    state.auto_failover_configured = true;
+    save_state(&state)?;
+    if !enabled {
+        if let Ok(mut breaker) = BREAKER.lock() {
+            *breaker = Breaker::default();
+        }
+        if let Ok(mut fallback) = LAST_FALLBACK.lock() {
+            *fallback = None;
+        }
+    }
+    Ok(status())
 }
 
 /// Persist a degraded state without changing listener/config ownership.
@@ -178,7 +238,10 @@ fn sanitize_responses_body(
                         .map(|a| a.is_empty())
                         .unwrap_or(true);
                     if empty_reasoning_content {
-                        if obj.contains_key("encrypted_content") && !content_empty {
+                        // GPT 类中转要求 reasoning 的 content 必须为空数组（无论是否带
+                        // encrypted_content 字段）。部分落盘的 reasoning 条目不带该字段，
+                        // 若不清空会触发 400 array too long。
+                        if !content_empty {
                             obj.insert("content".into(), serde_json::json!([]));
                             changed = true;
                         }
@@ -290,15 +353,23 @@ fn learn_reasoning_policy(provider_id: &str, empty_content: bool) {
 }
 
 fn model_denied(provider_id: &str, model: &str) -> bool {
-    DENIED_MODELS
+    if DENIED_MODELS
         .lock()
         .ok()
         .and_then(|models| models.get(provider_id).map(|denied| denied.contains(model)))
         .unwrap_or(false)
+    {
+        return true;
+    }
+    load_state()
+        .denied_models
+        .get(provider_id)
+        .map(|denied| denied.contains(model))
+        .unwrap_or(false)
 }
 
 fn learn_denied_model(provider_id: &str, model: &str) -> bool {
-    DENIED_MODELS
+    let learned = DENIED_MODELS
         .lock()
         .map(|mut models| {
             models
@@ -306,7 +377,19 @@ fn learn_denied_model(provider_id: &str, model: &str) -> bool {
                 .or_default()
                 .insert(model.to_string())
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if learned {
+        let mut state = load_state();
+        state
+            .denied_models
+            .entry(provider_id.to_string())
+            .or_default()
+            .insert(model.to_string());
+        if let Err(error) = save_state(&state) {
+            log::warn!("persist denied relay model failed: {error}");
+        }
+    }
+    learned
 }
 
 /// 只识别两类明确、互斥的 reasoning schema 错误。返回下一次重试策略；
@@ -355,6 +438,20 @@ struct BufferedStream {
 enum InitialStream {
     Forward(BufferedStream),
     Retry(bool),
+    TransientFailure(String),
+}
+
+fn sse_terminal_failure(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("event: error")
+        || lower.contains("\"type\":\"error\"")
+        || lower.contains("\"type\": \"error\"")
+        || lower.contains("response.failed")
+    {
+        return Some(upstream_error_snippet(bytes, ""));
+    }
+    None
 }
 
 /// 中转有时以 HTTP 200 建立 SSE，随后才通过 event:error/response.failed
@@ -374,15 +471,20 @@ async fn inspect_initial_sse(resp: reqwest::Response, current_policy: bool) -> I
                 if let Some(next) = reasoning_error_policy(&prefix, current_policy) {
                     return InitialStream::Retry(next);
                 }
+                if let Some(message) = sse_terminal_failure(&prefix) {
+                    return InitialStream::TransientFailure(message);
+                }
                 // 一个完整 SSE 事件已到达但只是 created/in_progress，继续等
                 // 后续首个有效输出或明确错误。
             }
             Some(Err(e)) => {
-                let msg = e.to_string();
-                prefix.extend_from_slice(msg.as_bytes());
-                break;
+                return InitialStream::TransientFailure(e.to_string());
             }
-            None => break,
+            None => {
+                return InitialStream::TransientFailure(
+                    "upstream stream ended before the first valid output".to_string(),
+                );
+            }
         }
     }
     InitialStream::Forward(BufferedStream {
@@ -745,7 +847,7 @@ fn client() -> reqwest::Client {
         .user_agent("codexff-router");
     // 与 DNS 守护同一套系统代理发现: 机场设置了 HTTP/SOCKS 代理时
     // 上游请求也走代理 (TUN 模式则无需代理, 直连即进隧道)
-    if let Some(url) = crate::official_quota::system_proxy_url() {
+    if let Some(url) = crate::official_quota::effective_proxy_url() {
         if let Ok(mut proxy) = reqwest::Proxy::all(&url) {
             proxy = proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1"));
             builder = builder.proxy(proxy);
@@ -790,7 +892,11 @@ async fn send_upstream_request(
 
 enum UpstreamAttempt {
     Response(reqwest::Response),
-    HttpFailure { status: u16, body: Bytes },
+    HttpFailure {
+        status: u16,
+        body: Bytes,
+        attempts: usize,
+    },
 }
 
 fn retryable_upstream_status(status: u16, body: &[u8]) -> bool {
@@ -833,17 +939,39 @@ async fn send_with_transient_retry(
             return Ok(UpstreamAttempt::Response(response));
         }
 
+        let retry_after_ms = retry_after_delay_ms(&response);
         let error_body = read_upstream_error_body(response).await;
         if !retryable_upstream_status(status, &error_body) || attempt == UPSTREAM_TRANSIENT_RETRIES
         {
             return Ok(UpstreamAttempt::HttpFailure {
                 status,
                 body: error_body,
+                attempts: attempt + 1,
             });
         }
-        tokio::time::sleep(Duration::from_millis(UPSTREAM_RETRY_DELAYS_MS[attempt])).await;
+        let backoff_ms = retry_after_ms.unwrap_or(UPSTREAM_RETRY_DELAYS_MS[attempt]);
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
     }
     unreachable!("transient retry loop always returns")
+}
+
+/// 供应商若返回 Retry-After，优先尊重其秒数；限制上限避免一个坏节点让
+/// Codex 无限卡住。日期格式不解析，绝大多数中转只返回整数秒。
+fn retry_after_delay_ms(resp: &reqwest::Response) -> Option<u64> {
+    retry_after_value_ms(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn retry_after_value_ms(value: Option<&str>) -> Option<u64> {
+    let seconds = value.and_then(|value| value.trim().parse::<u64>().ok())?;
+    Some(
+        seconds
+            .saturating_mul(1_000)
+            .min(UPSTREAM_RETRY_AFTER_MAX_MS),
+    )
 }
 
 async fn read_upstream_error_body(resp: reqwest::Response) -> Bytes {
@@ -908,10 +1036,34 @@ fn upstream_http_failure(
     )
 }
 
+fn upstream_http_failure_after_attempts(
+    profile: &profiles::RelayProfile,
+    status: u16,
+    body: &[u8],
+    api_key: &str,
+    attempts: usize,
+) -> String {
+    let diagnostic = upstream_http_failure(profile, status, body, api_key);
+    if attempts <= 1 {
+        diagnostic
+    } else {
+        format!("{diagnostic}（已自动尝试 {attempts} 次）")
+    }
+}
+
 fn request_model(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+}
+
+/// Codex 的系统审批审查会创建独立 Luna 任务，即使主界面当前选择的是 Sol。
+/// 部分中转不开放 Luna，导致所有需要系统授权的本地操作都被 503 阻断。
+/// 该提示词由审批系统固定注入，匹配范围远窄于普通用户/Agent 会话。
+fn is_approval_review_request(body: &[u8]) -> bool {
+    const MARKER: &[u8] =
+        b"The following is the Codex agent history whose request action you are assessing.";
+    body.windows(MARKER.len()).any(|window| window == MARKER)
 }
 
 fn is_access_forbidden_failure(status: u16, body: &[u8]) -> bool {
@@ -919,6 +1071,24 @@ fn is_access_forbidden_failure(status: u16, body: &[u8]) -> bool {
         && String::from_utf8_lossy(body)
             .to_ascii_lowercase()
             .contains("upstream access forbidden")
+}
+
+/// 某些中转不会返回标准的 model-not-found/403，而是把旧会话携带的
+/// Luna 模型统一包装成 502/503 Service temporarily unavailable。
+/// 仅对历史兼容链中明确的 Luna 模型启用学习，避免把普通上游抖动误判为
+/// 当前默认模型不可用。
+fn is_legacy_luna_unavailable(status: u16, body: &[u8], model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    if model != "gpt-5.6-luna" || !matches!(status, 502 | 503 | 504) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("service temporarily unavailable")
+        || text.contains("upstream service unavailable")
+        || text.contains("model unavailable")
+        || text.contains("model not available")
 }
 
 fn router_error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -1050,8 +1220,7 @@ fn should_resume_on_startup(
     resume_after_restart: bool,
     codex_running: bool,
 ) -> bool {
-    active_relay_known
-        && (has_router_evidence || (resume_after_restart && codex_running))
+    active_relay_known && (has_router_evidence || (resume_after_restart && codex_running))
 }
 
 /// 按状态还原真实 base_url
@@ -1213,11 +1382,13 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                 chain.push(p.clone());
             }
         }
-        for p in fallback_chain(
-            &profiles::current_active().unwrap_or(ActiveSelection::Official),
-            &relays,
-        ) {
-            chain.push(p.clone());
+        if load_state().auto_failover_enabled {
+            for p in fallback_chain(
+                &profiles::current_active().unwrap_or(ActiveSelection::Official),
+                &relays,
+            ) {
+                chain.push(p.clone());
+            }
         }
         chain
     };
@@ -1230,8 +1401,12 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
         .unwrap_or_default()
         .to_string();
     for p in chain.iter() {
-        let breaker_open = BREAKER.lock().map(|b| b.is_open(&p.id)).unwrap_or(false);
-        if breaker_open {
+        let auto_failover = load_state().auto_failover_enabled;
+        let breaker_open =
+            auto_failover && BREAKER.lock().map(|b| b.is_open(&p.id)).unwrap_or(false);
+        // 只有存在其它兼容候选时才跳过已熔断供应商。唯一供应商仍执行一次
+        // 真实请求并返回上游原始错误，避免把明确故障掩盖成 generic 502。
+        if breaker_open && chain.len() > 1 {
             continue;
         }
         let Some(pkey) = vault::get_relay_key(&p.id).ok().flatten() else {
@@ -1242,9 +1417,12 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
         // (fallback chain 里各供应商模型不同, 不能复用同一个 body)。
         let empty_reasoning_content = reasoning_policy_for(p);
         let incoming_model = request_model(&body);
-        let supported_models = if incoming_model
-            .as_deref()
-            .is_some_and(|model| model_denied(&p.id, model))
+        let approval_luna =
+            incoming_model.as_deref() == Some("gpt-5.6-luna") && is_approval_review_request(&body);
+        let supported_models = if approval_luna
+            || incoming_model
+                .as_deref()
+                .is_some_and(|model| model_denied(&p.id, model))
         {
             &[][..]
         } else {
@@ -1344,7 +1522,9 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                         .unwrap();
                 }
                 if status >= 500 || status == 429 {
-                    let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                    if auto_failover {
+                        let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                    }
                     let error_body = read_upstream_error_body(resp).await;
                     last_status = Some(status);
                     last_error = Some(upstream_http_failure(p, status, &error_body, &pkey));
@@ -1405,6 +1585,16 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                                                 "upstream rejected both reasoning schemas",
                                             );
                                         }
+                                        InitialStream::TransientFailure(message) => {
+                                            let _ =
+                                                BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                                            last_status = Some(502);
+                                            last_error = Some(format!(
+                                                "upstream {} ({}) stream failed before output after reasoning retry: {}",
+                                                p.name, p.id, message
+                                            ));
+                                            continue;
+                                        }
                                     }
                                 }
                                 Ok(retry) => {
@@ -1412,12 +1602,7 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                                     let bytes = read_upstream_error_body(retry).await;
                                     return router_error_response(
                                         status,
-                                        upstream_http_failure(
-                                            p,
-                                            status.as_u16(),
-                                            &bytes,
-                                            &pkey,
-                                        ),
+                                        upstream_http_failure(p, status.as_u16(), &bytes, &pkey),
                                     );
                                 }
                                 Err(e) => {
@@ -1428,6 +1613,143 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                                             p.name, p.id, e
                                         ),
                                     );
+                                }
+                            }
+                        }
+                        InitialStream::TransientFailure(message) => {
+                            let stream_model = incoming_model.as_deref();
+                            if let Some(model) = stream_model {
+                                if model != p.model && learn_denied_model(&p.id, model) {
+                                    log::warn!(
+                                        "relay {} rejected task model {} during SSE startup; retrying with default model {}",
+                                        p.name,
+                                        model,
+                                        p.model
+                                    );
+                                    return Box::pin(forward(method, uri, headers, body)).await;
+                                }
+                            }
+                            // HTTP 已是 200，但上游在首个有效输出前断流。此时尚未
+                            // 向 Codex 转发任何字节，可安全地用新连接重试一次；
+                            // 一旦出现正文/工具调用，inspect_initial_sse 会返回
+                            // Forward，后续断流绝不在这里重发。
+                            tokio::time::sleep(Duration::from_millis(UPSTREAM_RETRY_DELAYS_MS[0]))
+                                .await;
+                            let retry_http = client();
+                            match send_with_transient_retry(
+                                &retry_http,
+                                &method,
+                                &url,
+                                &headers,
+                                &pkey,
+                                &request_body,
+                            )
+                            .await
+                            {
+                                Ok(UpstreamAttempt::Response(retry_resp)) => {
+                                    let retry_status = retry_resp.status().as_u16();
+                                    if retry_status >= 400 {
+                                        let retry_body = read_upstream_error_body(retry_resp).await;
+                                        let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                                        last_status = Some(retry_status);
+                                        last_error = Some(format!(
+                                            "upstream {} ({}) stream retry failed after '{}': {}",
+                                            p.name,
+                                            p.id,
+                                            message,
+                                            upstream_error_snippet(&retry_body, &pkey)
+                                        ));
+                                        continue;
+                                    }
+                                    let retry_ct = retry_resp
+                                        .headers()
+                                        .get("content-type")
+                                        .and_then(|value| value.to_str().ok())
+                                        .unwrap_or("application/json")
+                                        .to_string();
+                                    if retry_ct.to_ascii_lowercase().contains("text/event-stream") {
+                                        match inspect_initial_sse(
+                                            retry_resp,
+                                            empty_reasoning_content,
+                                        )
+                                        .await
+                                        {
+                                            InitialStream::Forward(stream) => {
+                                                let _ = BREAKER
+                                                    .lock()
+                                                    .map(|mut b| b.record_success(&p.id));
+                                                if p.id != primary_id {
+                                                    record_fallback(&p.id);
+                                                }
+                                                return response_from_buffered_stream(
+                                                    retry_status,
+                                                    retry_ct,
+                                                    stream,
+                                                    p.clone(),
+                                                );
+                                            }
+                                            InitialStream::Retry(_) => {
+                                                let _ = BREAKER
+                                                    .lock()
+                                                    .map(|mut b| b.record_failure(&p.id));
+                                                last_status = Some(400);
+                                                last_error = Some(format!(
+                                                    "upstream {} ({}) changed reasoning schema during stream retry",
+                                                    p.name, p.id
+                                                ));
+                                                continue;
+                                            }
+                                            InitialStream::TransientFailure(retry_message) => {
+                                                let _ = BREAKER
+                                                    .lock()
+                                                    .map(|mut b| b.record_failure(&p.id));
+                                                last_status = Some(502);
+                                                last_error = Some(format!(
+                                                    "upstream {} ({}) stream failed before output twice: {}; {}",
+                                                    p.name, p.id, message, retry_message
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    let _ = BREAKER.lock().map(|mut b| b.record_success(&p.id));
+                                    return Response::builder()
+                                        .status(
+                                            StatusCode::from_u16(retry_status)
+                                                .unwrap_or(StatusCode::OK),
+                                        )
+                                        .header("content-type", retry_ct)
+                                        .body(Body::from_stream(retry_resp.bytes_stream()))
+                                        .unwrap();
+                                }
+                                Ok(UpstreamAttempt::HttpFailure {
+                                    status,
+                                    body: retry_body,
+                                    attempts,
+                                }) => {
+                                    let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                                    last_status = Some(status);
+                                    last_error = Some(format!(
+                                        "{}; initial stream failure: {}",
+                                        upstream_http_failure_after_attempts(
+                                            p,
+                                            status,
+                                            &retry_body,
+                                            &pkey,
+                                            attempts,
+                                        ),
+                                        message
+                                    ));
+                                    continue;
+                                }
+                                Err(error) => {
+                                    let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                                    last_status = None;
+                                    last_error = Some(format!(
+                                        "upstream {} ({}) transport retry failed after '{}': {}",
+                                        p.name, p.id, message, error
+                                    ));
+                                    continue;
                                 }
                             }
                         }
@@ -1447,11 +1769,21 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
             Ok(UpstreamAttempt::HttpFailure {
                 status,
                 body: error_body,
+                attempts,
             }) => {
-                let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                if auto_failover {
+                    let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                }
                 last_status = Some(status);
-                if is_access_forbidden_failure(status, &error_body) {
-                    if let Some(model) = request_model(&request_body) {
+                let request_model_name = request_model(&request_body);
+                if is_access_forbidden_failure(status, &error_body)
+                    || is_legacy_luna_unavailable(
+                        status,
+                        &error_body,
+                        request_model_name.as_deref(),
+                    )
+                {
+                    if let Some(model) = request_model_name {
                         if model != p.model && learn_denied_model(&p.id, &model) {
                             log::warn!(
                                 "relay {} rejected task model {}; retrying with default model {}",
@@ -1465,10 +1797,18 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                         }
                     }
                 }
-                last_error = Some(upstream_http_failure(p, status, &error_body, &pkey));
+                last_error = Some(upstream_http_failure_after_attempts(
+                    p,
+                    status,
+                    &error_body,
+                    &pkey,
+                    attempts,
+                ));
             }
             Err(e) => {
-                let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                if auto_failover {
+                    let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                }
                 last_status = None;
                 last_error = Some(format!(
                     "upstream {} ({}) transport error: {}",
@@ -1533,6 +1873,7 @@ pub fn status() -> RouterStatus {
         port: state.port,
         rewritten: takeover_verified,
         automatic: state.automatic,
+        manually_paused: manually_paused(),
         degraded: state.degraded || runtime_died,
         recovery_message: state
             .recovery_message
@@ -1542,7 +1883,16 @@ pub fn status() -> RouterStatus {
             ActiveSelection::Official => "official".to_string(),
         }),
         last_fallback,
+        auto_failover_enabled: state.auto_failover_enabled,
     }
+}
+
+pub fn manually_paused() -> bool {
+    MANUALLY_PAUSED.load(Ordering::Acquire)
+}
+
+fn set_manually_paused(paused: bool) {
+    MANUALLY_PAUSED.store(paused, Ordering::Release);
 }
 
 /// Codex 是否仍指向本地路由 (config 的 base_url 被改写且未还原)。
@@ -1858,27 +2208,54 @@ pub async fn resume_or_recover_startup() -> Result<RouterStatus, String> {
 pub async fn set_enabled(enabled: bool) -> Result<RouterStatus, String> {
     if enabled {
         return enable_with_mode(false).await;
-    } else {
-        // Codex 会缓存启动时的 provider/base_url，不会实时重读 config.toml。
-        // 此时停止 19331 即使已经还原配置，当前会话仍会继续访问本地端口并
-        // 报 502。保持现状并明确要求先退出 Codex，避免把正在进行的会话断掉。
-        if crate::session_manager::codex_running() && codex_may_depend_on_router() {
-            return Err(
-                "Codex / ChatGPT 当前仍在运行，不能直接关闭本地路由，否则当前会话会报 502。请先完全退出 Codex / ChatGPT，再关闭本地路由。"
-                    .to_string(),
-            );
+    }
+    disable_runtime(false)?;
+    Ok(status())
+}
+
+fn disable_runtime(force: bool) -> Result<(), String> {
+    // Codex 会缓存启动时的 provider/base_url，不会实时重读 config.toml。
+    // 默认仍保护正在进行的会话；只有用户看过悬浮确认并显式 force 才关闭。
+    if !force && crate::session_manager::codex_running() && codex_may_depend_on_router() {
+        return Err(
+            "Codex / ChatGPT 当前仍在运行，关闭本地路由可能中断当前会话。请确认后强制关闭，或先完全退出 Codex / ChatGPT。"
+                .to_string(),
+        );
+    }
+    let mut s = load_state();
+    restore_config(&mut s)?;
+    s.enabled = false;
+    s.automatic = false;
+    s.resume_after_restart = false;
+    save_state(&s)?;
+    if let Some(rt) = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(tx) = rt.shutdown {
+            let _ = tx.send(());
         }
-        let mut s = load_state();
-        restore_config(&mut s)?;
-        s.enabled = false;
-        s.automatic = false;
-        s.resume_after_restart = false;
-        save_state(&s)?;
-        if let Some(rt) = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            if let Some(tx) = rt.shutdown {
-                let _ = tx.send(());
+    }
+    Ok(())
+}
+
+/// 用户界面的显式开关。手动关闭后暂停本次运行期内的自动自愈；
+/// 手动开启清除暂停。暂停不落盘，App 重启后自然恢复。
+pub async fn set_manual_enabled(enabled: bool, force: bool) -> Result<RouterStatus, String> {
+    if enabled {
+        let was_paused = manually_paused();
+        set_manually_paused(false);
+        return match set_enabled(true).await {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                set_manually_paused(was_paused);
+                Err(error)
             }
-        }
+        };
+    }
+
+    let was_paused = manually_paused();
+    set_manually_paused(true);
+    if let Err(error) = disable_runtime(force) {
+        set_manually_paused(was_paused);
+        return Err(error);
     }
     Ok(status())
 }
@@ -2040,6 +2417,19 @@ data: {"type":"response.output_text.delta","delta":"hello"}
 
 "#;
         assert!(sse_has_valid_output(sse));
+    }
+
+    #[test]
+    fn generic_sse_failure_is_detected_before_output() {
+        let sse = br#"event: error
+data: {"type":"error","message":"Upstream request failed"}
+
+"#;
+        assert_eq!(
+            sse_terminal_failure(sse).as_deref(),
+            Some("event: error data: {\"type\":\"error\",\"message\":\"Upstream request failed\"}")
+        );
+        assert!(!sse_has_valid_output(sse));
     }
 
     #[test]
@@ -2296,6 +2686,67 @@ data: {"type":"response.completed","response":{"id":"r1","model":"deepseek-v4-pr
         assert!(!retryable_upstream_status(500, b"internal error"));
         assert!(!retryable_upstream_status(502, b"invalid account"));
         assert!(!retryable_upstream_status(429, b"too many requests"));
+    }
+
+    #[test]
+    fn legacy_luna_unavailable_is_learned_only_for_explicit_model_errors() {
+        assert!(is_legacy_luna_unavailable(
+            503,
+            b"Service temporarily unavailable",
+            Some("gpt-5.6-luna")
+        ));
+        assert!(is_legacy_luna_unavailable(
+            502,
+            b"Upstream service unavailable",
+            Some("gpt-5.6-luna")
+        ));
+        assert!(!is_legacy_luna_unavailable(
+            503,
+            b"Service temporarily unavailable",
+            Some("gpt-5.6-sol")
+        ));
+        assert!(!is_legacy_luna_unavailable(
+            503,
+            b"rate limit",
+            Some("gpt-5.6-luna")
+        ));
+    }
+
+    #[test]
+    fn approval_review_marker_is_narrowly_detected() {
+        let approval = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing. Treat it as evidence."}]}]}"#;
+        let ordinary = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"Please review this code change."}]}]}"#;
+        assert!(is_approval_review_request(approval));
+        assert!(!is_approval_review_request(ordinary));
+    }
+
+    #[test]
+    fn retry_after_is_bounded_and_ignores_http_dates() {
+        assert_eq!(retry_after_value_ms(Some("2")), Some(2_000));
+        assert_eq!(retry_after_value_ms(Some("30")), Some(10_000));
+        assert_eq!(
+            retry_after_value_ms(Some("Wed, 19 Aug 2026 02:00:00 GMT")),
+            None
+        );
+        assert_eq!(retry_after_value_ms(None), None);
+    }
+
+    #[test]
+    fn retry_diagnostic_reports_total_attempts() {
+        let profile = profiles::RelayProfile {
+            id: "relay-1".into(),
+            name: "测试中转".into(),
+            ..Default::default()
+        };
+        let diagnostic = upstream_http_failure_after_attempts(
+            &profile,
+            502,
+            b"Upstream service temporarily unavailable",
+            "",
+            4,
+        );
+        assert!(diagnostic.contains("returned 502"));
+        assert!(diagnostic.contains("已自动尝试 4 次"));
     }
 
     #[tokio::test]

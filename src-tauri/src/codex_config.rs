@@ -126,7 +126,7 @@ pub fn read_auth_json() -> Result<Option<Value>, CodexConfigError> {
     Ok(Some(serde_json::from_str(&text)?))
 }
 
-/// 官方 profile 激活: 会话统一开启时写共享 custom 桶；关闭时写原生 openai 桶。
+/// 官方 profile 激活始终写原生 openai 桶。
 /// 认证仍走 auth.json 官方登录。
 /// 清掉我们写过的中转表 (codexff_relay 标记) 和遗留中转形态 custom 表。
 /// 保留用户自己的其他 provider 配置。
@@ -138,12 +138,7 @@ pub fn write_official_config(
 ) -> Result<(), CodexConfigError> {
     let mut doc = parse_or_default(&read_config_text()?)?;
 
-    let unify_enabled = crate::session_unify::state().enabled;
-    doc["model_provider"] = value(if unify_enabled {
-        SHARED_MODEL_PROVIDER
-    } else {
-        OFFICIAL_MODEL_PROVIDER
-    });
+    doc["model_provider"] = value(OFFICIAL_MODEL_PROVIDER);
     // 顶层字段还原: Some(Some(v)) → 写回; Some(None) → 删除 (切换前没有)
     match restore_model {
         Some(Some(v)) => doc["model"] = value(v),
@@ -219,9 +214,6 @@ pub fn write_official_config(
             .collect();
         for key in ours {
             table.remove(&key);
-        }
-        if unify_enabled {
-            table.insert(SHARED_MODEL_PROVIDER, Item::Table(official_custom_table()));
         }
     }
 
@@ -763,11 +755,7 @@ pub fn write_relay_config(
         set_codex_model_catalog_field(&mut doc, true);
     } else if has_supported {
         // 任意中转: 只显示它真实支持的模型, 避免选了不支持的模型提交才报错
-        write_relay_model_catalog(
-            supported_models.unwrap_or_default(),
-            ctx_w,
-            ctx_c,
-        )?;
+        write_relay_model_catalog(supported_models.unwrap_or_default(), ctx_w, ctx_c)?;
         set_codex_model_catalog_field(&mut doc, true);
     } else {
         // 未知模型清单: 移除我们的目录文件, 避免下拉残留上一个供应商的模型
@@ -955,19 +943,40 @@ mod tests {
     #[test]
     fn effective_ctx_defaults_by_model() {
         // 显式值优先
-        assert_eq!(effective_ctx("gpt-5.6-sol", Some(400_000), Some(360_000)), (Some(400_000), Some(360_000)));
+        assert_eq!(
+            effective_ctx("gpt-5.6-sol", Some(400_000), Some(360_000)),
+            (Some(400_000), Some(360_000))
+        );
         // GPT 中转: 1M 窗口 + 压缩阈值封顶 22 万 (桌面端内置窗口 ~25.8 万,
         // 80 万阈值会在撞墙前永不触发 → 显式降低让 Codex 提前压缩)
-        assert_eq!(effective_ctx("gpt-5.6-sol", None, None), (Some(1_000_000), Some(220_000)));
+        assert_eq!(
+            effective_ctx("gpt-5.6-sol", None, None),
+            (Some(1_000_000), Some(220_000))
+        );
         // DeepSeek: 官方窗口
-        assert_eq!(effective_ctx("deepseek-v4-flash", None, None), (Some(1_048_576), Some(943_718)));
+        assert_eq!(
+            effective_ctx("deepseek-v4-flash", None, None),
+            (Some(1_048_576), Some(943_718))
+        );
         // 其它模型: Codex 默认 128k
-        assert_eq!(effective_ctx("my-custom-llm", None, None), (Some(128_000), Some(115_200)));
+        assert_eq!(
+            effective_ctx("my-custom-llm", None, None),
+            (Some(128_000), Some(115_200))
+        );
         // 只给窗口 → GPT 压缩阈值仍封顶 22 万; 其它模型自动 90%
-        assert_eq!(effective_ctx("gpt-5.5", Some(500_000), None), (Some(500_000), Some(220_000)));
-        assert_eq!(effective_ctx("my-custom-llm", Some(500_000), None), (Some(500_000), Some(450_000)));
+        assert_eq!(
+            effective_ctx("gpt-5.5", Some(500_000), None),
+            (Some(500_000), Some(220_000))
+        );
+        assert_eq!(
+            effective_ctx("my-custom-llm", Some(500_000), None),
+            (Some(500_000), Some(450_000))
+        );
         // 显式给的压缩阈值优先, 不被 22 万封顶覆盖
-        assert_eq!(effective_ctx("gpt-5.6-sol", Some(1_000_000), Some(900_000)), (Some(1_000_000), Some(900_000)));
+        assert_eq!(
+            effective_ctx("gpt-5.6-sol", Some(1_000_000), Some(900_000)),
+            (Some(1_000_000), Some(900_000))
+        );
     }
 
     #[test]

@@ -14,19 +14,16 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { listen } from "@tauri-apps/api/event";
 import { ProfilesPage } from "./pages/ProfilesPage";
-import { SessionsPage } from "./pages/SessionsPage";
 import { PetsPage } from "./pages/PetsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { WorkflowPage } from "./pages/WorkflowPage";
 import { FloatingToast, type ToastRequest } from "./FloatingToast";
 import { FirstRunGuide } from "./FirstRunGuide";
 
-type Tab = "profiles" | "sessions" | "workflow" | "pets" | "settings";
+type Tab = "profiles" | "workflow" | "pets" | "settings";
 
 function App() {
   const [tab, setTab] = useState<Tab>("profiles");
-  // 会话页首次打开后保持挂载，切换 Tab 时保留已加载列表、折叠和选中状态。
-  const [sessionsVisited, setSessionsVisited] = useState(false);
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -433,15 +430,6 @@ function App() {
             Profile 切换
           </button>
           <button
-            className={tab === "sessions" ? "tab active" : "tab"}
-            onClick={() => {
-              setSessionsVisited(true);
-              setTab("sessions");
-            }}
-          >
-            会话管理
-          </button>
-          <button
             className={tab === "workflow" ? "tab active" : "tab"}
             onClick={() => setTab("workflow")}
           >
@@ -478,11 +466,6 @@ function App() {
             switchingLabel={switchStep ?? undefined}
             onToast={setPageToast}
           />
-        )}
-        {sessionsVisited && (
-          <div style={{ display: tab === "sessions" ? "contents" : "none" }}>
-            <SessionsPage onToast={setPageToast} />
-          </div>
         )}
         {tab === "workflow" && <WorkflowPage onToast={setPageToast} />}
         {tab === "pets" && <PetsPage onToast={setPageToast} />}

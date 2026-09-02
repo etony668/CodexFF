@@ -144,32 +144,43 @@ pub(crate) fn system_proxy_url_for(target: &str) -> Option<String> {
 /// 通过进程名判断 PID 是否为常见代理客户端 (避免把普通本地服务当代理)。
 fn is_known_proxy_process(pid: u32) -> bool {
     const KEYWORDS: &[&str] = &[
-        "flclash", "clash", "mihomo", "sing-box", "singbox", "verge", "surge",
-        "v2ray", "xray", "shadowsocks", "ss-local", "naive", "hysteria",
-        "libcyber", "quantumult", "qv2ray", "trojan", "hiddify", "nekoray",
-        "stash", "outline",
+        "flclash",
+        "clash",
+        "mihomo",
+        "sing-box",
+        "singbox",
+        "verge",
+        "surge",
+        "v2ray",
+        "xray",
+        "shadowsocks",
+        "ss-local",
+        "naive",
+        "hysteria",
+        "libcyber",
+        "quantumult",
+        "qv2ray",
+        "trojan",
+        "hiddify",
+        "nekoray",
+        "stash",
+        "outline",
     ];
     // 进程名 (core-darwin-arm64 这类不带产品名的进程也要能识别)
     if let Ok(out) = std::process::Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .output()
     {
-        let name = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+        let name = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .to_ascii_lowercase();
         if KEYWORDS.iter().any(|k| name.contains(k)) {
             return true;
         }
     }
     // 进程名不含关键字时, 看可执行路径 (如 /Applications/LibCyber Desktop.app/...)
     if let Ok(out) = std::process::Command::new("/usr/sbin/lsof")
-        .args([
-            "-nP",
-            "-a",
-            "-p",
-            &pid.to_string(),
-            "-d",
-            "txt",
-            "-Fn",
-        ])
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-d", "txt", "-Fn"])
         .output()
     {
         let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();

@@ -26,11 +26,7 @@ static TEST_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 fn storage_dir() -> std::path::PathBuf {
     #[cfg(test)]
     {
-        if let Some(d) = TEST_DIR
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
+        if let Some(d) = TEST_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return d;
         }
     }
@@ -76,6 +72,8 @@ pub struct UsageLogEntry {
 pub struct DailyPoint {
     pub date: String,
     pub balance: Option<f64>,
+    /// 当日请求消耗的 token 数
+    pub tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,9 +145,7 @@ pub fn record_balance(
     let ts = now_ms();
     let day = ts / 86_400_000;
     let mut items = read_snapshots();
-    items.retain(|s| {
-        !(s.provider_id == provider_id && s.ts_ms / 86_400_000 == day)
-    });
+    items.retain(|s| !(s.provider_id == provider_id && s.ts_ms / 86_400_000 == day));
     items.push(BalanceSnapshot {
         ts_ms: ts,
         provider_id: provider_id.to_string(),
@@ -227,6 +223,7 @@ pub fn overview() -> UsageOverview {
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut cache_by_provider: HashMap<String, (u64, u64)> = HashMap::new();
     let mut name_by_provider: HashMap<String, String> = HashMap::new();
+    let mut tokens_by_provider_day: HashMap<(String, String), u64> = HashMap::new();
 
     for s in snaps.iter() {
         let pos = match index.get(&s.provider_id) {
@@ -246,8 +243,7 @@ pub fn overview() -> UsageOverview {
         };
         let p = &mut by_provider[pos];
         p.provider_name = s.provider_name.clone();
-        if p
-            .latest
+        if p.latest
             .as_ref()
             .map(|l: &BalanceSnapshot| s.ts_ms > l.ts_ms)
             .unwrap_or(true)
@@ -257,10 +253,17 @@ pub fn overview() -> UsageOverview {
         p.series.push(DailyPoint {
             date: day_str(s.ts_ms),
             balance: s.balance,
+            tokens: 0,
         });
     }
 
     for l in logs.iter().filter(|l| l.ts_ms >= cutoff) {
+        let day = day_str(l.ts_ms);
+        if let Some(tokens) = l.total_tokens {
+            *tokens_by_provider_day
+                .entry((l.provider_id.clone(), day))
+                .or_default() += tokens;
+        }
         name_by_provider
             .entry(l.provider_id.clone())
             .or_insert_with(|| l.provider_name.clone());
@@ -305,7 +308,15 @@ pub fn overview() -> UsageOverview {
                 .find(|d| d.date == date)
                 .map(|d| d.balance)
                 .flatten();
-            filled.push(DailyPoint { date, balance: val });
+            let tokens = tokens_by_provider_day
+                .get(&(p.provider_id.clone(), date.clone()))
+                .copied()
+                .unwrap_or(0);
+            filled.push(DailyPoint {
+                date,
+                balance: val,
+                tokens,
+            });
         }
         p.series = filled;
     }
@@ -366,8 +377,22 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         *TEST_DIR.lock().unwrap() = Some(tmp.clone());
         *crate::session_usage::TEST_DIR.lock().unwrap() = Some(tmp.clone());
-        record_balance("p1", "甲", Some(10.0), Some("CNY".into()), Some(20.0), Some(10.0));
-        record_balance("p1", "甲", Some(9.5), Some("CNY".into()), Some(20.0), Some(10.5));
+        record_balance(
+            "p1",
+            "甲",
+            Some(10.0),
+            Some("CNY".into()),
+            Some(20.0),
+            Some(10.0),
+        );
+        record_balance(
+            "p1",
+            "甲",
+            Some(9.5),
+            Some("CNY".into()),
+            Some(20.0),
+            Some(10.5),
+        );
         let snaps = read_snapshots();
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].balance, Some(9.5));

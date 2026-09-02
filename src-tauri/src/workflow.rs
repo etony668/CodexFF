@@ -70,9 +70,8 @@ pub fn list_model_sources() -> Vec<WorkflowModelSource> {
 }
 
 /// Codex 支持的思考档位 (含社区常见的 minimal)
-pub const ALLOWED_EFFORTS: [&str; 7] = [
-    "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-];
+pub const ALLOWED_EFFORTS: [&str; 7] =
+    ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
@@ -277,7 +276,10 @@ pub fn list_workflow_agents() -> Result<WorkflowAgentsResult, WorkflowError> {
     }
     // 预设优先, 其次按名称排序
     agents.sort_by_key(|a| {
-        let order = PRESET_IDS.iter().position(|p| *p == a.id).unwrap_or(usize::MAX);
+        let order = PRESET_IDS
+            .iter()
+            .position(|p| *p == a.id)
+            .unwrap_or(usize::MAX);
         (order, a.id.clone())
     });
     // 未安装的预设也补齐展示 (backup 可能存在)
@@ -299,7 +301,10 @@ pub fn list_workflow_agents() -> Result<WorkflowAgentsResult, WorkflowError> {
         }
     }
     agents.sort_by_key(|a| {
-        let order = PRESET_IDS.iter().position(|p| *p == a.id).unwrap_or(usize::MAX);
+        let order = PRESET_IDS
+            .iter()
+            .position(|p| *p == a.id)
+            .unwrap_or(usize::MAX);
         (order, a.id.clone())
     });
     Ok(WorkflowAgentsResult {
@@ -433,10 +438,8 @@ mod tests {
         let _env = crate::test_util::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!(
-            "codexff-workflow-test-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("codexff-workflow-test-{}", std::process::id()));
         let agents = tmp.join("agents");
         std::fs::create_dir_all(&agents).unwrap();
         // 临时目录, 用 CODEX_HOME 指向它 (每次调用实时读取)

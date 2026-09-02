@@ -110,7 +110,7 @@ fn unified_state_path() -> PathBuf {
 
 fn project_visibility_backup_path(provider: &str) -> PathBuf {
     vault::vault_dir()
-        .join("project-visibility-backup")
+        .join("project-visibility-index")
         .join(format!("{provider}.json"))
 }
 
@@ -625,7 +625,12 @@ pub fn sync_project_visibility(provider: &str) -> Result<(), session_manager::Se
     }
     let source_sha256 = sha256_file(&path)?;
     let mut root: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    restore_project_visibility(provider, &mut root)?;
+    // 每次都先合并两个渠道的轻量项目索引，再按目标渠道过滤。这里保存的
+    // 只有项目名、路径、顺序和线程映射，不包含 rollout 正文或会话备份。
+    // 若只恢复目标渠道自身的索引，第一次从 custom 切到 openai 时，
+    // IdeaHatch 会因为上一轮已从全局状态移除而无法重新出现。
+    restore_project_visibility(OPENAI_BUCKET, &mut root)?;
+    restore_project_visibility(SHARED_BUCKET, &mut root)?;
     let Some(obj) = root.as_object_mut() else {
         return Ok(());
     };
@@ -845,6 +850,312 @@ fn all_session_files() -> Vec<(PathBuf, bool)> {
 
 fn current_ledger_path(generation: &str) -> PathBuf {
     unify_backup_root().join(generation).join("ledger.json")
+}
+
+const RETIRE_MARKER: &str = "session-management-retired.json";
+
+/// 一次性退役旧会话管理：把 IdeaHatch 恢复为官方桶，其余线程归入
+/// 第三方桶；先做 APFS 写时复制快照，校验文件/ID/SQLite 完整后才
+/// 删除所有退役期间的备份。该流程只在 Codex/ChatGPT 完全退出时执行。
+pub fn retire_session_management(
+    progress: &dyn Fn(&str),
+) -> Result<bool, session_manager::SessionError> {
+    let marker = vault::vault_dir().join(RETIRE_MARKER);
+    if marker.exists() {
+        return Ok(true);
+    }
+    if session_manager::codex_running() {
+        return Ok(false);
+    }
+
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let recovery_root = vault::vault_dir()
+        .join("recovery-backups")
+        .join(format!("session-management-retire-{stamp}"));
+    // 先为当前普通会话、隔离标记与索引创建写时复制快照。隔离会话若仍在
+    // 金库，也会随整个 quarantine 目录一并被保留；因此后续解除隔离失败
+    // 或进程中断时仍可从这一快照恢复。
+    let before_normal = all_session_files()
+        .into_iter()
+        .filter_map(|(path, archived)| {
+            file_meta(&path).map(|(session_id, thread_id, provider)| {
+                (
+                    relative_session_path(&path),
+                    archived,
+                    session_id,
+                    thread_id,
+                    provider,
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    progress(&format!(
+        "创建会话退役安全快照（{} 个当前会话文件，使用写时复制）…",
+        before_normal.len()
+    ));
+    for (rel, _, _, _, _, _) in &before_normal {
+        copy_snapshot_file(
+            &codex_dir().join(rel),
+            &recovery_root.join("sessions").join(rel),
+        )?;
+    }
+    for (name, path) in [
+        ("state_5.sqlite", codex_config::codex_state_db_path()),
+        (
+            "global-state.json",
+            codex_config::codex_config_dir().join(".codex-global-state.json"),
+        ),
+        (
+            "session_index.jsonl",
+            codex_config::codex_config_dir().join("session_index.jsonl"),
+        ),
+        (
+            "isolated-sessions.json",
+            vault::vault_dir().join("isolated-sessions.json"),
+        ),
+    ] {
+        if path.exists() {
+            copy_snapshot_file(&path, &recovery_root.join("state").join(name))?;
+        }
+    }
+    let quarantine = vault::vault_dir().join("session-quarantine");
+    if quarantine.exists() {
+        let mut quarantine_files = Vec::new();
+        walk_jsonl(&quarantine, &mut quarantine_files);
+        for source in quarantine_files {
+            let rel = source.strip_prefix(&quarantine).unwrap_or(source.as_path());
+            copy_snapshot_file(&source, &recovery_root.join("quarantine").join(rel))?;
+        }
+    }
+
+    // 快照落盘以后才解除历史隔离。该步骤只移动文件/索引，不改写正文。
+    session_manager::sync_session_isolation_for(false, progress)?;
+    let before = all_session_files()
+        .into_iter()
+        .filter_map(|(path, archived)| {
+            file_meta(&path).map(|(session_id, thread_id, provider)| {
+                (
+                    relative_session_path(&path),
+                    archived,
+                    session_id,
+                    thread_id,
+                    provider,
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let db_path = codex_config::codex_state_db_path();
+    let mut projects = HashMap::<String, String>::new();
+    if db_path.exists() {
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, COALESCE(p.name, '') FROM threads t \
+             LEFT JOIN projects p ON p.id=t.project_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            projects.insert(row.0, row.1.trim().to_string());
+        }
+    }
+
+    let mut expected_provider = HashMap::<String, &'static str>::new();
+    for thread_id in projects.keys() {
+        let target = if projects
+            .get(thread_id)
+            .is_some_and(|name| name == "IdeaHatch")
+        {
+            OPENAI_BUCKET
+        } else {
+            SHARED_BUCKET
+        };
+        expected_provider.insert(thread_id.clone(), target);
+    }
+
+    let mut official_threads = HashSet::new();
+    for (path, _) in all_session_files() {
+        let Some((_, thread_id, provider)) = file_meta(&path) else {
+            continue;
+        };
+        let target = expected_provider
+            .get(&thread_id)
+            .copied()
+            .unwrap_or(SHARED_BUCKET);
+        if target == OPENAI_BUCKET {
+            official_threads.insert(thread_id);
+        }
+        if provider != target {
+            if provider != OPENAI_BUCKET && provider != SHARED_BUCKET {
+                return Err(session_manager::SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "会话 {} 使用了未知渠道桶 {provider}，为避免误改已停止退役迁移",
+                        path.display()
+                    ),
+                )));
+            }
+            let changed = rewrite_provider_in_place(&path, &provider, target)?;
+            if !changed {
+                return Err(session_manager::SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("无法校验或改写会话渠道桶: {}", path.display()),
+                )));
+            }
+        }
+    }
+
+    if db_path.exists() {
+        let mut conn = Connection::open(&db_path)?;
+        conn.busy_timeout(Duration::from_secs(10))?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare("SELECT t.id, COALESCE(p.name, '') FROM threads t LEFT JOIN projects p ON p.id=t.project_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            let (id, name) = row;
+            let target = if name.trim() == "IdeaHatch" {
+                OPENAI_BUCKET
+            } else {
+                SHARED_BUCKET
+            };
+            tx.execute(
+                "UPDATE threads SET model_provider=?1 WHERE id=?2",
+                [target, id.as_str()],
+            )?;
+        }
+        drop(stmt);
+        tx.commit()?;
+    }
+
+    let after = all_session_files()
+        .into_iter()
+        .filter_map(|(path, archived)| {
+            file_meta(&path).map(|(session_id, thread_id, provider)| {
+                (
+                    relative_session_path(&path),
+                    archived,
+                    session_id,
+                    thread_id,
+                    provider,
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut before_ids = before
+        .iter()
+        .map(|(p, a, s, t, _, z)| (p.clone(), *a, s.clone(), t.clone(), *z))
+        .collect::<Vec<_>>();
+    let mut after_ids = after
+        .iter()
+        .map(|(p, a, s, t, _, z)| (p.clone(), *a, s.clone(), t.clone(), *z))
+        .collect::<Vec<_>>();
+    before_ids.sort();
+    after_ids.sort();
+    if before_ids != after_ids || after.len() != before.len() {
+        return Err(session_manager::SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "会话退役校验失败：文件/ID/大小不一致（迁移前 {}，迁移后 {}）",
+                before.len(),
+                after.len()
+            ),
+        )));
+    }
+    let mut official_count = 0usize;
+    for (_, _, _, thread, provider, _) in &after {
+        let target = expected_provider
+            .get(thread)
+            .copied()
+            .unwrap_or(SHARED_BUCKET);
+        if provider != target {
+            return Err(session_manager::SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("会话 {thread} 的渠道桶校验失败：期望 {target}，实际 {provider}"),
+            )));
+        }
+        if official_threads.contains(thread) && provider == OPENAI_BUCKET {
+            official_count += 1;
+        }
+    }
+    if official_count == 0 && !official_threads.is_empty() {
+        return Err(session_manager::SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IdeaHatch 会话归属校验失败",
+        )));
+    }
+    if db_path.exists() {
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.model_provider, COALESCE(p.name, '') FROM threads t \
+             LEFT JOIN projects p ON p.id=t.project_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (thread_id, provider, project_name) = row;
+            let target = if project_name.trim() == "IdeaHatch" {
+                OPENAI_BUCKET
+            } else {
+                SHARED_BUCKET
+            };
+            if provider != target {
+                return Err(session_manager::SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "SQLite 会话 {thread_id} 的渠道桶校验失败：期望 {target}，实际 {provider}"
+                    ),
+                )));
+            }
+        }
+    }
+    session_manager::clear_isolated_session_markers()?;
+    // 归属已验证，所有历史统一/增量备份、项目可见性备份、隔离目录与本次
+    // 写时复制快照均不再保留。这里的删除发生在所有文件和 SQLite 校验之后。
+    if let Ok(entries) = std::fs::read_dir(unify_backup_root()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(unified_state_path());
+    let _ = std::fs::remove_dir_all(vault::vault_dir().join("project-visibility-backup"));
+    let _ = std::fs::remove_dir_all(vault::vault_dir().join("project-visibility-index"));
+    let _ = std::fs::remove_dir_all(vault::vault_dir().join("session-quarantine"));
+    let _ = std::fs::remove_file(vault::vault_dir().join("isolated-sessions.json"));
+    std::fs::remove_dir_all(&recovery_root)?;
+    vault::atomic_write_bytes(
+        &marker,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "retired_at": chrono::Local::now().to_rfc3339(),
+            "session_files": after.len(),
+            "official_ideahatch_files": official_count,
+            "validated": true,
+            "backups_removed": true,
+        }))?
+        .as_slice(),
+    )
+    .map_err(|e| session_manager::SessionError::Io(std::io::Error::other(e)))?;
+    progress("会话管理已退役，归属恢复与完整性校验通过。");
+    Ok(true)
 }
 
 fn load_current_ledger(generation: &str) -> Result<UnifiedLedger, session_manager::SessionError> {
@@ -1512,7 +1823,8 @@ fn rewrite_jsonl_file(
         if start < n {
             line.extend_from_slice(&buf[start..n]);
         }
-        if line.len() > MAX_BUFFER_LINE && !line.windows(META_MARKER.len()).any(|w| w == META_MARKER)
+        if line.len() > MAX_BUFFER_LINE
+            && !line.windows(META_MARKER.len()).any(|w| w == META_MARKER)
         {
             writer.write_all(&line)?;
             line.clear();
@@ -1574,10 +1886,7 @@ fn rewrite_meta_bucket(
     if payload.get("model_provider")?.as_str()? != from {
         return None;
     }
-    payload.insert(
-        "model_provider".to_string(),
-        Value::String(to.to_string()),
-    );
+    payload.insert("model_provider".to_string(), Value::String(to.to_string()));
     let mut out = serde_json::to_string(&v).ok()?;
     out.push('\n');
     Some(out.into_bytes())
@@ -1806,9 +2115,8 @@ pub fn migrate_selected(
         }
         std::fs::copy(path, &backup_path)?;
         let selected = selected.clone();
-        let rewrite = |line: &[u8]| {
-            rewrite_meta_bucket(line, &selected, true, OPENAI_BUCKET, SHARED_BUCKET)
-        };
+        let rewrite =
+            |line: &[u8]| rewrite_meta_bucket(line, &selected, true, OPENAI_BUCKET, SHARED_BUCKET);
         rewrite_jsonl_file(path, &rewrite)?;
         session_ids.push(session_id.clone());
     }
@@ -1926,9 +2234,8 @@ pub fn restore_from_backup(
         }
         std::fs::copy(path, &backup_path)?;
         let selected = selected_sessions.clone();
-        let rewrite = |line: &[u8]| {
-            rewrite_meta_bucket(line, &selected, false, SHARED_BUCKET, OPENAI_BUCKET)
-        };
+        let rewrite =
+            |line: &[u8]| rewrite_meta_bucket(line, &selected, false, SHARED_BUCKET, OPENAI_BUCKET);
         if rewrite_jsonl_file(path, &rewrite)? {
             restored_files += 1;
         }
@@ -1971,15 +2278,15 @@ mod tests {
         let line = br#"{"timestamp":"t","type":"session_meta","payload":{"id":"s1","session_id":"t1","model_provider":"openai"}}
 "#;
         let selected = HashSet::from(["other".to_string()]);
-        assert!(rewrite_meta_bucket(&line[..], &selected, true, OPENAI_BUCKET, SHARED_BUCKET).is_none());
+        assert!(
+            rewrite_meta_bucket(&line[..], &selected, true, OPENAI_BUCKET, SHARED_BUCKET).is_none()
+        );
     }
 
     #[test]
     fn rewrite_jsonl_streams_huge_lines() {
-        let dir = std::env::temp_dir().join(format!(
-            "codexff-unify-rewrite-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("codexff-unify-rewrite-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create dir");
         let path = dir.join("rollout.jsonl");
@@ -1989,19 +2296,15 @@ mod tests {
         std::fs::write(&path, format!("{meta}{huge}")).expect("write file");
 
         let selected = HashSet::from(["t1".to_string()]);
-        let rewrite = |line: &[u8]| {
-            rewrite_meta_bucket(line, &selected, true, OPENAI_BUCKET, SHARED_BUCKET)
-        };
+        let rewrite =
+            |line: &[u8]| rewrite_meta_bucket(line, &selected, true, OPENAI_BUCKET, SHARED_BUCKET);
         let changed = rewrite_jsonl_file(&path, &rewrite).expect("rewrite");
         assert!(changed);
 
         let text = std::fs::read_to_string(&path).expect("read back");
         let first_line = text.lines().next().expect("first line");
         let v: Value = serde_json::from_str(first_line).expect("valid json");
-        assert_eq!(
-            v["payload"]["model_provider"].as_str(),
-            Some("custom")
-        );
+        assert_eq!(v["payload"]["model_provider"].as_str(), Some("custom"));
         assert_eq!(v["payload"]["session_id"].as_str(), Some("t1"));
         assert!(text.len() > 70 * 1024 * 1024);
         std::fs::remove_dir_all(&dir).ok();
@@ -2034,10 +2337,8 @@ mod tests {
 
     #[test]
     fn state_db_bucket_update() {
-        let path = std::env::temp_dir().join(format!(
-            "codexff-unify-db-{}.sqlite",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("codexff-unify-db-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let conn = Connection::open(&path).expect("open db");

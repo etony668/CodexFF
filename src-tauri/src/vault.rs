@@ -73,7 +73,7 @@ pub enum VaultError {
     Keyring(String),
 }
 
-/// vault 根目录 (~/.codexff/vault 或 env CODEXFF_VAULT_DIR 覆盖)
+/// vault 根目录 (~/Library/Application Support/codexff/vault 或 env CODEXFF_VAULT_DIR 覆盖)
 pub fn vault_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CODEXFF_VAULT_DIR") {
         let trimmed = dir.trim();
@@ -85,6 +85,57 @@ pub fn vault_dir() -> PathBuf {
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
         .join("codexff")
         .join("vault")
+}
+
+/// 一次性启动迁移: 将旧的大写 `CodexFF` 用户数据目录合并到小写 `codexff`。
+///
+/// 默认 macOS APFS 不区分大小写, `codexff` 与 `CodexFF` 指向同一物理目录,
+/// 此时无需迁移 (也绝不能尝试把目录移动到它自己身上)。仅在区分大小写的文件系统上,
+/// 当旧的大写目录真实存在且与小写目录为不同物理路径时, 才把其下条目并入小写目录。
+///
+/// 幂等: 重复调用安全; 通过 env (CODEXFF_VAULT_DIR / CODEXFF_DATA_DIR) 覆盖路径时跳过。
+pub fn migrate_legacy_data_dir_if_needed() {
+    // env 覆盖场景下路径由测试/用户指定, 不做迁移
+    if std::env::var("CODEXFF_VAULT_DIR").is_ok() || std::env::var("CODEXFF_DATA_DIR").is_ok() {
+        return;
+    }
+    let data_dir = match dirs::data_dir() {
+        Some(d) => d,
+        None => {
+            return;
+        }
+    };
+    let legacy = data_dir.join("CodexFF");
+    if !legacy.exists() {
+        return;
+    }
+    let canonical = data_dir.join("codexff");
+    // 区分大小写判定: 若两者 canonicalize 后相同, 物理为同一目录, 跳过移动自身
+    if let (Ok(l), Ok(c)) = (legacy.canonicalize(), canonical.canonicalize()) {
+        if l == c {
+            return;
+        }
+    }
+    if fs::create_dir_all(&canonical).is_err() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(&legacy) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let dst = canonical.join(&name);
+            if dst.exists() {
+                // 同名已存在则保留现有、不覆盖 (各子目录名本不冲突)
+                continue;
+            }
+            let _ = fs::rename(entry.path(), &dst);
+        }
+    }
+    // 旧目录已空则清理
+    if let Ok(iter) = fs::read_dir(&legacy) {
+        if iter.count() == 0 {
+            let _ = fs::remove_dir(&legacy);
+        }
+    }
 }
 
 fn official_auth_path() -> PathBuf {
@@ -415,10 +466,15 @@ pub fn restore_config_backup() -> Result<(), VaultError> {
 // 只访问一个钥匙串条目，避免每个供应商各弹一次授权。磁盘上的
 // secrets.v1.json 永远只有密文；旧版明文 relay-keys.json / official-auth.json
 // 首次读取后会迁移并删除。
-const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+// 首次访问或 App 被替换后，macOS 可能显示钥匙串授权窗口。3 秒会在用户
+// 尚未来得及点击时误报 vault 读取失败；保留上限是为了避免系统服务永久挂起。
+const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MASTER_SERVICE: &str = "com.codexff.vault.v2";
 const MASTER_ACCOUNT: &str = "encryption-master-key";
 static MASTER_KEY_CACHE: LazyLock<Mutex<Option<[u8; 32]>>> = LazyLock::new(|| Mutex::new(None));
+// 单飞锁：启动阶段状态、许可证、供应商可能同时访问 vault。只允许一次
+// Keychain 读取/授权，其余调用等待缓存，避免重复弹窗和竞态生成不同主密钥。
+static MASTER_KEY_INIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEST_SECRETS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -468,6 +524,13 @@ fn master_key() -> Result<[u8; 32], VaultError> {
     if let Some(key) = *MASTER_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
         return Ok(key);
     }
+    let _init = MASTER_KEY_INIT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // 等锁期间另一个调用可能已完成初始化。
+    if let Some(key) = *MASTER_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Ok(key);
+    }
     let existing = keyring_call(|| {
         let entry =
             keyring::Entry::new(MASTER_SERVICE, MASTER_ACCOUNT).map_err(|e| e.to_string())?;
@@ -477,7 +540,9 @@ fn master_key() -> Result<[u8; 32], VaultError> {
             Err(e) => Err(e.to_string()),
         }
     })?
-    .ok_or_else(|| VaultError::Keyring("读取钥匙串主密钥超时".into()))?;
+    .ok_or_else(|| {
+        VaultError::Keyring("等待 macOS 钥匙串授权超时，请允许 CodexFF Pro 访问后重试".into())
+    })?;
     let key = if let Some(encoded) = existing {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
@@ -485,6 +550,14 @@ fn master_key() -> Result<[u8; 32], VaultError> {
         <[u8; 32]>::try_from(bytes.as_slice())
             .map_err(|_| VaultError::Keyring("钥匙串主密钥长度无效".into()))?
     } else {
+        // 已有密文却没有原主密钥时绝不能生成新密钥，否则旧数据必然无法解密，
+        // 且错误会被误认为“vault 损坏”。让用户先恢复钥匙串条目。
+        if secrets_path().exists() {
+            return Err(VaultError::Keyring(
+                "钥匙串中缺少 CodexFF Pro 主密钥，现有 vault 密文未被覆盖；请恢复钥匙串或原 App 授权后重试"
+                    .into(),
+            ));
+        }
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
         let encoded = base64::engine::general_purpose::STANDARD.encode(key);
@@ -494,7 +567,9 @@ fn master_key() -> Result<[u8; 32], VaultError> {
             entry.set_password(&encoded).map_err(|e| e.to_string())
         })?;
         if saved.is_none() {
-            return Err(VaultError::Keyring("写入钥匙串主密钥超时".into()));
+            return Err(VaultError::Keyring(
+                "等待 macOS 钥匙串写入授权超时，请允许后重试".into(),
+            ));
         }
         key
     };

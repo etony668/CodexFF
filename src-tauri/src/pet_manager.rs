@@ -103,7 +103,9 @@ fn read_pet_meta(dir: &Path) -> Result<Option<PetMeta>, PetError> {
     let sprite_path = dir.join(&sprite_name);
     let (size_bytes, dims) = if sprite_path.exists() {
         (
-            std::fs::metadata(&sprite_path).map(|m| m.len()).unwrap_or(0),
+            std::fs::metadata(&sprite_path)
+                .map(|m| m.len())
+                .unwrap_or(0),
             image_dimensions(&sprite_path),
         )
     } else {
@@ -237,7 +239,9 @@ pub fn import_zip(_file_name: &str, data_base64: &str) -> Result<PetMeta, PetErr
         .status()?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&tmp);
-        return Err(PetError::Invalid("ZIP 解压失败，文件可能损坏或不是有效压缩包".into()));
+        return Err(PetError::Invalid(
+            "ZIP 解压失败，文件可能损坏或不是有效压缩包".into(),
+        ));
     }
     let result = install_from_dir(&extract, false);
     let _ = std::fs::remove_dir_all(&tmp);
@@ -254,7 +258,10 @@ pub fn import_folder(files: Vec<PetFileInput>) -> Result<PetMeta, PetError> {
         let rel = Path::new(&f.path);
         if rel.is_absolute()
             || rel.components().any(|c| {
-                matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
             })
         {
             let _ = std::fs::remove_dir_all(&tmp);
@@ -300,14 +307,11 @@ fn install_from_dir(dir: &Path, replace: bool) -> Result<PetMeta, PetError> {
     let text = std::fs::read_to_string(&json_path)?;
     let pj: PetJson = serde_json::from_str(&text)
         .map_err(|e| PetError::Invalid(format!("pet.json 解析失败: {e}")))?;
-    let raw_id = pj
-        .id
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            pj.display_name
-                .clone()
-                .unwrap_or_else(|| "custom-pet".to_string())
-        });
+    let raw_id = pj.id.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        pj.display_name
+            .clone()
+            .unwrap_or_else(|| "custom-pet".to_string())
+    });
     let id = sanitize_id(&raw_id)
         .ok_or_else(|| PetError::Invalid(format!("宠物 id 含非法字符: {raw_id}")))?;
     let version = pj.sprite_version_number.unwrap_or(1);
@@ -451,8 +455,7 @@ fn validated_pet_command(command: &str) -> Result<(String, Vec<String>), PetErro
             .any(|token| trimmed.contains(token))
     {
         return Err(PetError::Invalid(
-            "为保护本机安全，只支持单条官方宠物安装命令，不支持脚本拼接、重定向或多行 shell"
-                .into(),
+            "为保护本机安全，只支持单条官方宠物安装命令，不支持脚本拼接、重定向或多行 shell".into(),
         ));
     }
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
@@ -632,7 +635,10 @@ pub fn install_from_command(
     result?;
 
     let after = list_pets()?;
-    Ok(after.into_iter().filter(|p| !before.contains(&p.id)).collect())
+    Ok(after
+        .into_iter()
+        .filter(|p| !before.contains(&p.id))
+        .collect())
 }
 
 /// 请求取消当前正在执行的命令安装 (终止整个进程组)。
@@ -781,7 +787,10 @@ mod tests {
             "npx petdex install ../escape",
         ] {
             let result = validated_pet_command(command);
-            assert!(matches!(result, Err(PetError::Invalid(_))), "{command}: {result:?}");
+            assert!(
+                matches!(result, Err(PetError::Invalid(_))),
+                "{command}: {result:?}"
+            );
         }
     }
 }

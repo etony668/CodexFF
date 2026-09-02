@@ -24,11 +24,7 @@ pub(crate) static TEST_DIR: std::sync::Mutex<Option<std::path::PathBuf>> =
 fn storage_dir() -> std::path::PathBuf {
     #[cfg(test)]
     {
-        if let Some(d) = TEST_DIR
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
+        if let Some(d) = TEST_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return d;
         }
     }
@@ -39,11 +35,7 @@ fn storage_dir() -> std::path::PathBuf {
 fn session_roots() -> Vec<PathBuf> {
     #[cfg(test)]
     {
-        if let Some(d) = TEST_DIR
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
+        if let Some(d) = TEST_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return vec![d.join("sessions"), d.join("archived_sessions")];
         }
     }
@@ -201,7 +193,10 @@ pub fn scan() -> SessionUsageSummary {
             .unwrap_or(0);
         let size = meta.len();
         let cached = cache.files.get(&key);
-        if cached.map(|c| c.mtime_ms == mtime && c.size == size).unwrap_or(false) {
+        if cached
+            .map(|c| c.mtime_ms == mtime && c.size == size)
+            .unwrap_or(false)
+        {
             continue;
         }
         let (requests, tokens, cost, last_ts) = parse_file(path);

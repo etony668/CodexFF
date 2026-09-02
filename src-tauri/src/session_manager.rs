@@ -104,11 +104,13 @@ pub(crate) fn normal_root(archived: bool) -> std::path::PathBuf {
 }
 
 pub(crate) fn quarantine_root(archived: bool) -> std::path::PathBuf {
-    vault::vault_dir().join("session-quarantine").join(if archived {
-        "archived_sessions"
-    } else {
-        "sessions"
-    })
+    vault::vault_dir()
+        .join("session-quarantine")
+        .join(if archived {
+            "archived_sessions"
+        } else {
+            "sessions"
+        })
 }
 
 /// 移动会话文件 — 安全迁移:
@@ -172,10 +174,7 @@ fn copy_file_safe(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "session".to_string());
-    let tmp = parent.join(format!(
-        ".{name}.codexff-tmp-{}",
-        std::process::id()
-    ));
+    let tmp = parent.join(format!(".{name}.codexff-tmp-{}", std::process::id()));
     let result = (|| -> std::io::Result<()> {
         let mut input = std::fs::File::open(src)?;
         let mut output = std::fs::File::create(&tmp)?;
@@ -183,10 +182,7 @@ fn copy_file_safe(
         let mut copied: u64 = 0;
         let mut last_pct: u64 = 0;
         let total_mb = src_len as f64 / (1024.0 * 1024.0);
-        progress(&format!(
-            "复制会话文件 {name} (0 MB / {:.1} MB)…",
-            total_mb
-        ));
+        progress(&format!("复制会话文件 {name} (0 MB / {:.1} MB)…", total_mb));
         loop {
             let n = input.read(&mut buf)?;
             if n == 0 {
@@ -248,10 +244,7 @@ fn file_thread_id(path: &std::path::Path) -> Option<String> {
 /// 找到线程 ID 对应的所有文件 (正常目录 + 金库隔离区), 返回 (源, 目标, 是否在正常目录)
 fn thread_files(thread_id: &str) -> Vec<(std::path::PathBuf, std::path::PathBuf, bool)> {
     let mut out = Vec::new();
-    for (normal, archived) in [
-        (normal_root(false), false),
-        (normal_root(true), true),
-    ] {
+    for (normal, archived) in [(normal_root(false), false), (normal_root(true), true)] {
         if !normal.exists() {
             continue;
         }
@@ -520,9 +513,7 @@ fn db_thread_from_backup_prepared(
     if in_backup {
         let section_id: Option<String> = tx
             .query_row(
-                &format!(
-                    "SELECT thread_section_id FROM {THREADS_ISOLATED_TABLE} WHERE id=?1"
-                ),
+                &format!("SELECT thread_section_id FROM {THREADS_ISOLATED_TABLE} WHERE id=?1"),
                 [thread_id],
                 |r| r.get(0),
             )
@@ -802,10 +793,7 @@ fn sync_ambient_suggestions(cwd: &str, official: bool) -> Result<(), SessionErro
         if !matches {
             continue;
         }
-        let name = entry
-            .file_name()
-            .to_string_lossy()
-            .to_string();
+        let name = entry.file_name().to_string_lossy().to_string();
         let dst = q.join(&name);
         if official && dir.exists() && !dst.exists() {
             std::fs::create_dir_all(&q)?;
@@ -924,7 +912,9 @@ fn sync_global_state(thread_id: &str, official: bool) -> Result<(), SessionError
                     })
                     .unwrap_or(false);
                 if !still_used {
-                    if let Some(projects) = obj.get_mut("local-projects").and_then(|v| v.as_object_mut())
+                    if let Some(projects) = obj
+                        .get_mut("local-projects")
+                        .and_then(|v| v.as_object_mut())
                     {
                         if let Some(pv) = projects.remove(&pid) {
                             let entry = removed
@@ -935,7 +925,8 @@ fn sync_global_state(thread_id: &str, official: bool) -> Result<(), SessionError
                             }
                         }
                     }
-                    if let Some(order) = obj.get_mut("project-order").and_then(|v| v.as_array_mut()) {
+                    if let Some(order) = obj.get_mut("project-order").and_then(|v| v.as_array_mut())
+                    {
                         order.retain(|x| x.as_str() != Some(pid.as_str()));
                         removed
                             .entry("project-order".to_string())
@@ -971,20 +962,14 @@ fn sync_global_state(thread_id: &str, official: bool) -> Result<(), SessionError
         }
         if !removed.is_empty() {
             std::fs::create_dir_all(&backup_root)?;
-            std::fs::write(
-                &backup,
-                serde_json::to_vec_pretty(&Value::Object(removed))?,
-            )?;
-            vault::atomic_write_bytes(
-                &path,
-                serde_json::to_vec_pretty(&root)?.as_slice(),
-            )
-            .map_err(|e| {
-                SessionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("写入 .codex-global-state.json 失败: {e}"),
-                ))
-            })?;
+            std::fs::write(&backup, serde_json::to_vec_pretty(&Value::Object(removed))?)?;
+            vault::atomic_write_bytes(&path, serde_json::to_vec_pretty(&root)?.as_slice())
+                .map_err(|e| {
+                    SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("写入 .codex-global-state.json 失败: {e}"),
+                    ))
+                })?;
             isolation_log(&format!("global-state cleaned thread={thread_id}"));
         }
     } else if backup.exists() {
@@ -1032,16 +1017,13 @@ fn sync_global_state(thread_id: &str, official: bool) -> Result<(), SessionError
                     }
                 }
             }
-            vault::atomic_write_bytes(
-                &path,
-                serde_json::to_vec_pretty(&root)?.as_slice(),
-            )
-            .map_err(|e| {
-                SessionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("写入 .codex-global-state.json 失败: {e}"),
-                ))
-            })?;
+            vault::atomic_write_bytes(&path, serde_json::to_vec_pretty(&root)?.as_slice())
+                .map_err(|e| {
+                    SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("写入 .codex-global-state.json 失败: {e}"),
+                    ))
+                })?;
         }
         std::fs::remove_file(&backup)?;
         isolation_log(&format!("global-state restored thread={thread_id}"));
@@ -1064,11 +1046,7 @@ fn sync_session_index(thread_id: &str, official: bool) -> Result<(), SessionErro
     for line in text.lines() {
         let is_target = serde_json::from_str::<Value>(line)
             .ok()
-            .and_then(|v| {
-                v.get("id")
-                    .and_then(|i| i.as_str())
-                    .map(|s| s.to_string())
-            })
+            .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
             .map(|s| s == thread_id)
             .unwrap_or(false);
         if is_target {
@@ -1096,11 +1074,7 @@ fn sync_session_index(thread_id: &str, official: bool) -> Result<(), SessionErro
         let already = text.lines().any(|l| {
             serde_json::from_str::<Value>(l)
                 .ok()
-                .and_then(|v| {
-                    v.get("id")
-                        .and_then(|i| i.as_str())
-                        .map(|s| s.to_string())
-                })
+                .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
                 == Some(thread_id.to_string())
         });
         if !already {
@@ -1239,7 +1213,9 @@ fn purge_aux_db_rows(thread_id: &str) {
         let sql = format!("DELETE FROM {table} WHERE thread_id=?1");
         if let Ok(n) = conn.execute(&sql, [thread_id]) {
             if n > 0 {
-                isolation_log(&format!("aux db purged {table} thread={thread_id} rows={n}"));
+                isolation_log(&format!(
+                    "aux db purged {table} thread={thread_id} rows={n}"
+                ));
             }
         }
     }
@@ -1324,6 +1300,12 @@ pub fn has_isolated_sessions() -> bool {
     !load_isolated().is_empty()
 }
 
+/// 会话隔离功能退役后清空仅由 CodexFF 维护的标记文件。
+/// 调用方必须已先将所有标记线程同步回正常目录并通过完整性校验。
+pub fn clear_isolated_session_markers() -> Result<(), SessionError> {
+    save_isolated(&[])
+}
+
 /// 当前是否官方订阅激活 (隔离生效条件)
 fn official_active() -> bool {
     matches!(
@@ -1345,7 +1327,11 @@ pub fn codex_running() -> bool {
         ("-f", "Codex \\(Renderer\\)\\.app"),
     ];
     for (flag, pat) in checks {
-        if let Ok(out) = std::process::Command::new("pgrep").arg(flag).arg(pat).output() {
+        if let Ok(out) = std::process::Command::new("pgrep")
+            .arg(flag)
+            .arg(pat)
+            .output()
+        {
             if out.status.success() {
                 return true;
             }
@@ -1362,9 +1348,7 @@ pub fn sync_session_isolation() -> Result<(), SessionError> {
 
 /// 带进度回调的隔离同步; 每个线程内先移动, 任一步失败立即回滚该线程已移动文件,
 /// 避免“一半在金库一半在原位”的会话分裂。
-pub fn sync_session_isolation_with_progress(
-    progress: &dyn Fn(&str),
-) -> Result<(), SessionError> {
+pub fn sync_session_isolation_with_progress(progress: &dyn Fn(&str)) -> Result<(), SessionError> {
     sync_session_isolation_for(official_active(), progress)
 }
 
@@ -1555,9 +1539,7 @@ pub fn set_session_isolated_with_progress(
                     let _ = move_file_safe(d, s, &|_| {});
                 }
                 let _ = save_isolated(&previous_items);
-                isolation_log(&format!(
-                    "set thread={thread_id} file move error: {e}"
-                ));
+                isolation_log(&format!("set thread={thread_id} file move error: {e}"));
                 return Err(e);
             }
         }
@@ -1831,10 +1813,8 @@ pub fn scan_sessions() -> Result<Vec<SessionMeta>, SessionError> {
     }
     // 隔离状态 = 文件位置隔离 OR 隔离标记存在。
     // 非官方模式下文件不移动, 但标记已持久化, checkbox 必须仍显示已隔离。
-    let isolated_markers: std::collections::HashSet<String> = load_isolated()
-        .into_iter()
-        .map(|i| i.thread_id)
-        .collect();
+    let isolated_markers: std::collections::HashSet<String> =
+        load_isolated().into_iter().map(|i| i.thread_id).collect();
     let mut merged: Vec<SessionMeta> = grouped
         .into_values()
         .map(|mut v| {
@@ -2117,9 +2097,7 @@ fn parse_session(
                 file_cwd = cwd.to_string();
             }
         }
-        if preview.is_empty()
-            && v.get("type").and_then(|t| t.as_str()) == Some("user")
-        {
+        if preview.is_empty() && v.get("type").and_then(|t| t.as_str()) == Some("user") {
             if let Some(t) = v.get("payload").and_then(|p| p.get("text")) {
                 if let Some(s) = t.as_str() {
                     preview = s.chars().take(300).collect();
@@ -2175,10 +2153,7 @@ fn parse_session(
     }
     // 模型以 state DB 的 threads.model 为准（rollout 里的 payload.model 可能
     // 残留早期/瞬时设置，不代表当前线程绑定）。
-    let model = models
-        .get(&thread_id)
-        .cloned()
-        .unwrap_or(model);
+    let model = models.get(&thread_id).cloned().unwrap_or(model);
     let cwd = cwds.get(&thread_id).cloned().unwrap_or(file_cwd);
     let project = project_name_for_cwd(&cwd, projects);
 
@@ -2609,7 +2584,9 @@ mod tests {
         let mut conn = Connection::open(&db_path).unwrap();
         db_thread_to_backup(&mut conn, "t1").unwrap();
         let main: i64 = conn
-            .query_row("SELECT COUNT(*) FROM threads WHERE id='t1'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM threads WHERE id='t1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let backup: i64 = conn
             .query_row(
@@ -2622,7 +2599,9 @@ mod tests {
 
         db_thread_from_backup(&mut conn, "t1").unwrap();
         let main: i64 = conn
-            .query_row("SELECT COUNT(*) FROM threads WHERE id='t1'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM threads WHERE id='t1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let backup: i64 = conn
             .query_row(
@@ -2662,14 +2641,10 @@ mod tests {
 
         let titles = load_thread_string_column(&conn, "title", "title <> ''");
         let cwds = load_thread_string_column(&conn, "cwd", "cwd <> ''");
-        let models =
-            load_thread_string_column(&conn, "model", "model IS NOT NULL AND model <> ''");
+        let models = load_thread_string_column(&conn, "model", "model IS NOT NULL AND model <> ''");
 
         assert_eq!(titles.get("active").map(String::as_str), Some("正常会话"));
-        assert_eq!(
-            cwds.get("active").map(String::as_str),
-            Some("/work/active")
-        );
+        assert_eq!(cwds.get("active").map(String::as_str), Some("/work/active"));
         assert_eq!(models.get("active").map(String::as_str), Some("gpt-5.6"));
         assert_eq!(titles.get("isolated").map(String::as_str), Some("隔离会话"));
         assert_eq!(
