@@ -37,7 +37,7 @@ jobs:
         run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Upload Windows NSIS installer
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: CodexFF-Free-Windows-x64
           if-no-files-found: error
