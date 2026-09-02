@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -404,6 +405,7 @@ static ACTIVE_INSTALL_PGID: Mutex<Option<u32>> = Mutex::new(None);
 /// 用户是否请求取消当前安装。
 static INSTALL_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 fn kill_process_group(pgid: u32) {
     let _ = Command::new("/bin/kill")
         .args(["-TERM", &format!("-{pgid}")])
@@ -411,6 +413,9 @@ fn kill_process_group(pgid: u32) {
         .stderr(Stdio::null())
         .status();
 }
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: u32) {}
 
 /// GUI 启动时 PATH 可能不含 Homebrew / nvm / bun 等目录, 拼一份常见路径。
 fn common_bin_dirs() -> Vec<String> {
@@ -564,6 +569,7 @@ pub fn install_from_command(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
     cmd.process_group(0);
 
     let mut child = cmd

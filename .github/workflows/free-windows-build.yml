@@ -33,14 +33,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build Windows installer
-        run: npm run tauri -- build --target x86_64-pc-windows-msvc
+      - name: Build Windows NSIS installer
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis
 
-      - name: Upload Windows installers
+      - name: Upload Windows NSIS installer
         uses: actions/upload-artifact@v4
         with:
           name: CodexFF-Free-Windows-x64
           if-no-files-found: error
-          path: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe

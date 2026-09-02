@@ -1056,6 +1056,7 @@ pub fn run() {
     app.run(|app_handle, event| {
         // macOS: 点击 Dock 图标唤回主窗口 (窗口被关闭按钮隐藏后,
         // 从 Dock 或状态栏都能重新打开)
+        #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {
             tray::show_main_window(app_handle);
         }

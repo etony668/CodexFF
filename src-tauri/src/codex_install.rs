@@ -299,6 +299,7 @@ fn macos_version() -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+#[cfg(unix)]
 fn free_disk_bytes() -> u64 {
     use std::ffi::CString;
     let Ok(path) = CString::new("/") else {
@@ -310,6 +311,13 @@ fn free_disk_bytes() -> u64 {
         return 0;
     }
     (vfs.f_bavail as u64).saturating_mul(vfs.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_disk_bytes() -> u64 {
+    // Windows 构建不依赖 Unix statvfs；安装器仍会由系统在下载/安装阶段
+    // 返回明确的磁盘空间错误。
+    0
 }
 
 fn cleanup(tmp: &Path, mount: &Path) {
