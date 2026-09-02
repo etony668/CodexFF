@@ -116,7 +116,7 @@ pub fn codex_cli_binary() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         if let Some(app_data) = std::env::var_os("APPDATA") {
-            candidates.push(PathBuf::from(app_data).join("npm/codex.cmd"));
+            candidates.push(PathBuf::from(&app_data).join("npm/codex.cmd"));
             candidates.push(PathBuf::from(app_data).join("npm/codex.exe"));
         }
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
