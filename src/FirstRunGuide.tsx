@@ -11,7 +11,7 @@ interface Props {
 const PAGES = [
   {
     title: "隐私说明",
-    body: "你的登录凭证、密钥等只保存在这台 Mac 上并进行加密存储，App 不会上传、不会收集任何使用数据。切换供应商、会话与历史记录也全部由本地管理，你可以随时查看或删除。",
+    body: "你的登录凭证、密钥与许可证等只保存在这台电脑上并进行加密存储，App 不会上传、不会收集任何使用数据。切换供应商、会话与历史记录也全部由本地管理，你可以随时查看或删除。",
     img: { light: privacyLightImg, dark: privacyDarkImg },
     caption: "隐私保护示意图",
   },

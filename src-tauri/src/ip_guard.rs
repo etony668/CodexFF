@@ -405,10 +405,9 @@ static IP_CACHE: std::sync::Mutex<Option<(String, std::time::Instant)>> =
 /// 让出口 IP 能跟随网络变化实时更新 (不受 30s 缓存影响)。
 fn network_signature() -> String {
     let mut sig = String::new();
-    if let Ok(out) = std::process::Command::new("netstat")
-        .args(["-rn", "-f", "inet"])
-        .output()
-    {
+    let mut netstat = std::process::Command::new("netstat");
+    crate::process_utils::hide_console_window(&mut netstat);
+    if let Ok(out) = netstat.args(["-rn", "-f", "inet"]).output() {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             let mut parts = line.split_whitespace();
@@ -421,7 +420,9 @@ fn network_signature() -> String {
             }
         }
     }
-    if let Ok(out) = std::process::Command::new("ifconfig").output() {
+    let mut ifconfig = std::process::Command::new("ifconfig");
+    crate::process_utils::hide_console_window(&mut ifconfig);
+    if let Ok(out) = ifconfig.output() {
         let text = String::from_utf8_lossy(&out.stdout);
         let mut in_utun = false;
         for line in text.lines() {

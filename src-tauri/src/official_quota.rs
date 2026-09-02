@@ -48,10 +48,9 @@ impl OfficialQuota {
 /// macOS 系统代理 (scutil --proxy): HTTPS 优先, 无则 HTTP, 再则 SOCKS;
 /// 显式代理全关时回退到 CFNetwork 解析 PAC。
 fn explicit_system_proxy_url() -> Option<String> {
-    let out = std::process::Command::new("scutil")
-        .arg("--proxy")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("scutil");
+    crate::process_utils::hide_console_window(&mut command);
+    let out = command.arg("--proxy").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut https_enabled = false;
     let mut https_host: Option<String> = None;
@@ -167,10 +166,9 @@ fn is_known_proxy_process(pid: u32) -> bool {
         "outline",
     ];
     // 进程名 (core-darwin-arm64 这类不带产品名的进程也要能识别)
-    if let Ok(out) = std::process::Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-    {
+    let mut ps = std::process::Command::new("/bin/ps");
+    crate::process_utils::hide_console_window(&mut ps);
+    if let Ok(out) = ps.args(["-p", &pid.to_string(), "-o", "comm="]).output() {
         let name = String::from_utf8_lossy(&out.stdout)
             .trim()
             .to_ascii_lowercase();
@@ -179,7 +177,9 @@ fn is_known_proxy_process(pid: u32) -> bool {
         }
     }
     // 进程名不含关键字时, 看可执行路径 (如 /Applications/LibCyber Desktop.app/...)
-    if let Ok(out) = std::process::Command::new("/usr/sbin/lsof")
+    let mut lsof = std::process::Command::new("/usr/sbin/lsof");
+    crate::process_utils::hide_console_window(&mut lsof);
+    if let Ok(out) = lsof
         .args(["-nP", "-a", "-p", &pid.to_string(), "-d", "txt", "-Fn"])
         .output()
     {
@@ -209,7 +209,9 @@ pub(crate) fn fallback_local_proxy_url() -> Option<String> {
         (10808, "socks5"),
     ];
     for (port, scheme) in CANDIDATES {
-        let Ok(out) = std::process::Command::new("/usr/sbin/lsof")
+        let mut lsof = std::process::Command::new("/usr/sbin/lsof");
+        crate::process_utils::hide_console_window(&mut lsof);
+        let Ok(out) = lsof
             .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-F", "p"])
             .output()
         else {

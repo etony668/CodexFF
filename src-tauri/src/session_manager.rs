@@ -1327,11 +1327,9 @@ pub fn codex_running() -> bool {
         ("-f", "Codex \\(Renderer\\)\\.app"),
     ];
     for (flag, pat) in checks {
-        if let Ok(out) = std::process::Command::new("pgrep")
-            .arg(flag)
-            .arg(pat)
-            .output()
-        {
+        let mut pgrep = std::process::Command::new("pgrep");
+        crate::process_utils::hide_console_window(&mut pgrep);
+        if let Ok(out) = pgrep.arg(flag).arg(pat).output() {
             if out.status.success() {
                 return true;
             }
