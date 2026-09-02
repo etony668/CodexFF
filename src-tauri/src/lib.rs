@@ -1,28 +1,21 @@
 // codexff — Codex profile switcher
 // 凭证金库 + 物理隔离 + 会话管理 + IP 指纹守护
 
-pub mod admin;
 pub mod balance;
 pub mod codex_config;
 pub mod codex_install;
-pub mod dns_protect;
 pub mod import_config;
 pub mod ip_guard;
-pub mod license;
 pub mod local_router;
 pub mod official_quota;
 pub mod pet_manager;
 pub mod prefix_diag;
 pub mod process_utils;
 pub mod profiles;
-pub mod proxy_rules;
 pub mod session_manager;
 pub mod session_model;
-pub mod session_unify;
 pub mod session_usage;
-pub mod tamper;
-pub mod task_board;
-pub mod task_board_plugin;
+pub mod session_unify;
 #[cfg(test)]
 pub mod test_util;
 pub mod tray;
@@ -95,13 +88,6 @@ impl From<workflow::WorkflowError> for ApiError {
         }
     }
 }
-impl From<task_board::TaskBoardError> for ApiError {
-    fn from(e: task_board::TaskBoardError) -> Self {
-        ApiError {
-            message: e.to_string(),
-        }
-    }
-}
 
 #[derive(Serialize)]
 struct AppStatus {
@@ -110,192 +96,6 @@ struct AppStatus {
     official_login_present: bool,
     ip: ip_guard::IpCheckResult,
     version: String,
-}
-
-fn require_task_board_license() -> Result<(), ApiError> {
-    if license::is_dns_unlocked() {
-        Ok(())
-    } else {
-        Err(ApiError {
-            message: "任务看板为激活功能，请先完成激活。".into(),
-        })
-    }
-}
-
-fn show_task_board_window(app: &tauri::AppHandle, project_path: String) -> Result<(), ApiError> {
-    require_task_board_license()?;
-    use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
-
-    if project_path.trim().is_empty() {
-        return Err(ApiError {
-            message: "项目目录不能为空".into(),
-        });
-    }
-    let project_path = task_board::remember_project_path(&project_path)?;
-    if let Some(window) = app.get_webview_window("task-board") {
-        let _ = app.emit("task-board-project", project_path);
-        let _ = window.show();
-        let _ = window.set_focus();
-        return Ok(());
-    }
-
-    let encoded: String = url::form_urlencoded::byte_serialize(project_path.as_bytes()).collect();
-    let app_url = format!("index.html?view=task-board&project={encoded}");
-    WebviewWindowBuilder::new(app, "task-board", WebviewUrl::App(app_url.into()))
-        .title("CodexFF 项目任务看板")
-        .inner_size(440.0, 780.0)
-        .min_inner_size(360.0, 560.0)
-        .resizable(true)
-        .always_on_top(true)
-        .visible(true)
-        .build()
-        .map_err(|e| ApiError {
-            message: format!("打开任务看板失败: {e}"),
-        })?;
-    Ok(())
-}
-
-#[tauri::command]
-fn open_task_board(app: tauri::AppHandle, project_path: String) -> Result<(), ApiError> {
-    show_task_board_window(&app, project_path)
-}
-
-#[tauri::command]
-fn choose_task_board_project(app: tauri::AppHandle) -> Result<Option<String>, ApiError> {
-    require_task_board_license()?;
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("/usr/bin/osascript")
-            .args([
-                "-e",
-                r#"try
-  set selectedFolder to choose folder with prompt "选择要绑定任务看板的项目目录"
-  return POSIX path of selectedFolder
-on error number -128
-  return ""
-end try"#,
-            ])
-            .output()
-            .map_err(|e| ApiError {
-                message: format!("打开项目目录选择器失败: {e}"),
-            })?;
-        if !output.status.success() {
-            return Err(ApiError {
-                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
-        let project_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if project_path.is_empty() {
-            return Ok(None);
-        }
-        show_task_board_window(&app, project_path.clone())?;
-        return Ok(Some(project_path));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = app;
-        Err(ApiError {
-            message: "当前版本仅支持在 macOS 中选择项目目录".into(),
-        })
-    }
-}
-
-pub(crate) fn open_task_board_default_inner(app: &tauri::AppHandle) -> Result<(), ApiError> {
-    require_task_board_license()?;
-    let project_path = task_board::remembered_project_path()?
-        .ok_or_else(|| ApiError {
-            message:
-                "尚未同步当前项目。请先在 Codex 中新建、恢复或继续一次项目任务，任务面板会自动绑定到该项目"
-                    .into(),
-        })?;
-    show_task_board_window(app, project_path)
-}
-
-#[tauri::command]
-fn open_task_board_default(app: tauri::AppHandle) -> Result<(), ApiError> {
-    open_task_board_default_inner(&app)
-}
-
-#[tauri::command]
-fn close_task_board(app: tauri::AppHandle) -> Result<(), ApiError> {
-    if let Some(window) = app.get_webview_window("task-board") {
-        window.close().map_err(|e| ApiError {
-            message: format!("关闭任务面板失败: {e}"),
-        })?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn task_board_get(project_path: String) -> Result<task_board::TaskBoardSnapshot, ApiError> {
-    require_task_board_license()?;
-    Ok(task_board::get(&project_path)?)
-}
-
-#[tauri::command]
-fn task_board_revision(project_path: String) -> Result<task_board::TaskBoardRevision, ApiError> {
-    require_task_board_license()?;
-    Ok(task_board::revision(&project_path)?)
-}
-
-#[tauri::command]
-fn task_board_create(
-    project_path: String,
-    parent_id: Option<String>,
-    title: String,
-    details: Option<String>,
-    boundary: Option<String>,
-    kind: Option<String>,
-) -> Result<task_board::TaskBoardSnapshot, ApiError> {
-    require_task_board_license()?;
-    Ok(task_board::create(
-        &project_path,
-        parent_id.as_deref(),
-        &title,
-        details.as_deref(),
-        boundary.as_deref(),
-        kind.as_deref(),
-    )?)
-}
-
-#[tauri::command]
-fn task_board_update(
-    project_path: String,
-    task_id: String,
-    update: task_board::TaskBoardUpdate,
-) -> Result<task_board::TaskBoardSnapshot, ApiError> {
-    require_task_board_license()?;
-    Ok(task_board::update(&project_path, &task_id, update)?)
-}
-
-#[tauri::command]
-fn task_board_delete(
-    project_path: String,
-    task_id: String,
-) -> Result<task_board::TaskBoardSnapshot, ApiError> {
-    require_task_board_license()?;
-    Ok(task_board::delete(&project_path, &task_id)?)
-}
-
-#[tauri::command]
-fn task_board_plugin_status() -> Result<task_board_plugin::TaskBoardPluginStatus, ApiError> {
-    require_task_board_license()?;
-    Ok(task_board_plugin::status())
-}
-
-#[tauri::command]
-fn set_task_board_plugin_enabled(
-    app: tauri::AppHandle,
-    enabled: bool,
-) -> Result<task_board_plugin::TaskBoardPluginStatus, ApiError> {
-    // 关闭/卸载始终允许，用于许可证失效后的安全清理；开启必须实时验签。
-    if enabled {
-        require_task_board_license()?;
-    }
-    let status =
-        task_board_plugin::set_enabled(&app, enabled).map_err(|message| ApiError { message })?;
-    tray::update_tray_task_board_state(&app, status.installed);
-    Ok(status)
 }
 
 /// 本地路由自愈节流 (30s): 中转激活 + 会话需要清洗 + Codex 运行中时,
@@ -328,7 +128,6 @@ async fn get_status() -> Result<AppStatus, ApiError> {
         .unwrap_or(false);
     if now.saturating_sub(ROUTER_HEAL_LAST.load(std::sync::atomic::Ordering::Relaxed)) >= 30
         && !local_router::status().enabled
-        && !local_router::manually_paused()
         && active_compat_supported
         && crate::session_manager::codex_running()
     {
@@ -491,9 +290,6 @@ async fn activate_official(
 ) -> Result<ActiveSelection, ApiError> {
     use tauri::Emitter;
     let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
-    // 官方与第三方严格互斥：从第三方切回官方时，无论是否使用本地路由，
-    // 只要 Codex 仍在运行就可能在进程内缓存第三方地址/凭证。必须先完全
-    // 退出，再关闭路由并恢复官方凭证，绝不允许两种身份在同一进程交叉。
     let profile_kind = codex_config::current_profile_kind();
     let active_identity = profiles::current_active();
     let safe_known_official = matches!(profile_kind, Ok(codex_config::CurrentProfile::Official))
@@ -521,8 +317,6 @@ async fn activate_official(
             }
         }
     }
-    // 所有可提前完成的预检通过后才关闭第三方兼容路由。若后续官方切换
-    // 事务失败，会恢复原 relay 配置，并在下面重新接管路由。
     let router_before = local_router::status();
     let router_was_active = router_before.enabled || local_router::codex_may_depend_on_router();
     let switch_snapshot = profiles::capture_switch_snapshot()?;
@@ -581,7 +375,6 @@ async fn activate_official(
             format!("供应商已切换，但切换历史记录失败，频繁切换告警可能不准确: {e}"),
         );
     }
-    preserve_dns_after_provider_switch(&app).await;
     let _ = app.emit("provider-changed", ());
     Ok(result)
 }
@@ -590,17 +383,6 @@ async fn activate_official(
 #[tauri::command]
 async fn check_ip_type() -> Result<ip_guard::IpTypeResult, ApiError> {
     Ok(ip_guard::check_ip_type().await)
-}
-
-async fn preserve_dns_after_provider_switch(app: &tauri::AppHandle) {
-    use tauri::Emitter;
-    // 供应商切换与网络出口没有因果关系。这里绝不调用 DNS 的重连、刷新、
-    // 重验或关闭路径：这些动作会改变 stub generation，且曾让已全绿的
-    // 守护在切官方期间被误判为降级。仅回读当前状态同步 UI/状态栏。
-    if let Ok(status) = tauri::async_runtime::spawn_blocking(dns_protect::status).await {
-        tray::update_tray_dns_state(app, &status);
-        let _ = app.emit("dns-protection-changed", status);
-    }
 }
 
 /// 最近 30 分钟切换次数 (频繁切换告警)
@@ -616,9 +398,6 @@ async fn activate_relay(
 ) -> Result<ActiveSelection, ApiError> {
     use tauri::Emitter;
     let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
-    // 只查 SQLite，不读取/改写 rollout。任何历史会话跨第三方供应商续接
-    // 都启用请求兼容层：即使模型名相同，Responses reasoning/tool schema
-    // 也可能不同，不能仅靠模型清单判断。
     let target_profile = profiles::list_relay_profiles()?
         .into_iter()
         .find(|p| p.id == profile_id)
@@ -629,14 +408,9 @@ async fn activate_relay(
     let target_wire = target_profile.wire_api.as_deref().unwrap_or("openai_chat");
     if target_models.is_empty() {
         if let Ok(Some(key)) = vault::get_relay_key(&profile_id) {
-            if let Some(profile) = profiles::list_relay_profiles()?
-                .into_iter()
-                .find(|p| p.id == profile_id)
-            {
-                if let Ok(models) = fetch_relay_models(&profile.base_url, &key).await {
-                    target_models = models.clone();
-                    let _ = profiles::update_relay_supported_models(&profile_id, models);
-                }
+            if let Ok(models) = fetch_relay_models(&target_profile.base_url, &key).await {
+                target_models = models.clone();
+                let _ = profiles::update_relay_supported_models(&profile_id, models);
             }
         }
     }
@@ -660,9 +434,6 @@ async fn activate_relay(
             && !status.degraded
             && local_router::codex_points_at_router()
     };
-    // 没有路由接管时，Codex 会缓存旧 provider/base_url/auth；运行中直接写
-    // config 并不能可靠切换，且可能让官方与第三方凭证在同一进程交叉。
-    // 路由已经接管时，第三方之间只切路由目标，可安全热切换。
     if !router_already_active && crate::session_manager::codex_running() {
         return Err(ApiError {
             message:
@@ -680,9 +451,6 @@ async fn activate_relay(
     } else {
         false
     };
-
-    // 路由开启时必须先解除旧供应商接管，再写新供应商配置。若反过来，
-    // sync_active 恢复旧 original_base_url 时会覆盖刚写入的新地址。
     if router_already_active {
         local_router::prepare_provider_switch().map_err(|e| ApiError {
             message: format!("无法解除旧供应商的兼容路由接管，本次未切换: {e}"),
@@ -694,8 +462,6 @@ async fn activate_relay(
     }) {
         Ok(result) => result,
         Err(e) => {
-            // profile 内层事务只保证核心 config/auth 回滚；外层快照还覆盖
-            // model catalog、active selection 和 relay state，必须一并恢复。
             let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
             let router_rollback = restore_relay_router_after_verified_snapshot(
                 &rollback,
@@ -745,23 +511,20 @@ async fn activate_relay(
             }
         };
         let _ = app.emit("router-status", router);
-    } else {
-        // 用户手动开启的路由继续跟随当前供应商；没有开启则保持直连。
-        if local_router::status().enabled {
-            if let Err(e) = local_router::sync_active() {
-                let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
-                let router_rollback = restore_relay_router_after_verified_snapshot(
-                    &rollback,
-                    router_already_active,
-                    compatibility_prepared,
-                )
-                .await;
-                return Err(ApiError {
-                    message: format!(
-                        "本地路由跟随供应商失败，切换已回滚: {e}; 状态回滚: {rollback:?}; 路由回滚: {router_rollback:?}"
-                    ),
-                });
-            }
+    } else if local_router::status().enabled {
+        if let Err(e) = local_router::sync_active() {
+            let rollback = profiles::restore_switch_snapshot(&switch_snapshot);
+            let router_rollback = restore_relay_router_after_verified_snapshot(
+                &rollback,
+                router_already_active,
+                compatibility_prepared,
+            )
+            .await;
+            return Err(ApiError {
+                message: format!(
+                    "本地路由跟随供应商失败，切换已回滚: {e}; 状态回滚: {rollback:?}; 路由回滚: {router_rollback:?}"
+                ),
+            });
         }
     }
     if let Err(e) = profiles::record_switch() {
@@ -771,7 +534,6 @@ async fn activate_relay(
             format!("供应商已切换，但切换历史记录失败，频繁切换告警可能不准确: {e}"),
         );
     }
-    preserve_dns_after_provider_switch(&app).await;
     let _ = app.emit("provider-changed", ());
     Ok(result)
 }
@@ -896,58 +658,21 @@ fn is_codex_running() -> Result<bool, ApiError> {
     Ok(session_manager::codex_running())
 }
 
-/// Codex 桌面端是否已安装。
+/// Codex 桌面端是否已安装 (标准路径 / 运行进程)
 #[tauri::command]
 fn is_codex_installed() -> Result<bool, ApiError> {
     Ok(codex_install::is_codex_desktop_installed())
 }
 
-/// 获取桌面端 / CLI 当前版本，可选联网检查官方最新版本。
-#[tauri::command]
-async fn codex_install_status(
-    check_latest: Option<bool>,
-) -> Result<codex_install::CodexInstallStatus, ApiError> {
-    Ok(codex_install::install_status(check_latest.unwrap_or(false)).await)
-}
-
-/// 一键补齐 Codex 桌面端与 CLI。
+/// 一键下载并安装 Codex 桌面端 (官方 DMG), 进度上抛到 "codex-install-progress"
 #[tauri::command]
 async fn install_codex(app: tauri::AppHandle) -> Result<(), ApiError> {
-    use tauri::Emitter;
-    let handle = app.clone();
-    codex_install::install_all(move |p| {
-        let _ = handle.emit("codex-install-progress", &p);
-    })
-    .await
-    .map_err(|e| ApiError { message: e })
-}
-
-/// 更新 Codex 桌面端。
-#[tauri::command]
-async fn update_codex_desktop(app: tauri::AppHandle) -> Result<(), ApiError> {
     use tauri::Emitter;
     let handle = app.clone();
     codex_install::install_desktop(true, move |p| {
         let _ = handle.emit("codex-install-progress", &p);
     })
     .await
-    .map_err(|e| ApiError { message: e })
-}
-
-/// 安装或更新 Codex CLI。
-#[tauri::command]
-async fn update_codex_cli(app: tauri::AppHandle) -> Result<(), ApiError> {
-    use tauri::Emitter;
-    let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        codex_install::install_cli(true, move |p| {
-            let _ = handle.emit("codex-install-progress", &p);
-        })
-    })
-    .await
-    .map_err(|e| ApiError {
-        message: format!("CLI 安装任务失败: {e}"),
-    })?
     .map_err(|e| ApiError { message: e })
 }
 
@@ -962,326 +687,6 @@ async fn check_ip() -> Result<ip_guard::IpCheckResult, ApiError> {
 #[tauri::command]
 async fn check_dns_leak() -> Result<ip_guard::DnsLeakResult, ApiError> {
     Ok(ip_guard::check_dns_leak().await)
-}
-
-/// 开启 DoH 保护: 系统 DNS → 本地 DoH 转发器 (管理员授权一次)
-#[tauri::command]
-async fn enable_dns_protection(
-    app: tauri::AppHandle,
-) -> Result<dns_protect::DnsProtectStatus, ApiError> {
-    enable_dns_protection_verified(app).await
-}
-
-pub(crate) async fn enable_dns_protection_verified(
-    app: tauri::AppHandle,
-) -> Result<dns_protect::DnsProtectStatus, ApiError> {
-    use tauri::Emitter;
-    // 惊喜功能: DNS 守护需要离线许可证激活 (泄露检测/IP 指纹守护不受影响)
-    if !license::is_dns_unlocked() {
-        return Err(ApiError {
-            message: "DNS 守护为惊喜功能，尚未激活。请在首页底部版本号处连点 10 次打开激活窗口。"
-                .into(),
-        });
-    }
-    let status = tauri::async_runtime::spawn_blocking(dns_protect::enable)
-        .await
-        .map_err(|e| ApiError {
-            message: format!("DNS 守护启动任务失败: {e}"),
-        })?
-        .map_err(|e| ApiError {
-            message: e.to_string(),
-        })?;
-    tray::update_tray_dns_state(&app, &status);
-
-    // 核心硬门槛：只有权威服务器实际观察不到中国大陆 DNS 解析器，
-    // 且严格传输仍保持认证，才能把状态从 Preparing 提交为 Enabled。
-    //
-    // 严格传输认证需要 stub 经出口访问 Cloudflare trace + DoH 预热, 最慢 ~12s,
-    // 且 stub 每 90s 会重建连接池(generation+1)。enable 已等待认证完成, 但
-    // 泄露检测请求发出时若正好碰上一次重建窗口, 会因 generation 不匹配而首测
-    // 失败。此时不是真故障 —— 等几秒让 stub 完成重验证后再测一次即可,
-    // 避免给用户过早弹出“请手动关闭守护后重试”。
-    let mut leak = ip_guard::check_dns_leak_for_enable_gate().await;
-    if leak.leaking != Some(false) || leak.resolver_ips.is_empty() {
-        let first_detail = leak
-            .error
-            .clone()
-            .unwrap_or_else(|| "权威检测未得到全绿结果".into());
-        let looks_transient = first_detail.contains("出口在权威检测期间发生变化")
-            || first_detail.contains("失去严格保护路径")
-            || first_detail.contains("重新执行全绿验收");
-        if looks_transient {
-            log::info!("全绿验收首测疑似瞬态({first_detail}), 等待 8s 后重试一次");
-            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-            leak = ip_guard::check_dns_leak_for_enable_gate().await;
-        }
-    }
-    if leak.leaking != Some(false) || leak.resolver_ips.is_empty() {
-        let detail = leak
-            .error
-            .unwrap_or_else(|| "权威检测未得到全绿结果".into());
-        // 全绿检测属于授权后的网络探测，失败时不能再自动调用 disable：
-        // disable 会再次弹出管理员授权，导致一次开启操作连续出现多个授权框。
-        // 保留当前接管状态并标记降级，用户明确点击“关闭守护”时再执行恢复事务。
-        let detail_for_state = detail.clone();
-        let degraded = tauri::async_runtime::spawn_blocking(move || {
-            dns_protect::mark_enable_verification_failed(&detail_for_state)
-        })
-        .await
-        .map_err(|e| ApiError {
-            message: format!("DNS 守护验收失败且状态保存任务失败：{e}"),
-        })?
-        .map_err(|e| ApiError {
-            message: format!("DNS 守护验收失败且状态保存失败：{e}"),
-        })?;
-        tray::update_tray_dns_state(&app, &degraded);
-        let _ = app.emit("dns-protection-changed", &degraded);
-        return Err(ApiError {
-            message: if detail.contains("未检测到可验证") {
-                dns_protect::NO_VERIFIABLE_NETWORK_MESSAGE.to_string()
-            } else {
-                format!("DNS 守护未通过全绿验收，当前处于降级状态，请手动关闭守护后重试：{detail}")
-            },
-        });
-    }
-
-    let verified = match dns_protect::finish_enable_verification(leak.transport_generation) {
-        Ok(verified) => verified,
-        Err(e) => {
-            // 同上：最终状态校验失败只标记降级，不自动关闭/再次请求授权。
-            let verification_error = e.to_string();
-            let error_for_state = verification_error.clone();
-            let degraded = tauri::async_runtime::spawn_blocking(move || {
-                dns_protect::mark_enable_verification_failed(&error_for_state)
-            })
-            .await
-            .map_err(|join_error| ApiError {
-                message: format!("DNS 守护最终状态校验失败且状态保存任务失败：{join_error}"),
-            })?
-            .map_err(|save_error| ApiError {
-                message: format!("DNS 守护最终状态校验失败且状态保存失败：{save_error}"),
-            })?;
-            tray::update_tray_dns_state(&app, &degraded);
-            let _ = app.emit("dns-protection-changed", &degraded);
-            return Err(ApiError {
-                message: format!(
-                    "DNS 守护最终状态校验失败，当前处于降级状态，请手动关闭守护后重试：{verification_error}"
-                ),
-            });
-        }
-    };
-    tray::update_tray_dns_state(&app, &verified);
-    Ok(verified)
-}
-
-/// 激活惊喜功能 (Ed25519 离线许可证)
-#[tauri::command]
-async fn activate_dns_license(
-    app: tauri::AppHandle,
-    license: String,
-) -> Result<license::LicenseInfo, ApiError> {
-    license::activate(&license).map_err(|e| ApiError { message: e })?;
-    // 新版许可证先进入 pending；本命令必须等待一次签名在线校验，
-    // 校验成功前 is_dns_unlocked() 始终为 false，不存在异步启用窗口。
-    let info = enforce_license_state(&app)
-        .await
-        .map_err(|message| ApiError { message })?;
-    // 激活后托盘立即出现 DNS 守护开关 (status() 可能探活, 不能阻塞 async 上下文)
-    if let Ok(s) = tauri::async_runtime::spawn_blocking(dns_protect::status).await {
-        tray::update_tray_dns_state(&app, &s);
-    }
-    Ok(info)
-}
-
-/// 惊喜功能激活状态 (每次实时验签)
-#[tauri::command]
-fn dns_license_status() -> Result<license::LicenseInfo, ApiError> {
-    Ok(license::status())
-}
-
-async fn enforce_license_state(app: &tauri::AppHandle) -> Result<license::LicenseInfo, String> {
-    use tauri::Emitter;
-    let online = license::check_online().await;
-    let license_info = license::status();
-    let tamper = tamper::status();
-    // Pending 只表示启动校验尚未结束，不能把一张正常许可证误判失效。
-    let invalid = !license_info.activated
-        || matches!(tamper, tamper::TamperStatus::Fail(_))
-        || matches!(online, license::OnlineCheck::StateInvalid);
-    let validation_required = license::online_validation_required();
-    if invalid || validation_required {
-        // 任务看板与 DNS 守护共用许可证。许可证不可用时立即关闭面板、
-        // 隐藏状态栏入口并移除残留 Skill/MCP，避免仅隐藏前端后仍可使用。
-        if let Some(window) = app.get_webview_window("task-board") {
-            let _ = window.close();
-        }
-        tray::update_tray_task_board_state(app, false);
-        let task_board_app = app.clone();
-        match tauri::async_runtime::spawn_blocking(move || {
-            let installed = task_board_plugin::status().installed;
-            if installed {
-                task_board_plugin::set_enabled(&task_board_app, false).map(|_| ())
-            } else {
-                Ok(())
-            }
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => log::warn!("许可证不可用，移除任务看板插件失败: {error}"),
-            Err(error) => log::warn!("许可证不可用，任务看板清理任务失败: {error}"),
-        }
-        let dns_enabled = tauri::async_runtime::spawn_blocking(dns_protect::status)
-            .await
-            .map(|s| s.enabled)
-            .unwrap_or(true);
-        if dns_enabled {
-            // disable 含 sudo 授权/bootout/多次探活, 必须走阻塞线程池
-            match tauri::async_runtime::spawn_blocking(dns_protect::disable).await {
-                Ok(Ok(status)) if !status.enabled && !status.degraded => {
-                    tray::update_tray_dns_state(app, &status);
-                    let _ = app.emit("dns-protection-changed", status);
-                }
-                Ok(Ok(status)) => {
-                    let reason = "许可证已失效，但 DNS 关闭操作仍在进行或未完成；守护已进入降级状态，请立即手动关闭。".to_string();
-                    match dns_protect::mark_degraded(&reason) {
-                        Ok(degraded) => {
-                            tray::update_tray_dns_state(app, &degraded);
-                            let _ = app.emit("dns-protection-changed", &degraded);
-                            let _ = app.emit("dns-license-enforcement-failed", &reason);
-                            return Err(reason);
-                        }
-                        Err(persist) => {
-                            let combined = format!("{reason}; 且降级状态保存失败: {persist}");
-                            tray::update_tray_dns_state(app, &status);
-                            let _ = app.emit("dns-protection-changed", &status);
-                            let _ = app.emit("dns-license-enforcement-failed", &combined);
-                            return Err(combined);
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    let reason = format!(
-                        "许可证已失效，但 DNS 守护关闭失败: {e}。当前状态不安全，已标记为降级，请立即手动关闭。"
-                    );
-                    let degraded = dns_protect::mark_degraded(&reason)
-                        .map_err(|persist| format!("{reason}; 且降级状态保存失败: {persist}"))?;
-                    tray::update_tray_dns_state(app, &degraded);
-                    let _ = app.emit("dns-protection-changed", &degraded);
-                    let _ = app.emit("dns-license-enforcement-failed", &reason);
-                    return Err(reason);
-                }
-                Err(join_error) => {
-                    let reason = format!(
-                        "许可证已失效，但 DNS 守护关闭任务失败: {join_error}。当前状态不安全，已标记为降级，请立即手动关闭。"
-                    );
-                    let degraded = dns_protect::mark_degraded(&reason)
-                        .map_err(|persist| format!("{reason}; 且降级状态保存失败: {persist}"))?;
-                    tray::update_tray_dns_state(app, &degraded);
-                    let _ = app.emit("dns-protection-changed", &degraded);
-                    let _ = app.emit("dns-license-enforcement-failed", &reason);
-                    return Err(reason);
-                }
-            }
-        }
-        let message = match online {
-            license::OnlineCheck::Revoked => {
-                let _ = app.emit("dns-license-revoked", ());
-                "该激活码已被作废（可能因退款或违规），DNS 守护已不可用。".to_string()
-            }
-            license::OnlineCheck::StateInvalid => {
-                let message = "许可证安全状态无法验证，DNS 守护已关闭，请重新激活。";
-                let _ = app.emit("dns-license-invalid", message);
-                message.to_string()
-            }
-            _ if validation_required => {
-                let _ = app.emit("dns-license-validation-required", ());
-                "在线校验已超过 72 小时，DNS 守护已关闭。联网后重新打开 App 即可恢复。".to_string()
-            }
-            _ if invalid => {
-                let message = license_info.message.clone();
-                let _ = app.emit("dns-license-invalid", &message);
-                message
-            }
-            _ => "许可证当前不可用，DNS 守护已关闭。".to_string(),
-        };
-        return Err(message);
-    }
-    // 激活有效时，状态栏入口仍必须同时满足插件已安装。
-    let task_board_app = app.clone();
-    if let Ok(status) = tauri::async_runtime::spawn_blocking(task_board_plugin::status).await {
-        tray::update_tray_task_board_state(&task_board_app, status.installed);
-    }
-    Ok(license_info)
-}
-
-/// 后台循环: 启动即校验一次，之后每 6 小时在线校验并执行结果。
-async fn license_check_loop(app: tauri::AppHandle) {
-    loop {
-        if let Err(e) = enforce_license_state(&app).await {
-            log::warn!("许可证状态执行未完成: {e}");
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
-    }
-}
-
-/// 关闭 DoH 保护: 还原系统 DNS + 杀 stub
-#[tauri::command]
-async fn disable_dns_protection(
-    app: tauri::AppHandle,
-) -> Result<dns_protect::DnsProtectStatus, ApiError> {
-    // 关闭流程含 sudo 授权/bootout/多次探活, 必须走阻塞线程池;
-    // 同步命令会把这些全跑在主线程上, 点“关闭守护”即冻结 UI。
-    let status = tauri::async_runtime::spawn_blocking(dns_protect::disable)
-        .await
-        .map_err(|e| ApiError {
-            message: format!("DNS 守护关闭任务失败: {e}"),
-        })?
-        .map_err(|e| ApiError {
-            message: e.to_string(),
-        })?;
-    tray::update_tray_dns_state(&app, &status);
-    Ok(status)
-}
-
-/// DNS 保护状态 (含 stub 探活)
-#[tauri::command]
-async fn dns_protection_status(
-    app: tauri::AppHandle,
-) -> Result<dns_protect::DnsProtectStatus, ApiError> {
-    // status() 含 UDP 探活与 scutil/networksetup 子进程调用; 同步命令会
-    // 阻塞主线程 (守护降级期间探活等满超时 → UI 假死), 必须走阻塞线程池。
-    let mut status = tauri::async_runtime::spawn_blocking(dns_protect::status)
-        .await
-        .map_err(|e| ApiError {
-            message: format!("DNS 状态查询任务失败: {e}"),
-        })?;
-    // 代理/TUN 恢复后仅刷新已有 stub 的出口连接池，不重新开启或关闭守护，
-    // 也不触发管理员授权。后续轮询会在严格传输恢复后完成一次全绿验收。
-    if status.enabled && status.degraded {
-        if let Ok(Ok(reconnecting)) =
-            tauri::async_runtime::spawn_blocking(dns_protect::refresh_after_network_reconnect).await
-        {
-            status = reconnecting;
-        }
-    }
-    // 代理恢复后，状态查询本身触发一次有限的全绿复核。
-    // 之前只有供应商切换流程会调用 finish_enable_verification，
-    // 因此“断开代理→降级→重新连通”后状态会一直停留在降级。
-    if status.enabled && status.degraded && dns_protect::strict_transport_verified() {
-        let leak = ip_guard::check_dns_leak_for_enable_gate().await;
-        if leak.leaking == Some(false) && !leak.resolver_ips.is_empty() {
-            if let Ok(Ok(verified)) = tauri::async_runtime::spawn_blocking(move || {
-                dns_protect::finish_enable_verification(leak.transport_generation)
-            })
-            .await
-            {
-                status = verified;
-            }
-        }
-    }
-    tray::update_tray_dns_state(&app, &status);
-    Ok(status)
 }
 
 /// 测试中转连接: GET {base_url}/models + Bearer key, 验证连通与 key 有效性。
@@ -1454,10 +859,7 @@ async fn list_usage_stats() -> usage_stats::UsageOverview {
 
 /// 本地路由开关 (启动/停止 127.0.0.1 代理)
 #[tauri::command]
-async fn set_local_router(
-    enabled: bool,
-    force: Option<bool>,
-) -> Result<local_router::RouterStatus, ApiError> {
+async fn set_local_router(enabled: bool) -> Result<local_router::RouterStatus, ApiError> {
     let _switch_guard = PROVIDER_SWITCH_LOCK.lock().await;
     if enabled && session_model::has_historical_threads().unwrap_or(true) {
         if let ActiveSelection::Relay { profile_id } = profiles::current_active()? {
@@ -1474,16 +876,9 @@ async fn set_local_router(
             }
         }
     }
-    Ok(
-        local_router::set_manual_enabled(enabled, force.unwrap_or(false))
-            .await
-            .map_err(|e| ApiError { message: e })?,
-    )
-}
-
-#[tauri::command]
-fn set_local_router_auto_failover(enabled: bool) -> Result<local_router::RouterStatus, ApiError> {
-    local_router::set_auto_failover_enabled(enabled).map_err(|e| ApiError { message: e })
+    Ok(local_router::set_enabled(enabled)
+        .await
+        .map_err(|e| ApiError { message: e })?)
 }
 
 /// 本地路由状态
@@ -1528,31 +923,6 @@ fn handle_deeplink(app: &tauri::AppHandle, url: &str) {
         }
         seen.push(url.to_string());
     }
-    if let Ok(parsed) = url::Url::parse(url) {
-        if parsed.host_str() == Some("task-board") {
-            let project_path = parsed
-                .query_pairs()
-                .find_map(|(key, value)| (key == "project").then(|| value.into_owned()));
-            if let Some(project_path) = project_path {
-                // 深链回调可能运行在 macOS URL 事件线程；同步创建 WebView
-                // 会与主 UI 线程互相等待，表现为应用出现彩虹转圈。
-                // 先让回调立即返回，再切回 Tauri 主线程创建/聚焦窗口。
-                let handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let main_handle = handle.clone();
-                    let result = handle.run_on_main_thread(move || {
-                        if let Err(error) = show_task_board_window(&main_handle, project_path) {
-                            log::warn!("任务面板深链处理失败: {}", error.message);
-                        }
-                    });
-                    if let Err(error) = result {
-                        log::warn!("任务面板主线程调度失败: {error}");
-                    }
-                });
-            }
-            return;
-        }
-    }
     let handle = app.clone();
     let url = url.to_string();
     tauri::async_runtime::spawn(async move {
@@ -1579,8 +949,6 @@ fn handle_deeplink(app: &tauri::AppHandle, url: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
-    // 反调试: 启动最早阶段拒绝调试器附加
-    tamper::deny_attach();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -1594,10 +962,8 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                if window.label() == "main" {
-                    #[cfg(target_os = "macos")]
-                    let _ = window.app_handle().set_dock_visibility(false);
-                }
+                #[cfg(target_os = "macos")]
+                let _ = window.app_handle().set_dock_visibility(false);
                 let _ = window.hide();
             }
         })
@@ -1626,22 +992,13 @@ pub fn run() {
             quit_app,
             is_codex_running,
             is_codex_installed,
-            codex_install_status,
             install_codex,
-            update_codex_desktop,
-            update_codex_cli,
             check_ip,
             check_dns_leak,
-            enable_dns_protection,
-            disable_dns_protection,
-            activate_dns_license,
-            dns_license_status,
-            dns_protection_status,
             test_relay,
             get_balance,
             list_usage_stats,
             set_local_router,
-            set_local_router_auto_failover,
             local_router_status,
             get_relay_key,
             take_pending_deeplink,
@@ -1651,47 +1008,8 @@ pub fn run() {
             get_official_quota,
             check_ip_type,
             get_switch_stats,
-            open_task_board,
-            choose_task_board_project,
-            open_task_board_default,
-            close_task_board,
-            task_board_get,
-            task_board_revision,
-            task_board_create,
-            task_board_update,
-            task_board_delete,
-            task_board_plugin_status,
-            set_task_board_plugin_enabled,
         ])
         .setup(|app| {
-            // 启动早期: 把旧的大写 CodexFF 用户数据目录一次性合并到小写 codexff
-            // (仅区分大小写的文件系统上真正执行, 幂等; 详见 vault::migrate_legacy_data_dir_if_needed)
-            crate::vault::migrate_legacy_data_dir_if_needed();
-            if let Err(e) = crate::session_unify::retire_session_management(&|step| {
-                log::info!("session management retirement: {step}");
-            }) {
-                log::warn!("会话管理退役迁移失败，保留备份并等待下次启动重试: {e}");
-            }
-            // 退役迁移完成后仍需让 Codex 的轻量项目索引跟随当前渠道。
-            // 只在 Codex/ChatGPT 完全退出时写入，避免与桌面端同时保存
-            // .codex-global-state.json；不会读取或搬动任何 rollout 正文。
-            if !crate::session_manager::codex_running() {
-                let provider = match crate::profiles::current_active() {
-                    Ok(crate::profiles::ActiveSelection::Official) => {
-                        crate::codex_config::OFFICIAL_MODEL_PROVIDER
-                    }
-                    Ok(crate::profiles::ActiveSelection::Relay { .. }) => {
-                        crate::codex_config::SHARED_MODEL_PROVIDER
-                    }
-                    Err(_) => "",
-                };
-                if !provider.is_empty() {
-                    if let Err(e) = crate::session_unify::sync_project_visibility(provider) {
-                        log::warn!("启动时同步渠道项目索引失败: {e}");
-                    }
-                }
-            }
-
             #[cfg(desktop)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
@@ -1715,21 +1033,6 @@ pub fn run() {
             // 状态栏常驻: 注册 tray 图标 + 菜单; Dock 图标平时保留
             // (普通 App), 仅用户点窗口关闭按钮时隐藏 (见 on_window_event)
             tray::setup_tray(app.handle())?;
-            // 启动时按当前 DoH 保护状态设置托盘盾牌角标。
-            // status() 可能探活数秒, 不能阻塞 App 启动; 托盘 5s 同步循环会兜底。
-            let dns_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Ok(dns) = tauri::async_runtime::spawn_blocking(dns_protect::status).await {
-                    tray::update_tray_dns_state(&dns_app, &dns);
-                }
-            });
-
-            // 先完成完整性校验，再启动在线许可证循环，避免 Pending 被误判。
-            let license_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = tauri::async_runtime::spawn_blocking(tamper::run_check).await;
-                license_check_loop(license_app).await;
-            });
 
             // 恢复上一实例仍被 Codex 缓存的兼容路由；若不存在有效接管，
             // 清理陈旧 localhost 状态。整个过程不改写任何历史会话。
@@ -1737,6 +1040,13 @@ pub fn run() {
                 tauri::async_runtime::block_on(local_router::resume_or_recover_startup())
             {
                 log::warn!("启动恢复会话兼容路由失败: {e}");
+            }
+            // 会话管理已退役：仅在 Codex/ChatGPT 完全退出时执行一次轻量归属恢复，
+            // 后续不再迁移、隔离或持续备份会话正文。
+            if let Err(e) = session_unify::retire_session_management(&|step| {
+                log::info!("session management retirement: {step}");
+            }) {
+                log::warn!("会话管理退役迁移失败，将在下次启动重试: {e}");
             }
 
             Ok(())
@@ -1747,6 +1057,7 @@ pub fn run() {
     app.run(|app_handle, event| {
         // macOS: 点击 Dock 图标唤回主窗口 (窗口被关闭按钮隐藏后,
         // 从 Dock 或状态栏都能重新打开)
+        #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {
             tray::show_main_window(app_handle);
         }
