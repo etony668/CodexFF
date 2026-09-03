@@ -14,8 +14,8 @@ pub mod process_utils;
 pub mod profiles;
 pub mod session_manager;
 pub mod session_model;
-pub mod session_usage;
 pub mod session_unify;
+pub mod session_usage;
 #[cfg(test)]
 pub mod test_util;
 pub mod tray;
