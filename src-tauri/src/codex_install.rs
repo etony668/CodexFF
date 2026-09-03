@@ -260,7 +260,18 @@ pub fn codex_cli_binary() -> Option<PathBuf> {
 }
 
 fn command_version(binary: &Path) -> Option<String> {
-    let mut command = Command::new(binary);
+    let mut command = if cfg!(windows)
+        && binary
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("cmd"))
+    {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C"]).arg(binary);
+        command
+    } else {
+        Command::new(binary)
+    };
     crate::process_utils::hide_console_window(&mut command);
     let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
