@@ -1,6 +1,7 @@
 //! Codex 桌面端 / CLI 检测、版本检查和一键安装。
 
 use std::fs;
+#[cfg(not(windows))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -241,8 +242,9 @@ pub fn codex_cli_binary() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         if let Some(app_data) = std::env::var_os("APPDATA") {
-            candidates.push(PathBuf::from(app_data).join("npm/codex.cmd"));
-            candidates.push(PathBuf::from(app_data).join("npm/codex.exe"));
+            let app_data = PathBuf::from(app_data);
+            candidates.push(app_data.join("npm/codex.cmd"));
+            candidates.push(app_data.join("npm/codex.exe"));
         }
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
             candidates.push(PathBuf::from(local_app_data).join("Programs/codex/codex.exe"));

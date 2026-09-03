@@ -4,6 +4,7 @@
 //! 快照，任何失败都优先回滚而不覆盖最新会话内容。
 
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};

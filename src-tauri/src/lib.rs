@@ -25,6 +25,7 @@ pub mod workflow;
 
 use serde::Serialize;
 use std::sync::LazyLock;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use tauri::Manager;
 use tokio::sync::Mutex as AsyncMutex;
 
