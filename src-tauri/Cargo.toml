@@ -1,6 +1,6 @@
 [package]
 name = "codexff"
-version = "1.2.230"
+version = "1.2.231"
 description = "Codex profile switcher with credential vault, local proxy and session manager"
 authors = ["codexff"]
 edition = "2021"
@@ -27,7 +27,7 @@ futures-util = "0.3"
 dirs = "6"
 chrono = "0.4"
 url = "2"
-keyring = { version = "3", features = ["apple-native"] }
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 log = "0.4"
 env_logger = "0.11"

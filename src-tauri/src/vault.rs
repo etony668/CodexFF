@@ -3,7 +3,7 @@
 //! 安全模型:
 //! - 官方凭证只在官方 profile 激活时存在于 ~/.codex/auth.json
 //! - 切到中转时, 官方凭证被 seal 进 vault 并从 auth.json 物理移除
-//! - 所有凭证以 AES-256-GCM 加密后存 vault，主密钥只存 macOS 钥匙串
+//! - 所有凭证以 AES-256-GCM 加密后存 vault，主密钥只存系统安全凭据存储
 //! - vault 目录权限 700
 //!
 //! 即使代理被绕过、config 被篡改, 中转模式下官方凭证也不在磁盘上。
@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+#[cfg(target_os = "windows")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -466,7 +468,7 @@ pub fn restore_config_backup() -> Result<(), VaultError> {
 // 只访问一个钥匙串条目，避免每个供应商各弹一次授权。磁盘上的
 // secrets.v1.json 永远只有密文；旧版明文 relay-keys.json / official-auth.json
 // 首次读取后会迁移并删除。
-// 首次访问或 App 被替换后，macOS 可能显示钥匙串授权窗口。3 秒会在用户
+// 首次访问或 App 被替换后，系统安全凭据存储可能显示授权窗口。3 秒会在用户
 // 尚未来得及点击时误报 vault 读取失败；保留上限是为了避免系统服务永久挂起。
 const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MASTER_SERVICE: &str = "com.codexff.vault.v2";
@@ -520,6 +522,30 @@ fn secrets_path() -> PathBuf {
     vault_dir().join("secrets.v1.json")
 }
 
+/// Windows 早期构建没有启用原生凭据管理器，主密钥只存在于进程内 mock
+/// 存储；重启后遗留的旧密文不可能被解密，但也绝不能静默覆盖。
+///
+/// 仅在 Windows 明确得到 `NoEntry` 后调用：将旧文件原样移到恢复目录，让当前
+/// Windows 用户可以创建新的主密钥并继续导入热链。macOS 保持原有的严格阻断，
+/// 避免钥匙串临时不可用时错误轮换密钥。
+#[cfg(target_os = "windows")]
+fn archive_orphaned_windows_secrets() -> Result<(), VaultError> {
+    let source = secrets_path();
+    if !source.exists() {
+        return Ok(());
+    }
+    let recovery = vault_dir()
+        .join("recovery-backups")
+        .join("windows-orphaned-vault");
+    fs::create_dir_all(&recovery)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let destination = recovery.join(format!("secrets.v1-{timestamp}.json"));
+    fs::rename(&source, &destination).map_err(VaultError::Io)
+}
+
 fn master_key() -> Result<[u8; 32], VaultError> {
     if let Some(key) = *MASTER_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
         return Ok(key);
@@ -541,7 +567,7 @@ fn master_key() -> Result<[u8; 32], VaultError> {
         }
     })?
     .ok_or_else(|| {
-        VaultError::Keyring("等待 macOS 钥匙串授权超时，请允许 CodexFF Pro 访问后重试".into())
+        VaultError::Keyring("等待系统安全凭据存储授权超时，请允许 CodexFF 访问后重试".into())
     })?;
     let key = if let Some(encoded) = existing {
         let bytes = base64::engine::general_purpose::STANDARD
@@ -553,10 +579,17 @@ fn master_key() -> Result<[u8; 32], VaultError> {
         // 已有密文却没有原主密钥时绝不能生成新密钥，否则旧数据必然无法解密，
         // 且错误会被误认为“vault 损坏”。让用户先恢复钥匙串条目。
         if secrets_path().exists() {
-            return Err(VaultError::Keyring(
-                "钥匙串中缺少 CodexFF Pro 主密钥，现有 vault 密文未被覆盖；请恢复钥匙串或原 App 授权后重试"
-                    .into(),
-            ));
+            #[cfg(target_os = "windows")]
+            {
+                archive_orphaned_windows_secrets()?;
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                return Err(VaultError::Keyring(
+                    "系统安全凭据存储中缺少 CodexFF 主密钥，现有 vault 密文未被覆盖；请恢复原系统凭据或原 App 授权后重试"
+                        .into(),
+                ));
+            }
         }
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
@@ -568,7 +601,7 @@ fn master_key() -> Result<[u8; 32], VaultError> {
         })?;
         if saved.is_none() {
             return Err(VaultError::Keyring(
-                "等待 macOS 钥匙串写入授权超时，请允许后重试".into(),
+                "等待系统安全凭据存储写入授权超时，请允许后重试".into(),
             ));
         }
         key
