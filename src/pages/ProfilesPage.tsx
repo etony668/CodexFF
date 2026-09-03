@@ -23,6 +23,7 @@ import {
   listUsageStats,
   localRouterStatus,
   setLocalRouter,
+  setLocalRouterAutoFailover,
   updateRelay,
 } from "../api";
 import { AddProviderPanel } from "../AddProviderPanel";
@@ -278,6 +279,20 @@ export function ProfilesPage({
     } finally {
       setRouterBusy(false);
       setPendingEnabled(null);
+    }
+  }
+
+  async function toggleAutoFailover() {
+    if (routerBusy || !routerStatus) return;
+    setRouterBusy(true);
+    try {
+      setRouterStatus(
+        await setLocalRouterAutoFailover(!routerStatus.auto_failover_enabled),
+      );
+    } catch (e) {
+      showError("更新自动故障切换设置失败", errMsg(e));
+    } finally {
+      setRouterBusy(false);
     }
   }
 
@@ -590,7 +605,7 @@ export function ProfilesPage({
           <div className="router-copy">
             <strong>本地路由</strong>
             <span className="hint">
-              供应商故障自动切换、熔断保护、Token 用量记录；自动跟随系统代理。
+              会话兼容、Token 用量记录；是否自动切换备用供应商由下方开关决定。
               开启后需重启 Codex 生效。
             </span>
           </div>
@@ -607,6 +622,42 @@ export function ProfilesPage({
             </button>
             <span className={routerOn ? "ok" : "dim"}>
               {routerBusy ? "处理中…" : routerOn ? "已开启" : "未开启"}
+            </span>
+          </div>
+        </div>
+        <div className="router-card">
+          <div className="router-copy">
+            <strong>自动故障切换</strong>
+            <span className="hint">
+              开启后，主供应商连续故障会自动尝试同协议、同模型家族的备用供应商并启用熔断保护。
+              关闭后只使用当前供应商，不自动切换或熔断。
+            </span>
+          </div>
+          <div className="router-actions">
+            <button
+              role="switch"
+              aria-checked={routerStatus?.auto_failover_enabled ?? false}
+              className={`switch${
+                (routerStatus?.auto_failover_enabled ?? false) ? " on" : ""
+              }`}
+              onClick={() => void toggleAutoFailover()}
+              disabled={routerBusy || !routerStatus}
+              title={
+                routerStatus?.auto_failover_enabled
+                  ? "关闭自动故障切换"
+                  : "开启自动故障切换"
+              }
+            >
+              <span className="switch-knob" />
+            </button>
+            <span
+              className={
+                (routerStatus?.auto_failover_enabled ?? false) ? "ok" : "dim"
+              }
+            >
+              {(routerStatus?.auto_failover_enabled ?? false)
+                ? "已开启"
+                : "未开启"}
             </span>
           </div>
         </div>

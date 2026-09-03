@@ -881,6 +881,11 @@ async fn set_local_router(enabled: bool) -> Result<local_router::RouterStatus, A
         .map_err(|e| ApiError { message: e })?)
 }
 
+#[tauri::command]
+fn set_local_router_auto_failover(enabled: bool) -> Result<local_router::RouterStatus, ApiError> {
+    local_router::set_auto_failover_enabled(enabled).map_err(|e| ApiError { message: e })
+}
+
 /// 本地路由状态
 #[tauri::command]
 fn local_router_status() -> local_router::RouterStatus {
@@ -999,6 +1004,7 @@ pub fn run() {
             get_balance,
             list_usage_stats,
             set_local_router,
+            set_local_router_auto_failover,
             local_router_status,
             get_relay_key,
             take_pending_deeplink,
