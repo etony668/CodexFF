@@ -8,9 +8,12 @@ use std::process::Command;
 
 use serde::Serialize;
 
+#[cfg(not(windows))]
 const DESKTOP_ARM_URL: &str = "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg";
+#[cfg(not(windows))]
 const DESKTOP_X64_URL: &str =
     "https://persistent.oaistatic.com/codex-app-prod/Codex-latest-x64.dmg";
+#[cfg(not(windows))]
 const DESKTOP_APPCAST_URL: &str = "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
 const CLI_LATEST_URL: &str = "https://registry.npmjs.org/@openai/codex/latest";
 
@@ -319,6 +322,7 @@ fn client_with_proxy() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("网络客户端初始化失败: {e}"))
 }
 
+#[cfg(not(windows))]
 fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     let start_tag = format!("<{tag}>");
     let start = xml.find(&start_tag)? + start_tag.len();
@@ -434,10 +438,12 @@ pub async fn install_status(check_latest: bool) -> CodexInstallStatus {
     status
 }
 
+#[cfg(not(windows))]
 fn fmt_mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+#[cfg(not(windows))]
 fn detach(mount: &Path) {
     let _ = Command::new("/usr/bin/hdiutil")
         .arg("detach")
@@ -445,6 +451,7 @@ fn detach(mount: &Path) {
         .output();
 }
 
+#[cfg(not(windows))]
 fn macos_version() -> Option<(u32, u32)> {
     let out = Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
@@ -460,7 +467,7 @@ fn macos_version() -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-#[cfg(unix)]
+#[cfg(all(not(windows), unix))]
 fn free_disk_bytes() -> u64 {
     use std::ffi::CString;
     let Ok(path) = CString::new("/") else {
@@ -474,18 +481,14 @@ fn free_disk_bytes() -> u64 {
     (vfs.f_bavail as u64).saturating_mul(vfs.f_frsize as u64)
 }
 
-#[cfg(not(unix))]
-fn free_disk_bytes() -> u64 {
-    // Windows 不依赖 Unix statvfs；系统会在下载/安装阶段报告磁盘错误。
-    0
-}
-
+#[cfg(not(windows))]
 fn cleanup(tmp: &Path, mount: &Path) {
     detach(mount);
     let _ = fs::remove_file(tmp);
     let _ = fs::remove_dir_all(mount);
 }
 
+#[cfg(not(windows))]
 fn verify_official_codex(app: &Path) -> Result<(), String> {
     let verify = Command::new("/usr/bin/codesign")
         .args(["--verify", "--deep", "--strict"])
@@ -534,6 +537,7 @@ fn verify_official_codex(app: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn mounted_codex_app(mount: &Path) -> Option<PathBuf> {
     fs::read_dir(mount)
         .ok()?
@@ -545,6 +549,7 @@ fn mounted_codex_app(mount: &Path) -> Option<PathBuf> {
         })
 }
 
+#[cfg(not(windows))]
 fn codex_process_running() -> bool {
     Command::new("/usr/bin/pgrep")
         .args(["-f", "/Applications/(Codex|ChatGPT)\\.app/Contents/MacOS/"])
