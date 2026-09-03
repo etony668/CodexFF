@@ -658,21 +658,58 @@ fn is_codex_running() -> Result<bool, ApiError> {
     Ok(session_manager::codex_running())
 }
 
-/// Codex 桌面端是否已安装 (标准路径 / 运行进程)
+/// Codex 桌面端是否已安装。
 #[tauri::command]
 fn is_codex_installed() -> Result<bool, ApiError> {
     Ok(codex_install::is_codex_desktop_installed())
 }
 
-/// 一键下载并安装 Codex 桌面端 (官方 DMG), 进度上抛到 "codex-install-progress"
+/// 获取桌面端 / CLI 当前版本，可选联网检查官方最新版本。
+#[tauri::command]
+async fn codex_install_status(
+    check_latest: Option<bool>,
+) -> Result<codex_install::CodexInstallStatus, ApiError> {
+    Ok(codex_install::install_status(check_latest.unwrap_or(false)).await)
+}
+
+/// 一键补齐 Codex 桌面端与 CLI。
 #[tauri::command]
 async fn install_codex(app: tauri::AppHandle) -> Result<(), ApiError> {
+    use tauri::Emitter;
+    let handle = app.clone();
+    codex_install::install_all(move |p| {
+        let _ = handle.emit("codex-install-progress", &p);
+    })
+    .await
+    .map_err(|e| ApiError { message: e })
+}
+
+/// 更新 Codex 桌面端。
+#[tauri::command]
+async fn update_codex_desktop(app: tauri::AppHandle) -> Result<(), ApiError> {
     use tauri::Emitter;
     let handle = app.clone();
     codex_install::install_desktop(true, move |p| {
         let _ = handle.emit("codex-install-progress", &p);
     })
     .await
+    .map_err(|e| ApiError { message: e })
+}
+
+/// 安装或更新 Codex CLI。
+#[tauri::command]
+async fn update_codex_cli(app: tauri::AppHandle) -> Result<(), ApiError> {
+    use tauri::Emitter;
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_install::install_cli(true, move |p| {
+            let _ = handle.emit("codex-install-progress", &p);
+        })
+    })
+    .await
+    .map_err(|e| ApiError {
+        message: format!("CLI 安装任务失败: {e}"),
+    })?
     .map_err(|e| ApiError { message: e })
 }
 
@@ -997,7 +1034,10 @@ pub fn run() {
             quit_app,
             is_codex_running,
             is_codex_installed,
+            codex_install_status,
             install_codex,
+            update_codex_desktop,
+            update_codex_cli,
             check_ip,
             check_dns_leak,
             test_relay,

@@ -510,9 +510,38 @@ export function isCodexInstalled(): Promise<boolean> {
   return invoke("is_codex_installed");
 }
 
-/** 一键下载并安装 Codex 桌面端 (进度事件: codex-install-progress) */
+export interface CodexComponentStatus {
+  installed: boolean;
+  current_version: string | null;
+  latest_version: string | null;
+  update_available: boolean;
+  source: string | null;
+  error: string | null;
+}
+
+export interface CodexInstallStatus {
+  desktop: CodexComponentStatus;
+  cli: CodexComponentStatus;
+}
+
+/** 检测 Codex 桌面端和 CLI，可选联网查询官方最新版本。 */
+export function getCodexInstallStatus(
+  checkLatest = false,
+): Promise<CodexInstallStatus> {
+  return invoke("codex_install_status", { checkLatest });
+}
+
+/** 一键补齐 Codex 桌面端和 CLI (进度事件: codex-install-progress) */
 export function installCodex(): Promise<void> {
   return invoke("install_codex");
+}
+
+export function updateCodexDesktop(): Promise<void> {
+  return invoke("update_codex_desktop");
+}
+
+export function updateCodexCli(): Promise<void> {
+  return invoke("update_codex_cli");
 }
 
 export function checkIp(): Promise<IpCheckResult> {

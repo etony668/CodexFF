@@ -1075,6 +1075,61 @@ button .btn-icon {
   min-width: 0;
   max-width: 420px;
 }
+.codex-components-card {
+  position: relative;
+  align-items: flex-start;
+  margin-top: 16px;
+}
+.codex-components-copy {
+  width: 100%;
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.codex-component-list {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 7px;
+}
+.codex-component-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 27px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-hover);
+}
+.codex-component-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+}
+.codex-component-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+}
+.codex-component-dot.ok { background: var(--ok, #3ecf8e); }
+.codex-component-dot.missing { background: var(--warn, #e5a13d); }
+.codex-component-action {
+  min-height: 24px;
+  padding: 2px 9px;
+  font-size: 11px;
+}
+.codex-environment-actions {
+  align-self: flex-start;
+  position: absolute;
+  top: 12px;
+  right: 14px;
+}
 @keyframes codex-indeterminate {
   0% { margin-left: 0%; }
   50% { margin-left: 60%; }

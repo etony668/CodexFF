@@ -13,10 +13,11 @@ import {
   deleteRelay,
   errMsg,
   getBalance,
+  getCodexInstallStatus,
   getOfficialQuota,
   getSwitchStats,
   installCodex,
-  isCodexInstalled,
+  CodexInstallStatus,
   UsageDailyPoint,
   UsageOverview,
   RouterStatus,
@@ -25,6 +26,8 @@ import {
   setLocalRouter,
   setLocalRouterAutoFailover,
   updateRelay,
+  updateCodexCli,
+  updateCodexDesktop,
 } from "../api";
 import { AddProviderPanel } from "../AddProviderPanel";
 import type { ToastRequest } from "../FloatingToast";
@@ -172,24 +175,42 @@ export function ProfilesPage({
   const [officialQuota, setOfficialQuota] = useState<OfficialQuota | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(false);
 
-  // Codex 桌面端检测 / 一键安装
-  const [codexInstalled, setCodexInstalled] = useState<boolean | null>(null);
+  // Codex 桌面端 / CLI 检测、安装与更新
+  const [codexStatus, setCodexStatus] = useState<CodexInstallStatus | null>(null);
+  const [codexChecking, setCodexChecking] = useState(false);
   const [codexInstalling, setCodexInstalling] = useState(false);
   const [codexProgress, setCodexProgress] = useState<{
+    component: string;
     phase: string;
     percent: number;
     message: string;
   } | null>(null);
 
+  async function refreshCodexStatus(checkLatest = false) {
+    if (checkLatest) setCodexChecking(true);
+    try {
+      setCodexStatus(await getCodexInstallStatus(checkLatest));
+    } catch (e) {
+      if (checkLatest) showError("检查版本失败", errMsg(e));
+    } finally {
+      if (checkLatest) setCodexChecking(false);
+    }
+  }
+
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void isCodexInstalled()
-      .then((ok) => {
-        if (!disposed) setCodexInstalled(ok);
+    void getCodexInstallStatus(false)
+      .then((next) => {
+        if (!disposed) setCodexStatus(next);
       })
       .catch(() => {});
-    void listen<{ phase: string; percent: number; message: string }>(
+    void listen<{
+      component: string;
+      phase: string;
+      percent: number;
+      message: string;
+    }>(
       "codex-install-progress",
       (e) => {
         if (disposed || !e.payload) return;
@@ -211,14 +232,34 @@ export function ProfilesPage({
     setCodexProgress(null);
     try {
       await installCodex();
-      setCodexInstalled(true);
+      const next = await getCodexInstallStatus(true);
+      setCodexStatus(next);
+      const ready = next.desktop.installed && next.cli.installed;
       setCodexProgress({
-        phase: "完成",
-        percent: 100,
-        message: "Codex 桌面端已安装",
+        component: "all",
+        phase: ready ? "完成" : "等待安装",
+        percent: ready ? 100 : -1,
+        message: ready
+          ? "Codex 桌面端与 CLI 已准备完成"
+          : "CLI 已处理；请完成桌面端安装后点击“检测更新”",
       });
     } catch (e) {
       showError("安装失败", errMsg(e));
+    } finally {
+      setCodexInstalling(false);
+    }
+  }
+
+  async function doUpdateCodex(component: "desktop" | "cli") {
+    if (codexInstalling) return;
+    setCodexInstalling(true);
+    setCodexProgress(null);
+    try {
+      if (component === "desktop") await updateCodexDesktop();
+      else await updateCodexCli();
+      await refreshCodexStatus(true);
+    } catch (e) {
+      showError(component === "desktop" ? "桌面端更新失败" : "CLI 更新失败", errMsg(e));
     } finally {
       setCodexInstalling(false);
     }
@@ -551,21 +592,75 @@ export function ProfilesPage({
             )}
           </div>
         )}
-        {codexInstalled === false && (
-          <div className="router-card">
-            <div className="router-copy">
-              <strong>未检测到 Codex 桌面端</strong>
+        {codexStatus && (
+          <div className="router-card codex-components-card">
+            <div className="router-copy codex-components-copy">
+              <strong>Codex 运行环境</strong>
               <span className="hint">
-                使用官方订阅需要 Codex 桌面端。点击右侧按钮自动下载官方安装包并安装到「应用程序」。
+                一键补齐官方桌面端和 CLI；版本检测仅访问 OpenAI 与 npm 官方更新源。
               </span>
+              <div className="codex-component-list">
+                {([
+                  ["desktop", "Codex 桌面端", codexStatus.desktop],
+                  ["cli", "Codex CLI", codexStatus.cli],
+                ] as const).map(([kind, label, component]) => (
+                  <div className="codex-component-row" key={kind}>
+                    <div className="codex-component-main">
+                      <span
+                        className={`codex-component-dot ${
+                          component.installed ? "ok" : "missing"
+                        }`}
+                      />
+                      <span>{label}</span>
+                      <span className="hint">
+                        {component.installed
+                          ? `已安装${
+                              component.current_version
+                                ? ` · v${component.current_version}`
+                                : ""
+                            }`
+                          : "未安装"}
+                        {component.latest_version
+                          ? ` · 最新 v${component.latest_version}`
+                          : ""}
+                      </span>
+                      {component.error && (
+                        <span className="hint warn">· {component.error}</span>
+                      )}
+                    </div>
+                    {(component.update_available || !component.installed) && (
+                      <button
+                        type="button"
+                        className="ghost codex-component-action"
+                        disabled={codexInstalling}
+                        onClick={() =>
+                          component.installed
+                            ? void doUpdateCodex(kind)
+                            : kind === "desktop"
+                              ? void doInstallCodex()
+                              : void doUpdateCodex("cli")
+                        }
+                      >
+                        {component.installed ? "更新" : "安装"}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
               {codexProgress && (
                 <div className="codex-install-progress">
                   <div className="quota-label">
-                    <span>{codexProgress.phase}</span>
+                    <span>
+                      {codexProgress.component === "cli"
+                        ? "Codex CLI"
+                        : codexProgress.component === "desktop"
+                          ? "Codex 桌面端"
+                          : codexProgress.phase}
+                    </span>
                     <span>
                       {codexProgress.percent >= 0
                         ? `${Math.round(codexProgress.percent)}%`
-                        : "下载中…"}
+                        : "处理中…"}
                     </span>
                   </div>
                   <div className="quota-bar">
@@ -585,14 +680,24 @@ export function ProfilesPage({
                 </div>
               )}
             </div>
-            <div className="router-actions">
+            <div className="router-actions codex-environment-actions">
+              {(!codexStatus.desktop.installed || !codexStatus.cli.installed) && (
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void doInstallCodex()}
+                  disabled={codexInstalling}
+                >
+                  {codexInstalling ? "安装中…" : "一键下载安装"}
+                </button>
+              )}
               <button
                 type="button"
-                className="primary"
-                onClick={() => void doInstallCodex()}
-                disabled={codexInstalling}
+                className="ghost"
+                onClick={() => void refreshCodexStatus(true)}
+                disabled={codexInstalling || codexChecking}
               >
-                {codexInstalling ? "安装中…" : "一键下载安装"}
+                {codexChecking ? "检测中…" : "检测更新"}
               </button>
             </div>
           </div>
