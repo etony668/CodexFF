@@ -141,8 +141,16 @@ export interface AppStatus {
   active: ActiveSelection | null;
   relays: RelayProfile[];
   official_login_present: boolean;
+  official_accounts: OfficialAccountInfo[];
+  active_official_account_id: string | null;
   ip: IpCheckResult;
   version: string;
+}
+
+export interface OfficialAccountInfo {
+  id: string;
+  account_id: string | null;
+  label: string;
 }
 
 /** invoke 拒绝值可能是对象 (后端 ApiError {message}) — 提取可读消息, 避免 [object Object] */
@@ -158,6 +166,16 @@ export function errMsg(e: unknown): string {
 
 export function getStatus(): Promise<AppStatus> {
   return invoke("get_status");
+}
+
+export function prepareOfficialAccountLogin(): Promise<OfficialAccountInfo[]> {
+  return invoke("prepare_official_account_login");
+}
+
+export function switchOfficialAccount(
+  accountId: string,
+): Promise<OfficialAccountInfo> {
+  return invoke("switch_official_account", { accountId });
 }
 
 export function addRelay(input: RelayProfileInput): Promise<RelayProfile> {

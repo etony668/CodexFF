@@ -141,6 +141,89 @@ button.danger.armed:hover:not(:disabled) {
 
 .tab { background: transparent; border: none; color: var(--dim); }
 .tab.active { color: var(--text); border-bottom: 2px solid var(--accent); }
+
+.official-account-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+.official-account-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.official-account-heading h2 {
+  margin-bottom: 10px;
+}
+.official-account-pagination {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.official-account-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.official-account-dot,
+.official-account-add {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 0;
+  width: 9px;
+  height: 9px;
+  padding: 0 !important;
+  flex: 0 0 9px;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--dim);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  line-height: 1;
+}
+.official-account-dot.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.official-account-add {
+  width: 23px;
+  height: 23px;
+  flex-basis: 23px;
+  font-size: 17px;
+  border-color: var(--border-strong, var(--dim));
+}
+.official-account-refresh {
+  margin-left: 2px;
+  white-space: nowrap;
+}
+.official-account-dot:disabled,
+.official-account-add:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+.app-header nav button { display: inline-flex; align-items: center; justify-content: center; }
+
+.settings-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+.settings-card-heading h2 {
+  margin: 0;
+}
+.settings-card-heading button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 /* DNS 守护中 — 按钮绿色显示 */
 .tab.dns-check.protected { color: var(--ok); }
 /* DNS 泄露 — 通用警示色 */

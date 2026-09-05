@@ -95,6 +95,8 @@ struct AppStatus {
     active: Option<ActiveSelection>,
     relays: Vec<RelayProfile>,
     official_login_present: bool,
+    official_accounts: Vec<vault::OfficialAccountInfo>,
+    active_official_account_id: Option<String>,
     ip: ip_guard::IpCheckResult,
     version: String,
 }
@@ -110,7 +112,13 @@ async fn get_status() -> Result<AppStatus, ApiError> {
     // 官方模式下 codex login 后 vault 可能还没有副本 (原捕获时机 = 切中转那刻)。
     // 每次状态刷新尝试补捕获 — 幂等 (vault 已有副本或非官方凭证形态则跳过)。
     let _ = vault::capture_official_if_missing();
+    if matches!(active, Some(ActiveSelection::Official)) {
+        let _ = vault::capture_official_account();
+    }
+    let _ = vault::migrate_official_accounts();
     let official_login_present = vault::restore_has_credentials();
+    let official_accounts = vault::list_official_accounts().unwrap_or_default();
+    let active_official_account_id = vault::active_official_account_id().ok().flatten();
     let ip = ip_guard::check_ip().await;
     // 自愈: 中转激活 + 会话需要清洗 + Codex 运行中 → 确保本地路由开启。
     let now = std::time::SystemTime::now()
@@ -143,8 +151,59 @@ async fn get_status() -> Result<AppStatus, ApiError> {
         active,
         relays,
         official_login_present,
+        official_accounts,
+        active_official_account_id,
         ip,
         version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+#[tauri::command]
+fn prepare_official_account_login() -> Result<Vec<vault::OfficialAccountInfo>, ApiError> {
+    if !matches!(
+        profiles::current_active().ok(),
+        Some(ActiveSelection::Official)
+    ) {
+        return Err(ApiError {
+            message: "请先切换到官方订阅，再新增官方账号。".into(),
+        });
+    }
+    if crate::session_manager::codex_running() {
+        return Err(ApiError {
+            message: "请先完全退出 Codex / ChatGPT，再新增官方账号。".into(),
+        });
+    }
+    let _ = vault::capture_official_account().map_err(|e| ApiError {
+        message: e.to_string(),
+    })?;
+    let auth_path = crate::codex_config::codex_auth_path();
+    if auth_path.exists() {
+        std::fs::remove_file(auth_path).map_err(|e| ApiError {
+            message: format!("准备新官方账号失败: {e}"),
+        })?;
+    }
+    vault::list_official_accounts().map_err(|e| ApiError {
+        message: e.to_string(),
+    })
+}
+
+#[tauri::command]
+fn switch_official_account(account_id: String) -> Result<vault::OfficialAccountInfo, ApiError> {
+    if !matches!(
+        profiles::current_active().ok(),
+        Some(ActiveSelection::Official)
+    ) {
+        return Err(ApiError {
+            message: "只有在官方订阅模式下才能切换官方账号。".into(),
+        });
+    }
+    if crate::session_manager::codex_running() {
+        return Err(ApiError {
+            message: "请先完全退出 Codex / ChatGPT，再切换官方账号。".into(),
+        });
+    }
+    vault::restore_official_account(&account_id).map_err(|e| ApiError {
+        message: e.to_string(),
     })
 }
 
@@ -1013,6 +1072,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             list_relays,
+            prepare_official_account_login,
+            switch_official_account,
             add_relay,
             update_relay,
             delete_relay,

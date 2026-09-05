@@ -16,11 +16,12 @@ import { listen } from "@tauri-apps/api/event";
 import { ProfilesPage } from "./pages/ProfilesPage";
 import { PetsPage } from "./pages/PetsPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { SettingsTab } from "./pages/SettingsTab";
 import { WorkflowPage } from "./pages/WorkflowPage";
 import { FloatingToast, type ToastRequest } from "./FloatingToast";
 import { FirstRunGuide } from "./FirstRunGuide";
 
-type Tab = "profiles" | "workflow" | "pets" | "settings";
+type Tab = "profiles" | "workflow" | "pets" | "security" | "settings";
 
 function App() {
   const [tab, setTab] = useState<Tab>("profiles");
@@ -122,13 +123,21 @@ function App() {
   }, []);
 
   const [switching, setSwitching] = useState(false);
+  const [switchingTarget, setSwitchingTarget] = useState<
+    "official" | string | null
+  >(null);
   // 切换检测进度 (官方模式: 出口 IP → 基线比对 → 写入配置)
   const [switchStep, setSwitchStep] = useState<string | null>(null);
 
   // 切换时不批量改写历史会话；续聊由本地路由按当前供应商适配。
-  async function performSwitch(sel: "official" | string, force: boolean) {
+  async function performSwitch(
+    sel: "official" | string,
+    force: boolean,
+    afterOfficialSwitch?: () => Promise<void>,
+  ) {
     if (switching) return; // 防双击并发切换 (config 读写非原子, 会互相覆盖)
     setSwitching(true);
+    setSwitchingTarget(sel);
     try {
       if (sel === "official") {
         setSwitchStep("写入官方配置与凭证…");
@@ -144,6 +153,10 @@ function App() {
 
       setSwitchStep(null);
       await refresh();
+      if (sel === "official" && afterOfficialSwitch) {
+        await afterOfficialSwitch();
+        await refresh();
+      }
       setNotice(
         sel === "official"
           ? `已切换到 ${relayName}。`
@@ -153,17 +166,22 @@ function App() {
       showErrorToast("切换失败", errMsg(e));
     } finally {
       setSwitching(false);
+      setSwitchingTarget(null);
       setSwitchStep(null);
     }
   }
 
-  async function switchTo(sel: "official" | string) {
+  async function switchTo(
+    sel: "official" | string,
+    afterOfficialSwitch?: () => Promise<void>,
+  ) {
     if (switching) return;
     if (sel !== "official") {
       await performSwitch(sel, false);
       return;
     }
     setSwitching(true);
+    setSwitchingTarget("official");
     try {
       // IP 硬检查分步: 前端先跑检测并显示进度, 比对不一致 → 自定义悬浮
       // 确认提示 (不自动消失), 用户确认后 force 调用。
@@ -175,6 +193,7 @@ function App() {
         if (ip.changed && ip.last_official_ip) {
           const msg = `出口 IP 已变: 上次官方基线 ${ip.last_official_ip} → 当前 ${ip.current_ip}。官方账号从新 IP 访问有封号风险。`;
           setSwitching(false);
+          setSwitchingTarget(null);
           setSwitchStep(null);
           setConfirmState({
             title: "出口 IP 已变",
@@ -182,20 +201,22 @@ function App() {
             confirmLabel: "仍然切换",
             onConfirm: () => {
               setConfirmState(null);
-              void performSwitch("official", true);
+              void performSwitch("official", true, afterOfficialSwitch);
             },
           });
           return;
         }
       }
       setSwitching(false);
+      setSwitchingTarget(null);
       setSwitchStep(null);
       // 前端刚完成了同一套出口 IP 与官方基线比对，结果有效时直接把已验证
       // 结论交给切换事务，避免后端再次访问最多 3 个 IP 服务（最坏约 18 秒）。
       // 若本次没有取得 IP，仍让后端执行权威检查，不能静默跳过风控保护。
-      await performSwitch("official", ipVerified);
+      await performSwitch("official", ipVerified, afterOfficialSwitch);
     } catch (e) {
       setSwitching(false);
+      setSwitchingTarget(null);
       setSwitchStep(null);
       showErrorToast("切换失败", errMsg(e));
     }
@@ -442,10 +463,16 @@ function App() {
             Codex宠物
           </button>
           <button
+            className={tab === "security" ? "tab active" : "tab"}
+            onClick={() => setTab("security")}
+          >
+            安全守护
+          </button>
+          <button
             className={tab === "settings" ? "tab active" : "tab"}
             onClick={() => setTab("settings")}
           >
-            安全守护
+            设置
           </button>
         </nav>
       </header>
@@ -464,12 +491,13 @@ function App() {
             onChanged={refresh}
             switching={switching}
             switchingLabel={switchStep ?? undefined}
+            switchingTarget={switchingTarget}
             onToast={setPageToast}
           />
         )}
         {tab === "workflow" && <WorkflowPage onToast={setPageToast} />}
         {tab === "pets" && <PetsPage onToast={setPageToast} />}
-        {tab === "settings" && (
+        {tab === "security" && (
           <SettingsPage
             status={status}
             onChanged={refresh}
@@ -479,6 +507,7 @@ function App() {
             onToast={setPageToast}
           />
         )}
+        {tab === "settings" && <SettingsTab onToast={setPageToast} />}
       </main>
       <footer className="app-footer">
         <span>CodexFF v{status?.version ?? ""} · 基础功能永久免费</span>

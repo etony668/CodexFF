@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import {
   AppStatus,
   BalanceInfo,
@@ -13,11 +12,9 @@ import {
   deleteRelay,
   errMsg,
   getBalance,
-  getCodexInstallStatus,
   getOfficialQuota,
   getSwitchStats,
-  installCodex,
-  CodexInstallStatus,
+  prepareOfficialAccountLogin,
   UsageDailyPoint,
   UsageOverview,
   RouterStatus,
@@ -25,21 +22,25 @@ import {
   localRouterStatus,
   setLocalRouter,
   setLocalRouterAutoFailover,
+  switchOfficialAccount,
   updateRelay,
-  updateCodexCli,
-  updateCodexDesktop,
 } from "../api";
 import { AddProviderPanel } from "../AddProviderPanel";
 import type { ToastRequest } from "../FloatingToast";
 
 interface Props {
   status: AppStatus | null;
-  onSwitch: (sel: "official" | string) => Promise<void>;
+  onSwitch: (
+    sel: "official" | string,
+    afterOfficialSwitch?: () => Promise<void>,
+  ) => Promise<void>;
   onChanged: () => Promise<void>;
   /** 切换进行中 (App 层守卫): 禁用切换按钮并提示, 避免无反馈吞点击 */
   switching?: boolean;
   /** 切换检测进度文案 (如 "检测出口 IP…") */
   switchingLabel?: string;
+  /** 当前切换目标；用于把进度显示在对应供应商卡片内 */
+  switchingTarget?: "official" | string | null;
   /** 请求 App 层统一显示悬浮提示。 */
   onToast?: (toast: ToastRequest) => void;
 }
@@ -150,12 +151,17 @@ function UsageSparkline({ series }: { series: UsageDailyPoint[] }) {
   );
 }
 
+function quotaWindowLabel(w: QuotaWindow): string {
+  return w.limit_window_seconds >= 24 * 60 * 60 ? "周额度" : "5 小时额度";
+}
+
 export function ProfilesPage({
   status,
   onSwitch,
   onChanged,
   switching,
   switchingLabel,
+  switchingTarget,
   onToast,
 }: Props) {
   const [busy, setBusy] = useState(false);
@@ -174,96 +180,9 @@ export function ProfilesPage({
   // 官方订阅额度 (5 小时/周进度条, wham/usage)
   const [officialQuota, setOfficialQuota] = useState<OfficialQuota | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(false);
-
-  // Codex 桌面端 / CLI 检测、安装与更新
-  const [codexStatus, setCodexStatus] = useState<CodexInstallStatus | null>(null);
-  const [codexChecking, setCodexChecking] = useState(false);
-  const [codexInstalling, setCodexInstalling] = useState(false);
-  const [codexProgress, setCodexProgress] = useState<{
-    component: string;
-    phase: string;
-    percent: number;
-    message: string;
-  } | null>(null);
-
-  async function refreshCodexStatus(checkLatest = false) {
-    if (checkLatest) setCodexChecking(true);
-    try {
-      setCodexStatus(await getCodexInstallStatus(checkLatest));
-    } catch (e) {
-      if (checkLatest) showError("检查版本失败", errMsg(e));
-    } finally {
-      if (checkLatest) setCodexChecking(false);
-    }
-  }
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void getCodexInstallStatus(false)
-      .then((next) => {
-        if (!disposed) setCodexStatus(next);
-      })
-      .catch(() => {});
-    void listen<{
-      component: string;
-      phase: string;
-      percent: number;
-      message: string;
-    }>(
-      "codex-install-progress",
-      (e) => {
-        if (disposed || !e.payload) return;
-        setCodexProgress(e.payload);
-      },
-    ).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
-
-  async function doInstallCodex() {
-    if (codexInstalling) return;
-    setCodexInstalling(true);
-    setCodexProgress(null);
-    try {
-      await installCodex();
-      const next = await getCodexInstallStatus(true);
-      setCodexStatus(next);
-      const ready = next.desktop.installed && next.cli.installed;
-      setCodexProgress({
-        component: "all",
-        phase: ready ? "完成" : "等待安装",
-        percent: ready ? 100 : -1,
-        message: ready
-          ? "Codex 桌面端与 CLI 已准备完成"
-          : "CLI 已处理；请完成桌面端安装后点击“检测更新”",
-      });
-    } catch (e) {
-      showError("安装失败", errMsg(e));
-    } finally {
-      setCodexInstalling(false);
-    }
-  }
-
-  async function doUpdateCodex(component: "desktop" | "cli") {
-    if (codexInstalling) return;
-    setCodexInstalling(true);
-    setCodexProgress(null);
-    try {
-      if (component === "desktop") await updateCodexDesktop();
-      else await updateCodexCli();
-      await refreshCodexStatus(true);
-    } catch (e) {
-      showError(component === "desktop" ? "桌面端更新失败" : "CLI 更新失败", errMsg(e));
-    } finally {
-      setCodexInstalling(false);
-    }
-  }
+  const quotaInFlight = useRef(false);
+  const quotaFailures = useRef(0);
+  const quotaNextAt = useRef(0);
 
   // 用量统计 (余额快照历史 + 本地路由请求统计)
   const [usage, setUsage] = useState<UsageOverview | null>(null);
@@ -339,23 +258,65 @@ export function ProfilesPage({
 
   // 防封: 出口 IP 类型 (数据中心/住宅) + 30 分钟切换次数
   const [ipType, setIpType] = useState<IpTypeResult | null>(null);
+  const ipTypeRequestSeq = useRef(0);
+  const observedIpForType = useRef<string | null | undefined>(undefined);
   const [switchCount, setSwitchCount] = useState(0);
+
+  async function refreshIpType() {
+    const seq = ++ipTypeRequestSeq.current;
+    try {
+      const result = await checkIpType();
+      if (seq === ipTypeRequestSeq.current) setIpType(result);
+    } catch {
+      // 网络短暂不可用时保持空状态，下一轮出口轮询或聚焦时会重新检测。
+    }
+  }
+
   useEffect(() => {
-    checkIpType()
-      .then(setIpType)
-      .catch(() => {});
     getSwitchStats()
       .then(setSwitchCount)
       .catch(() => {});
   }, []);
 
-  async function queryOfficialQuota() {
+  useEffect(() => {
+    const currentIp = status?.ip.current_ip ?? null;
+    if (observedIpForType.current === currentIp) return;
+    observedIpForType.current = currentIp;
+    setIpType(null);
+    void refreshIpType();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status?.ip.current_ip]);
+
+  useEffect(() => {
+    const onFocus = () => void refreshIpType();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function queryOfficialQuota(force = false) {
+    if (quotaInFlight.current) return;
+    if (!force && Date.now() < quotaNextAt.current) return;
+    quotaInFlight.current = true;
     setQuotaLoading(true);
     try {
-      setOfficialQuota(await getOfficialQuota());
+      const result = await getOfficialQuota();
+      setOfficialQuota(result);
+      if (result.error) {
+        quotaFailures.current += 1;
+        const delayMinutes = Math.min(60, 10 * 2 ** quotaFailures.current);
+        quotaNextAt.current = Date.now() + delayMinutes * 60 * 1000;
+      } else {
+        quotaFailures.current = 0;
+        quotaNextAt.current = Date.now() + 10 * 60 * 1000;
+      }
     } catch (e) {
       setOfficialQuota({ ...emptyQuota, error: errMsg(e) });
+      quotaFailures.current += 1;
+      const delayMinutes = Math.min(60, 10 * 2 ** quotaFailures.current);
+      quotaNextAt.current = Date.now() + delayMinutes * 60 * 1000;
     } finally {
+      quotaInFlight.current = false;
       setQuotaLoading(false);
     }
   }
@@ -363,17 +324,19 @@ export function ProfilesPage({
   // 每次进入官方态自动查询 (挂载时官方态 / 切到官方 / 切走再切回都触发)
   useEffect(() => {
     if (status?.active?.kind !== "official") return;
-    queryOfficialQuota();
+    quotaFailures.current = 0;
+    quotaNextAt.current = 0;
+    setOfficialQuota(null);
+    void queryOfficialQuota();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status?.active?.kind]);
+  }, [status?.active?.kind, status?.active_official_account_id]);
 
-  // 官方额度自动刷新: 每 10 分钟一次 (wham/usage 是官方客户端同款轻量接口,
-  // 10 分钟间隔风险很低; 仅在官方模式且应用打开时轮询, 切走后自动停止)
+  // 正常时 10 分钟刷新；失败后按 20/40/60 分钟退避。
   useEffect(() => {
     if (status?.active?.kind !== "official") return;
     const timer = setInterval(() => {
       void queryOfficialQuota();
-    }, 10 * 60 * 1000);
+    }, 60 * 1000);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status?.active?.kind]);
@@ -443,6 +406,94 @@ export function ProfilesPage({
     setPanelOpen(true);
   }
 
+  async function prepareNewOfficialAccount() {
+    try {
+      await prepareOfficialAccountLogin();
+      onToast?.({
+        title: "请登录新的官方账号",
+        message: "请在 Codex CLI 或桌面端完成 codex login，登录完成后点击刷新状态。",
+        kind: "info",
+      });
+    } catch (e) {
+      showError("准备新增官方账号失败", errMsg(e));
+    }
+  }
+
+  async function addOfficialAccount() {
+    if (busy || switching) return;
+    setBusy(true);
+    try {
+      if (status?.active?.kind !== "official") {
+        await onSwitch("official", prepareNewOfficialAccount);
+      } else {
+        await prepareNewOfficialAccount();
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshOfficialAccounts() {
+    if (busy || switching) return;
+    setBusy(true);
+    try {
+      await onChanged();
+      await refreshIpType();
+      if (status?.active?.kind === "official") {
+        quotaFailures.current = 0;
+        quotaNextAt.current = 0;
+        await queryOfficialQuota(true);
+      }
+      onToast?.({
+        title: "官方账号状态已刷新",
+        message: "已重新读取当前账号与可用额度。",
+        kind: "info",
+      });
+    } catch (e) {
+      showError("刷新官方账号失败", errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restoreOfficialAccount(accountId: string) {
+    try {
+      await switchOfficialAccount(accountId);
+      await onChanged();
+      setOfficialQuota(null);
+      quotaFailures.current = 0;
+      quotaNextAt.current = 0;
+      await queryOfficialQuota(true);
+      onToast?.({
+        title: "官方账号已切换",
+        message: "当前官方账号凭证已安全恢复。",
+        kind: "info",
+      });
+    } catch (e) {
+      showError("切换官方账号失败", errMsg(e));
+    }
+  }
+
+  async function selectOfficialAccount(accountId: string) {
+    if (
+      accountId === status?.active_official_account_id ||
+      busy ||
+      switching
+    ) {
+      return;
+    }
+    setBusy(true);
+    try {
+      if (status?.active?.kind !== "official") {
+        await onSwitch("official", () => restoreOfficialAccount(accountId));
+      } else {
+        await restoreOfficialAccount(accountId);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function saveProvider(input: RelayProfileInput) {
     if (editingProfile) {
       await updateRelay(editingProfile.id, input);
@@ -482,11 +533,26 @@ export function ProfilesPage({
   }
 
   const relays = status?.relays ?? [];
+  const officialAccounts = status?.official_accounts ?? [];
+  const activeOfficialAccount = officialAccounts.find(
+    (account) => account.id === status?.active_official_account_id,
+  );
 
   return (
     <div className="page">
       <section className="card">
-        <h2>官方订阅</h2>
+        <div
+          className="official-account-page"
+          key={status?.active_official_account_id ?? "no-official-account"}
+        >
+        <div className="official-account-heading">
+          <h2>官方订阅</h2>
+          <span className="hint">
+            {activeOfficialAccount
+              ? `当前账号 · ${activeOfficialAccount.label}`
+              : "尚未登录官方账号"}
+          </span>
+        </div>
         <p>
           官方模式 = 直连官方, 零中间层; 与中转共用会话历史桶 (custom),
           互切时同一会话可接续。官方凭证只在此模式下出现在本机。
@@ -517,10 +583,12 @@ export function ProfilesPage({
               <polyline points="7 23 3 19 7 15" />
               <path d="M21 13v2a4 4 0 0 1-4 4H3" />
             </svg>
-            {switching ? (switchingLabel ?? "切换中…") : "切换到官方"}
+            {switchingTarget === "official"
+              ? (switchingLabel ?? "切换中…")
+              : "切换到官方"}
           </button>
         )}
-        {switching && switchingLabel && (
+        {switchingTarget === "official" && switchingLabel && (
           <p className="hint">正在: {switchingLabel}</p>
         )}
         {!status?.official_login_present && (
@@ -565,26 +633,23 @@ export function ProfilesPage({
                   <button
                     type="button"
                     className="link-btn"
-                    onClick={queryOfficialQuota}
+                    onClick={() => void queryOfficialQuota(true)}
                     disabled={quotaLoading}
                   >
                     {quotaLoading ? "刷新中…" : "刷新"}
                   </button>
                 </div>
-                {officialQuota.primary_window && (
-                  <QuotaBar
-                    label="周额度"
-                    w={officialQuota.primary_window}
-                    onExpired={queryOfficialQuota}
-                  />
-                )}
-                {officialQuota.secondary_window && (
-                  <QuotaBar
-                    label="5 小时额度"
-                    w={officialQuota.secondary_window}
-                    onExpired={queryOfficialQuota}
-                  />
-                )}
+                {[officialQuota.primary_window, officialQuota.secondary_window]
+                  .filter((w): w is QuotaWindow => w != null)
+                  .sort((a, b) => a.limit_window_seconds - b.limit_window_seconds)
+                  .map((w) => (
+                    <QuotaBar
+                      key={`${w.limit_window_seconds}-${w.reset_at ?? w.reset_after_seconds ?? "none"}`}
+                      label={quotaWindowLabel(w)}
+                      w={w}
+                      onExpired={() => void queryOfficialQuota(true)}
+                    />
+                  ))}
                 {!officialQuota.primary_window && !officialQuota.secondary_window && (
                   <p className="hint">当前计划暂无窗口额度数据</p>
                 )}
@@ -592,116 +657,43 @@ export function ProfilesPage({
             )}
           </div>
         )}
-        {codexStatus && (
-          <div className="router-card codex-components-card">
-            <div className="router-copy codex-components-copy">
-              <strong>Codex 运行环境</strong>
-              <span className="hint">
-                一键补齐官方桌面端和 CLI；版本检测仅访问 OpenAI 与 npm 官方更新源。
-              </span>
-              <div className="codex-component-list">
-                {([
-                  ["desktop", "Codex 桌面端", codexStatus.desktop],
-                  ["cli", "Codex CLI", codexStatus.cli],
-                ] as const).map(([kind, label, component]) => (
-                  <div className="codex-component-row" key={kind}>
-                    <div className="codex-component-main">
-                      <span
-                        className={`codex-component-dot ${
-                          component.installed ? "ok" : "missing"
-                        }`}
-                      />
-                      <span>{label}</span>
-                      <span className="hint">
-                        {component.installed
-                          ? `已安装${
-                              component.current_version
-                                ? ` · v${component.current_version}`
-                                : ""
-                            }`
-                          : "未安装"}
-                        {component.latest_version
-                          ? ` · 最新 v${component.latest_version}`
-                          : ""}
-                      </span>
-                      {component.error && (
-                        <span className="hint warn">· {component.error}</span>
-                      )}
-                    </div>
-                    {(component.update_available || !component.installed) && (
-                      <button
-                        type="button"
-                        className="ghost codex-component-action"
-                        disabled={codexInstalling}
-                        onClick={() =>
-                          component.installed
-                            ? void doUpdateCodex(kind)
-                            : kind === "desktop"
-                              ? void doInstallCodex()
-                              : void doUpdateCodex("cli")
-                        }
-                      >
-                        {component.installed ? "更新" : "安装"}
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-              {codexProgress && (
-                <div className="codex-install-progress">
-                  <div className="quota-label">
-                    <span>
-                      {codexProgress.component === "cli"
-                        ? "Codex CLI"
-                        : codexProgress.component === "desktop"
-                          ? "Codex 桌面端"
-                          : codexProgress.phase}
-                    </span>
-                    <span>
-                      {codexProgress.percent >= 0
-                        ? `${Math.round(codexProgress.percent)}%`
-                        : "处理中…"}
-                    </span>
-                  </div>
-                  <div className="quota-bar">
-                    <div
-                      className={`quota-fill${
-                        codexProgress.percent < 0 ? " indeterminate" : ""
-                      }`}
-                      style={{
-                        width:
-                          codexProgress.percent >= 0
-                            ? `${Math.min(100, codexProgress.percent)}%`
-                            : "20%",
-                      }}
-                    />
-                  </div>
-                  <span className="hint">{codexProgress.message}</span>
-                </div>
-              )}
-            </div>
-            <div className="router-actions codex-environment-actions">
-              {(!codexStatus.desktop.installed || !codexStatus.cli.installed) && (
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => void doInstallCodex()}
-                  disabled={codexInstalling}
-                >
-                  {codexInstalling ? "安装中…" : "一键下载安装"}
-                </button>
-              )}
+        <div className="official-account-pagination" aria-label="官方账号分页">
+          <div className="official-account-dots">
+            {officialAccounts.map((account) => (
               <button
+                key={account.id}
                 type="button"
-                className="ghost"
-                onClick={() => void refreshCodexStatus(true)}
-                disabled={codexInstalling || codexChecking}
-              >
-                {codexChecking ? "检测中…" : "检测更新"}
-              </button>
-            </div>
+                className={`official-account-dot${
+                  account.id === status?.active_official_account_id ? " active" : ""
+                }`}
+                aria-label={`切换到${account.label}`}
+                title={account.label}
+                onClick={() => void selectOfficialAccount(account.id)}
+                disabled={busy || switching}
+              />
+            ))}
+            <button
+              type="button"
+              className="official-account-add"
+              aria-label="新增官方账号"
+              title="新增官方账号"
+              onClick={() => void addOfficialAccount()}
+              disabled={busy || switching}
+            >
+              +
+            </button>
+            <button
+              type="button"
+              className="link-btn official-account-refresh"
+              onClick={() => void refreshOfficialAccounts()}
+              disabled={busy || switching}
+              title="刷新官方账号和额度"
+            >
+              {busy ? "刷新中…" : "刷新"}
+            </button>
           </div>
-        )}
+        </div>
+        </div>
       </section>
 
       <section className="card">
