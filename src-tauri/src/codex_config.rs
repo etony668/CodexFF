@@ -479,7 +479,7 @@ fn write_deepseek_model_catalog(
         "resources/codex_deepseek_catalog_template.json"
     ))?;
     if let Some(models) = root.get_mut("models").and_then(Value::as_array_mut) {
-        for model in models {
+        for model in models.iter_mut() {
             let Some(obj) = model.as_object_mut() else {
                 continue;
             };
@@ -492,6 +492,48 @@ fn write_deepseek_model_catalog(
             obj.insert("context_window".into(), Value::from(window));
             obj.insert("max_context_window".into(), Value::from(window));
             obj.insert("auto_compact_token_limit".into(), Value::from(compact));
+        }
+
+        // DeepSeek 官方目录模板保留稳定的文本模型条目；实验性视觉模型
+        // 单独由应用注入，避免把实验模型设为默认，也避免旧模板覆盖它。
+        if !models.iter().any(|model| {
+            model.get("slug").and_then(Value::as_str) == Some("deepseek-v4-flash-vision-exp")
+        }) {
+            if let Some(template) = models
+                .iter()
+                .find(|model| {
+                    model.get("slug").and_then(Value::as_str) == Some("deepseek-v4-flash")
+                })
+                .cloned()
+            {
+                let mut vision = template;
+                if let Some(obj) = vision.as_object_mut() {
+                    let window = context_window.unwrap_or(1_048_576);
+                    let compact = auto_compact_limit.unwrap_or(window.saturating_mul(80) / 100);
+                    obj.insert(
+                        "slug".into(),
+                        Value::String("deepseek-v4-flash-vision-exp".into()),
+                    );
+                    obj.insert(
+                        "display_name".into(),
+                        Value::String("DeepSeek-V4-Flash-Vision-Exp".into()),
+                    );
+                    obj.insert(
+                        "description".into(),
+                        Value::String("Experimental DeepSeek multimodal vision model.".into()),
+                    );
+                    obj.insert(
+                        "input_modalities".into(),
+                        serde_json::json!(["text", "image"]),
+                    );
+                    obj.insert("supports_image_detail_original".into(), Value::Bool(true));
+                    obj.insert("context_window".into(), Value::from(window));
+                    obj.insert("max_context_window".into(), Value::from(window));
+                    obj.insert("auto_compact_token_limit".into(), Value::from(compact));
+                    obj.insert("priority".into(), Value::from(3));
+                }
+                models.push(vision);
+            }
         }
     }
     let content = serde_json::to_string_pretty(&root)?;
@@ -595,7 +637,8 @@ pub fn write_relay_model_catalog(
         obj.insert("auto_compact_token_limit".to_string(), Value::from(compact));
         let is_gpt_reasoning =
             normalized.starts_with("gpt-5.") && !normalized.starts_with("gpt-image-");
-        if is_gpt_reasoning {
+        let is_deepseek_vision = normalized == "deepseek-v4-flash-vision-exp";
+        if is_gpt_reasoning || is_deepseek_vision {
             obj.insert(
                 "input_modalities".to_string(),
                 serde_json::json!(["text", "image"]),
@@ -755,7 +798,18 @@ pub fn write_relay_config(
         set_codex_model_catalog_field(&mut doc, true);
     } else if has_supported {
         // 任意中转: 只显示它真实支持的模型, 避免选了不支持的模型提交才报错
-        write_relay_model_catalog(supported_models.unwrap_or_default(), ctx_w, ctx_c)?;
+        let mut relay_models = supported_models.unwrap_or_default().to_vec();
+        // 旧版保存的 DeepSeek profile 可能没有实验性 Vision 模型；
+        // 切换供应商时仍需让 Codex 主模型选择器看到它。供应商名称是
+        // 稳定标识，Base URL 可能已被本地路由接管。
+        if display_name.to_ascii_lowercase().contains("deepseek")
+            && !relay_models
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case("deepseek-v4-flash-vision-exp"))
+        {
+            relay_models.push("deepseek-v4-flash-vision-exp".to_string());
+        }
+        write_relay_model_catalog(&relay_models, ctx_w, ctx_c)?;
         set_codex_model_catalog_field(&mut doc, true);
     } else {
         // 未知模型清单: 移除我们的目录文件, 避免下拉残留上一个供应商的模型
@@ -1101,6 +1155,41 @@ enabled = true
         assert_eq!(deepseek["input_modalities"], serde_json::json!(["text"]));
         assert_eq!(deepseek["context_window"], Value::from(200_000));
         assert_eq!(deepseek["auto_compact_token_limit"], Value::from(160_000));
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn deepseek_official_catalog_includes_experimental_vision_model() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "codexff-deepseek-vision-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        write_deepseek_model_catalog(None, None).expect("write catalog");
+        let root: Value = serde_json::from_slice(
+            &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
+        )
+        .expect("parse catalog");
+        let vision = root["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .find(|m| m["slug"] == "deepseek-v4-flash-vision-exp")
+            .expect("vision model");
+        assert_eq!(
+            vision["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(vision["supports_image_detail_original"], Value::Bool(true));
+        assert_eq!(vision["context_window"], Value::from(1_048_576));
 
         std::env::remove_var("CODEX_HOME");
         let _ = std::fs::remove_dir_all(&home);

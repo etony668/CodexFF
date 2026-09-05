@@ -282,7 +282,13 @@ fn sanitize_responses_body(
     // 供应商明确配置的默认模型。兼容路由的职责就是保证跨供应商续接，
     // 不能把上一个供应商的自定义模型名原样发给能力未知的新供应商。
     if let Some(cur) = v.get("model").and_then(|m| m.as_str()) {
-        let needs_replace = if supported.is_empty() {
+        let known_deepseek_vision = cur == "deepseek-v4-flash-vision-exp"
+            && fallback_model
+                .map(|fallback| fallback.to_ascii_lowercase().starts_with("deepseek"))
+                .unwrap_or(false);
+        let needs_replace = if known_deepseek_vision {
+            false
+        } else if supported.is_empty() {
             fallback_model
                 .map(|fallback| !fallback.is_empty() && fallback != cur)
                 .unwrap_or(false)
@@ -2516,6 +2522,27 @@ data: {"type":"error","message":"Upstream request failed"}
         let out3 = sanitize_responses_body(&body3, &uri, Some("gpt-5.5"), None, &[], true);
         let v3: serde_json::Value = serde_json::from_slice(&out3).unwrap();
         assert_eq!(v3.get("model").unwrap(), "gpt-5.5");
+
+        // Vision 模型来自旧版 DeepSeek profile 时仍保留精确模型名，
+        // 且 input_image/image_url 载荷不被请求清洗逻辑移除。
+        let vision_body = Bytes::from(
+            r#"{"model":"deepseek-v4-flash-vision-exp","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,AAAA","detail":"high"}]}]}"#,
+        );
+        let vision_out = sanitize_responses_body(
+            &vision_body,
+            &uri,
+            Some("deepseek-v4-flash"),
+            Some("high"),
+            &["deepseek-v4-flash".into(), "deepseek-v4-pro".into()],
+            false,
+        );
+        let vision: serde_json::Value = serde_json::from_slice(&vision_out).unwrap();
+        assert_eq!(vision["model"], "deepseek-v4-flash-vision-exp");
+        assert_eq!(vision["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            vision["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,AAAA"
+        );
     }
 
     #[test]

@@ -46,9 +46,16 @@ interface Form {
 
 /** 官方模型默认上下文窗口 (GPT-5.6 Codex, 400K) — cc-switch 对齐 */
 const OFFICIAL_DEFAULT_CTX = 400000;
-const DEEPSEEK_V4_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
+const DEEPSEEK_V4_MODELS = [
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash-vision-exp",
+];
 
-function isDeepSeekOfficialBase(baseUrl: string) {
+function isDeepSeekOfficialBase(baseUrl: string, name = "") {
+  // 预设/旧配置有时会先经过本地路由地址，不能只靠当前 Base URL
+  // 判断；DeepSeek 厂商名称也是稳定的能力提示。
+  if (name.trim().toLowerCase().includes("deepseek")) return true;
   try {
     const host = new URL(baseUrl).hostname.toLowerCase();
     return host === "api.deepseek.com" || host.endsWith(".deepseek.com");
@@ -321,10 +328,10 @@ export function AddProviderPanel({
             ? Array.from(
                 new Set([
                   ...testResult.models,
-                  ...(isDeepSeekOfficialBase(form.baseUrl) ? DEEPSEEK_V4_MODELS : []),
+                  ...(isDeepSeekOfficialBase(form.baseUrl, form.name) ? DEEPSEEK_V4_MODELS : []),
                 ]),
               )
-            : isDeepSeekOfficialBase(form.baseUrl)
+            : isDeepSeekOfficialBase(form.baseUrl, form.name)
               ? DEEPSEEK_V4_MODELS
               : null,
       };
@@ -348,7 +355,7 @@ export function AddProviderPanel({
   const modelChoices = Array.from(
     new Set([
       ...(testResult?.models ?? editing?.supported_models ?? []),
-      ...(isDeepSeekOfficialBase(form.baseUrl) ? DEEPSEEK_V4_MODELS : []),
+      ...(isDeepSeekOfficialBase(form.baseUrl, form.name) ? DEEPSEEK_V4_MODELS : []),
       ...(form.model ? [form.model] : []),
     ]),
   ).filter(Boolean);

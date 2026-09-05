@@ -55,6 +55,7 @@ const FALLBACK_MODELS = [
   "gpt-5.2-codex",
   "deepseek-v4-flash",
   "deepseek-v4-pro",
+  "deepseek-v4-flash-vision-exp",
 ];
 
 const EFFORT_LABELS: Record<string, string> = {

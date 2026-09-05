@@ -21,12 +21,219 @@ use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::codex_config;
 
 pub const OFFICIAL_AUTH_FILENAME: &str = "official-auth.json";
 pub const BACKUP_DIR_NAME: &str = "backups";
 pub const RELAY_STATE_FILENAME: &str = "relay-state.json";
+const OFFICIAL_ACCOUNTS_INDEX_SECRET: &str = "official-accounts-index";
+const OFFICIAL_ACTIVE_ACCOUNT_SECRET: &str = "official-active-account";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfficialAccountInfo {
+    pub id: String,
+    pub account_id: Option<String>,
+    pub label: String,
+}
+
+fn official_account_id(auth: &Value) -> String {
+    let identity = auth
+        .pointer("/tokens/account_id")
+        .and_then(Value::as_str)
+        .or_else(|| auth.pointer("/ChatGPT/account_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string(auth).unwrap_or_default());
+    let mut digest = Sha256::new();
+    digest.update(identity.as_bytes());
+    let bytes = digest.finalize();
+    bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+fn official_account_label(auth: &Value, account_id: Option<&str>) -> String {
+    let email = auth
+        .pointer("/tokens/email")
+        .and_then(Value::as_str)
+        .or_else(|| auth.pointer("/ChatGPT/email").and_then(Value::as_str));
+    if let Some(email) = email.filter(|v| !v.trim().is_empty()) {
+        return mask_account_email(email);
+    }
+    account_id
+        .map(|id| format!("官方账号 · {}", id.chars().take(8).collect::<String>()))
+        .unwrap_or_else(|| "官方账号".to_string())
+}
+
+/// UI 只展示可识别但不可直接用于登录的账号标识，避免把 OAuth 邮箱完整暴露到前端。
+fn mask_account_email(email: &str) -> String {
+    let trimmed = email.trim();
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return trimmed.to_string();
+    };
+    if local.is_empty() || domain.is_empty() {
+        return trimmed.to_string();
+    }
+    let mut chars = local.chars();
+    let first = chars.next().unwrap_or('*');
+    let second = chars.next();
+    let prefix = match second {
+        Some(value) => format!("{first}{value}"),
+        None => first.to_string(),
+    };
+    format!("{prefix}***@{domain}")
+}
+
+fn load_official_account_index() -> Result<Vec<OfficialAccountInfo>, VaultError> {
+    let Some(text) = get_secret(OFFICIAL_ACCOUNTS_INDEX_SECRET)? else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&text).map_err(VaultError::Json)
+}
+
+fn save_official_account_index(accounts: &[OfficialAccountInfo]) -> Result<(), VaultError> {
+    set_secret(
+        OFFICIAL_ACCOUNTS_INDEX_SECRET,
+        &serde_json::to_string(accounts).map_err(VaultError::Json)?,
+    )
+}
+
+fn official_account_secret(id: &str) -> String {
+    format!("official-account:{id}")
+}
+
+/// 将现有单账号凭证迁移到多账号索引。凭证本体始终留在加密 vault。
+pub fn migrate_official_accounts() -> Result<(), VaultError> {
+    let mut accounts = load_official_account_index()?;
+    if accounts.is_empty() {
+        let Some(text) = get_secret("official-auth")? else {
+            return Ok(());
+        };
+        let auth: Value = serde_json::from_str(&text)?;
+        let account_id = auth
+            .pointer("/tokens/account_id")
+            .and_then(Value::as_str)
+            .or_else(|| auth.pointer("/ChatGPT/account_id").and_then(Value::as_str))
+            .map(str::to_string);
+        let id = official_account_id(&auth);
+        set_secret(&official_account_secret(&id), &text)?;
+        accounts.push(OfficialAccountInfo {
+            id: id.clone(),
+            account_id,
+            label: official_account_label(&auth, None),
+        });
+        save_official_account_index(&accounts)?;
+        set_secret(OFFICIAL_ACTIVE_ACCOUNT_SECRET, &id)?;
+    } else {
+        // 旧版本索引可能保存了完整邮箱；启动时一次性归一化，之后前端只收到脱敏标签。
+        let mut changed = false;
+        for account in &mut accounts {
+            let masked = account
+                .label
+                .split_once('@')
+                .map(|_| mask_account_email(&account.label))
+                .unwrap_or_else(|| account.label.clone());
+            if masked != account.label {
+                account.label = masked;
+                changed = true;
+            }
+        }
+        if changed {
+            save_official_account_index(&accounts)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn list_official_accounts() -> Result<Vec<OfficialAccountInfo>, VaultError> {
+    migrate_official_accounts()?;
+    load_official_account_index()
+}
+
+pub fn active_official_account_id() -> Result<Option<String>, VaultError> {
+    migrate_official_accounts()?;
+    get_secret(OFFICIAL_ACTIVE_ACCOUNT_SECRET)
+}
+
+/// 将当前 auth.json 中的官方凭证保存为一个账号槽位并设为当前账号。
+pub fn capture_official_account() -> Result<Option<OfficialAccountInfo>, VaultError> {
+    let Some(auth) =
+        codex_config::read_auth_json().map_err(|e| VaultError::Keyring(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    if !contains_official_credentials(&auth) {
+        return Ok(None);
+    }
+    let auth = sanitize_official_auth(&auth)?;
+    validate_official_auth_value(&auth)?;
+    let account_id = auth
+        .pointer("/tokens/account_id")
+        .and_then(Value::as_str)
+        .or_else(|| auth.pointer("/ChatGPT/account_id").and_then(Value::as_str))
+        .map(str::to_string);
+    let id = official_account_id(&auth);
+    let info = OfficialAccountInfo {
+        id: id.clone(),
+        account_id: account_id.clone(),
+        label: official_account_label(&auth, account_id.as_deref()),
+    };
+    set_secret(
+        &official_account_secret(&id),
+        &serde_json::to_string_pretty(&auth).map_err(VaultError::Json)?,
+    )?;
+    let mut accounts = load_official_account_index()?;
+    accounts.retain(|item| item.id != id);
+    accounts.push(info.clone());
+    let index = serde_json::to_string(&accounts).map_err(VaultError::Json)?;
+    let auth_text = serde_json::to_string_pretty(&auth).map_err(VaultError::Json)?;
+    update_secrets(&[
+        (&official_account_secret(&id), Some(auth_text.as_str())),
+        (OFFICIAL_ACCOUNTS_INDEX_SECRET, Some(index.as_str())),
+        (OFFICIAL_ACTIVE_ACCOUNT_SECRET, Some(id.as_str())),
+        ("official-auth", Some(auth_text.as_str())),
+    ])?;
+    Ok(Some(info))
+}
+
+/// 只将指定账号的加密凭证恢复到 auth.json，调用方负责官方进程互斥与状态提交。
+pub fn restore_official_account(id: &str) -> Result<OfficialAccountInfo, VaultError> {
+    migrate_official_accounts()?;
+    let accounts = load_official_account_index()?;
+    let info = accounts
+        .iter()
+        .find(|item| item.id == id)
+        .cloned()
+        .ok_or_else(|| VaultError::Keyring("官方账号不存在".into()))?;
+    let text = get_secret(&official_account_secret(id))?
+        .ok_or_else(|| VaultError::Keyring("官方账号凭证不存在".into()))?;
+    let auth: Value = serde_json::from_str(&text)?;
+    validate_official_auth_value(&auth)?;
+    let auth_path = codex_config::codex_auth_path();
+    let previous_auth = if auth_path.exists() {
+        Some(fs::read(&auth_path)?)
+    } else {
+        None
+    };
+    let rendered = serde_json::to_string_pretty(&auth).map_err(VaultError::Json)?;
+    atomic_write_bytes(&auth_path, rendered.as_bytes())?;
+    // 先确保 auth.json 可用，再原子地更新 vault 的“当前官方凭证 + 当前账号”。
+    // 若 vault 更新失败，尽力还原之前 auth.json，避免 UI 显示 A 而磁盘实际留下 B。
+    if let Err(error) = update_secrets(&[
+        ("official-auth", Some(text.as_str())),
+        (OFFICIAL_ACTIVE_ACCOUNT_SECRET, Some(id)),
+    ]) {
+        match previous_auth {
+            Some(bytes) => {
+                let _ = atomic_write_bytes(&auth_path, &bytes);
+            }
+            None => {
+                let _ = fs::remove_file(&auth_path);
+            }
+        }
+        return Err(error);
+    }
+    Ok(info)
+}
 
 /// 切到中转前的官方配置顶层字段 — 切回官方时还原
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -918,5 +1125,12 @@ mod auth_tests {
         let official = sanitize_official_auth(&api_key).expect("sanitize api key auth");
         assert_eq!(official, api_key);
         validate_official_auth_value(&official).expect("standalone official api key accepted");
+    }
+
+    #[test]
+    fn official_account_email_is_masked_without_losing_domain() {
+        assert_eq!(mask_account_email("alice@example.com"), "al***@example.com");
+        assert_eq!(mask_account_email("a@example.com"), "a***@example.com");
+        assert_eq!(mask_account_email("not-an-email"), "not-an-email");
     }
 }

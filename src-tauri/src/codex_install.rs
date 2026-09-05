@@ -309,7 +309,7 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn client_with_proxy() -> Result<reqwest::Client, String> {
+pub(crate) fn client_with_proxy() -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(1800));
