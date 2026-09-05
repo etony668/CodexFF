@@ -2543,6 +2543,27 @@ data: {"type":"error","message":"Upstream request failed"}
             vision["input"][0]["content"][1]["image_url"],
             "data:image/png;base64,AAAA"
         );
+
+        // GPT-6 Astra is listed by the relay itself, so the router must keep
+        // both the exact model slug and the image payload unchanged.
+        let astra_body = Bytes::from(
+            r#"{"model":"gpt-6-astra","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,BBBB","detail":"original"}]}]}"#,
+        );
+        let astra_out = sanitize_responses_body(
+            &astra_body,
+            &uri,
+            Some("gpt-6-astra"),
+            Some("high"),
+            &["gpt-6-astra".into()],
+            true,
+        );
+        let astra: serde_json::Value = serde_json::from_slice(&astra_out).unwrap();
+        assert_eq!(astra["model"], "gpt-6-astra");
+        assert_eq!(astra["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            astra["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,BBBB"
+        );
     }
 
     #[test]

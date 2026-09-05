@@ -39,4 +39,40 @@ cargo test --manifest-path src-tauri/Cargo.toml vault::auth_tests
 git diff --check
 ```
 
-- 结果：前端构建、Rust 检查与格式检查已通过；Vault 定向测试待执行。
+ - 结果：前端构建、Rust 检查与格式检查已通过；Vault 定向测试待执行。
+
+## GPT-6 Astra 中转多模态适配
+
+- 日期：2026-09-05。
+- 分支：`feature/dns-premium`。
+- 提交：未提交。
+- 目的：修复中转供应商下 `gpt-6-astra` 被 Codex 模型目录错误标记为不支持图片的问题。
+- 改动文件：
+  - `src-tauri/src/codex_config.rs`
+    - 第三方模型目录生成逻辑；
+    - GPT-6 Astra 能力判断；
+    - `relay_gpt6_astra_catalog_exposes_image_and_full_reasoning` 回归测试。
+  - `src-tauri/src/local_router.rs`
+    - Responses 请求中 GPT-6 Astra 图片载荷保留回归测试。
+- 关键变化：
+  - `gpt-6-astra` 显式写入 `input_modalities: ["text", "image"]` 和
+    `supports_image_detail_original: true`。
+  - GPT-6 Astra 使用完整 reasoning levels，与 GPT-5 系列保持一致。
+  - 未知的 `gpt-6-*` 自定义模型不会因名称前缀被自动标记为多模态，避免误放行。
+  - 本地路由保持 `gpt-6-astra` 模型名及 `input_image`/`image_url` 图片载荷，不做降级改写。
+- 兼容性与安全边界：
+  - 不修改 API Key、供应商认证、默认模型或免费分支。
+  - Windows/macOS 共用 Rust 目录与路由逻辑，无平台专属差异。
+  - 目录能力声明只解决本地 UI/请求适配；中转站仍需实际支持该模型和图片协议。
+- 验证命令及结果：
+
+```bash
+cargo fmt --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml relay_gpt6_astra_catalog_exposes_image_and_full_reasoning
+cargo test --manifest-path src-tauri/Cargo.toml responses_model_rewritten_per_supported_list
+cargo check --manifest-path src-tauri/Cargo.toml
+npm run build
+git diff --check
+```
+
+- 结果：GPT-6 Astra 模型目录与路由回归测试通过，Rust 检查和前端构建通过。

@@ -637,8 +637,12 @@ pub fn write_relay_model_catalog(
         obj.insert("auto_compact_token_limit".to_string(), Value::from(compact));
         let is_gpt_reasoning =
             normalized.starts_with("gpt-5.") && !normalized.starts_with("gpt-image-");
+        // GPT-6 Astra is a multimodal reasoning model exposed by relay
+        // providers. Keep this explicit rather than treating every future
+        // gpt-* slug as vision-capable until the provider declares it.
+        let is_gpt6_astra = normalized == "gpt-6-astra";
         let is_deepseek_vision = normalized == "deepseek-v4-flash-vision-exp";
-        if is_gpt_reasoning || is_deepseek_vision {
+        if is_gpt_reasoning || is_gpt6_astra || is_deepseek_vision {
             obj.insert(
                 "input_modalities".to_string(),
                 serde_json::json!(["text", "image"]),
@@ -650,7 +654,7 @@ pub fn write_relay_model_catalog(
         }
         obj.insert(
             "supported_reasoning_levels".to_string(),
-            if is_gpt_reasoning {
+            if is_gpt_reasoning || is_gpt6_astra {
                 serde_json::json!([
                     {"effort": "low", "description": "Fast responses with lighter reasoning"},
                     {"effort": "medium", "description": "Balanced reasoning depth"},
@@ -1155,6 +1159,55 @@ enabled = true
         assert_eq!(deepseek["input_modalities"], serde_json::json!(["text"]));
         assert_eq!(deepseek["context_window"], Value::from(200_000));
         assert_eq!(deepseek["auto_compact_token_limit"], Value::from(160_000));
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn relay_gpt6_astra_catalog_exposes_image_and_full_reasoning() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "codexff-gpt6-astra-catalog-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        write_relay_model_catalog(&["gpt-6-astra".into(), "gpt-6-unknown".into()], None, None)
+            .expect("write catalog");
+        let root: Value = serde_json::from_slice(
+            &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
+        )
+        .expect("parse catalog");
+        let models = root["models"].as_array().expect("models");
+        let astra = models
+            .iter()
+            .find(|m| m["slug"] == "gpt-6-astra")
+            .expect("astra model");
+        assert_eq!(
+            astra["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(astra["supports_image_detail_original"], Value::Bool(true));
+        let efforts = astra["supported_reasoning_levels"]
+            .as_array()
+            .expect("reasoning levels");
+        assert!(efforts.iter().any(|e| e["effort"] == "xhigh"));
+        assert!(efforts.iter().any(|e| e["effort"] == "max"));
+
+        let unknown = models
+            .iter()
+            .find(|m| m["slug"] == "gpt-6-unknown")
+            .expect("unknown model");
+        assert_eq!(unknown["input_modalities"], serde_json::json!(["text"]));
+        assert_eq!(
+            unknown["supports_image_detail_original"],
+            Value::Bool(false)
+        );
 
         std::env::remove_var("CODEX_HOME");
         let _ = std::fs::remove_dir_all(&home);
