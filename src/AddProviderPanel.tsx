@@ -451,60 +451,84 @@ export function AddProviderPanel({
         ) : (
           <div className="panel-body">
             <form onSubmit={submit} className="form">
-              <label>
-                供应商名称
-                <input value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="relay-a" required />
-              </label>
-              <label>
-                官网链接 (可选)
-                <input value={form.websiteUrl} onChange={(e) => set({ websiteUrl: e.target.value })} placeholder="https://relay.example.com" />
-              </label>
-              <label>
-                备注 (可选)
-                <input value={form.notes} onChange={(e) => set({ notes: e.target.value })} placeholder="月付 ¥20" />
-              </label>
-              <label>
-                API 请求地址 (Base URL)
-                <input value={form.baseUrl} onChange={(e) => set({ baseUrl: e.target.value })} placeholder="https://api.example.com/v1" required />
-              </label>
-              <label>
-                <span className="provider-field-label">
-                  <span>默认模型</span>
-                  <button
-                    type="button"
-                    className="provider-refresh-models"
-                    onClick={() => void runTest()}
-                    disabled={testing || !form.baseUrl || !form.key}
-                  >
-                    {testing ? "刷新中…" : "刷新模型列表"}
-                  </button>
-                </span>
-                {modelChoices.length > 0 ? (
-                  <select value={form.model} onChange={(e) => set({ model: e.target.value })}>
-                    <option value="">使用供应商默认模型</option>
-                    {modelChoices.map((model) => (
-                      <option key={model} value={model}>
-                        {model}
-                      </option>
-                    ))}
+              <div className="provider-fields-grid">
+                <label>
+                  供应商名称
+                  <input value={form.name} onChange={(e) => set({ name: e.target.value })} placeholder="relay-a" required />
+                </label>
+                <label>
+                  官网链接 (可选)
+                  <input value={form.websiteUrl} onChange={(e) => set({ websiteUrl: e.target.value })} placeholder="https://relay.example.com" />
+                </label>
+                <label>
+                  备注 (可选)
+                  <input value={form.notes} onChange={(e) => set({ notes: e.target.value })} placeholder="月付 ¥20" />
+                </label>
+                <label>
+                  API 请求地址 (Base URL)
+                  <input value={form.baseUrl} onChange={(e) => set({ baseUrl: e.target.value })} placeholder="https://api.example.com/v1" required />
+                </label>
+                <label>
+                  <span className="provider-field-label">
+                    <span>默认模型</span>
+                    <button
+                      type="button"
+                      className="provider-refresh-models"
+                      onClick={() => void runTest()}
+                      disabled={testing || !form.baseUrl || !form.key}
+                    >
+                      {testing ? "刷新中…" : "刷新模型列表"}
+                    </button>
+                  </span>
+                  {modelChoices.length > 0 ? (
+                    <select value={form.model} onChange={(e) => set({ model: e.target.value })}>
+                      <option value="">使用供应商默认模型</option>
+                      {modelChoices.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      value={form.model}
+                      onChange={(e) => set({ model: e.target.value })}
+                      placeholder="gpt-5.6-codex"
+                    />
+                  )}
+                </label>
+                <label>
+                  API 格式
+                  <select value={form.wireApi} onChange={(e) => set({ wireApi: e.target.value })}>
+                    <option value="responses">Responses (openai_responses)</option>
+                    <option value="chat">Chat Completions (openai_chat)</option>
+                    <option value="anthropic">Anthropic (anthropic)</option>
+                    <option value="">自动</option>
                   </select>
-                ) : (
+                </label>
+                <label>
+                  Reasoning Effort (可选, 也可直接在下方 config.toml 里写)
+                  <input value={form.reasoningEffort} onChange={(e) => set({ reasoningEffort: e.target.value })} placeholder="low / medium / high / xhigh / max" />
+                </label>
+                <label>
+                  上下文窗口 (token, 默认官方模型 400000)
                   <input
-                    value={form.model}
-                    onChange={(e) => set({ model: e.target.value })}
-                    placeholder="gpt-5.6-codex"
+                    value={form.modelContextWindow}
+                    onChange={(e) => set({ modelContextWindow: e.target.value })}
+                    placeholder="400000"
+                    inputMode="numeric"
                   />
-                )}
-              </label>
-              <label>
-                API 格式
-                <select value={form.wireApi} onChange={(e) => set({ wireApi: e.target.value })}>
-                  <option value="responses">Responses (openai_responses)</option>
-                  <option value="chat">Chat Completions (openai_chat)</option>
-                  <option value="anthropic">Anthropic (anthropic)</option>
-                  <option value="">自动</option>
-                </select>
-              </label>
+                </label>
+                <label>
+                  自动压缩阈值 (token, 默认 90% 窗口 = 360000)
+                  <input
+                    value={form.autoCompactLimit}
+                    onChange={(e) => set({ autoCompactLimit: e.target.value })}
+                    placeholder="360000"
+                    inputMode="numeric"
+                  />
+                </label>
+              </div>
               {form.wireApi === "anthropic" && (
                 <label>
                   Anthropic 认证字段
@@ -518,36 +542,6 @@ export function AddProviderPanel({
                   </select>
                 </label>
               )}
-              <label>
-                Reasoning Effort (可选, 也可直接在下方 config.toml 里写)
-                <input value={form.reasoningEffort} onChange={(e) => set({ reasoningEffort: e.target.value })} placeholder="low / medium / high / xhigh / max" />
-              </label>
-              <label>
-                上下文窗口 (token, 默认官方模型 400000)
-                <input
-                  value={form.modelContextWindow}
-                  onChange={(e) => set({ modelContextWindow: e.target.value })}
-                  placeholder="400000"
-                  inputMode="numeric"
-                />
-              </label>
-              <label>
-                自动压缩阈值 (token, 默认 90% 窗口 = 360000)
-                <input
-                  value={form.autoCompactLimit}
-                  onChange={(e) => set({ autoCompactLimit: e.target.value })}
-                  placeholder="360000"
-                  inputMode="numeric"
-                />
-              </label>
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={form.disableStorage}
-                  onChange={(e) => set({ disableStorage: e.target.checked })}
-                />
-                禁用响应存储 (disable_response_storage — 中转站通常要求)
-              </label>
               <label>
                 API Key {editing && <span className="dim">(留空 = 不修改)</span>}
                 <input
@@ -630,6 +624,14 @@ export function AddProviderPanel({
                   </div>
                 </div>
               )}
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={form.disableStorage}
+                  onChange={(e) => set({ disableStorage: e.target.checked })}
+                />
+                禁用响应存储 (disable_response_storage — 中转站通常要求)
+              </label>
               <div className="test-result-row">
                 {testResult && (
                   <span className={testResult.ok ? "ok" : "error"}>
