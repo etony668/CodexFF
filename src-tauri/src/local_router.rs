@@ -1079,6 +1079,23 @@ fn is_access_forbidden_failure(status: u16, body: &[u8]) -> bool {
             .contains("upstream access forbidden")
 }
 
+/// 系统审批请求可能携带独立的 Luna 模型，即使主会话当前选择的是 Sol。
+/// 对 GPT/Terra 兼容的第三方供应商，将这类审批请求固定交给 Terra；
+/// DeepSeek 等供应商继续使用自身默认模型，避免发送不支持的模型名。
+fn approval_fallback_model(profile: &profiles::RelayProfile, approval_luna: bool) -> &str {
+    if approval_luna
+        && (profile.model.to_ascii_lowercase().starts_with("gpt-")
+            || profile
+                .supported_models
+                .iter()
+                .any(|model| model == "gpt-5.6-terra"))
+    {
+        "gpt-5.6-terra"
+    } else {
+        profile.model.as_str()
+    }
+}
+
 /// 某些中转不会返回标准的 model-not-found/403，而是把旧会话携带的
 /// Luna 模型统一包装成 502/503 Service temporarily unavailable。
 /// 仅对历史兼容链中明确的 Luna 模型启用学习，避免把普通上游抖动误判为
@@ -1425,6 +1442,7 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
         let incoming_model = request_model(&body);
         let approval_luna =
             incoming_model.as_deref() == Some("gpt-5.6-luna") && is_approval_review_request(&body);
+        let fallback_model = approval_fallback_model(p, approval_luna);
         let supported_models = if approval_luna
             || incoming_model
                 .as_deref()
@@ -1437,7 +1455,7 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
         let request_body = sanitize_responses_body(
             &body,
             &uri,
-            Some(p.model.as_str()),
+            Some(fallback_model),
             p.model_reasoning_effort.as_deref(),
             supported_models,
             empty_reasoning_content,
@@ -1470,7 +1488,7 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                         let retry_body = sanitize_responses_body(
                             &body,
                             &uri,
-                            Some(p.model.as_str()),
+                            Some(fallback_model),
                             p.model_reasoning_effort.as_deref(),
                             &p.supported_models,
                             next_policy,
@@ -1549,7 +1567,7 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                             let retry_body = sanitize_responses_body(
                                 &body,
                                 &uri,
-                                Some(p.model.as_str()),
+                                Some(fallback_model),
                                 p.model_reasoning_effort.as_deref(),
                                 &p.supported_models,
                                 next_policy,
