@@ -375,7 +375,10 @@ export function AddProviderPanel({
     <div className="panel-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="panel">
         <div className="panel-header">
-          <button className="panel-back" onClick={() => (stage === "form" ? setStage("presets") : onClose())}>
+          <button
+            className="panel-back"
+            onClick={() => (stage === "form" && !editing ? setStage("presets") : onClose())}
+          >
             ←
           </button>
           <h2>
