@@ -452,8 +452,8 @@ export function AddProviderPanel({
             </div>
           </div>
         ) : (
-          <div className="panel-body">
-            <form onSubmit={submit} className="form">
+          <div className="panel-body provider-edit-body">
+            <form onSubmit={submit} className="form provider-edit-form">
               <div className="provider-fields-grid">
                 <label>
                   供应商名称
@@ -474,14 +474,6 @@ export function AddProviderPanel({
                 <label>
                   <span className="provider-field-label">
                     <span>默认模型</span>
-                    <button
-                      type="button"
-                      className="provider-refresh-models"
-                      onClick={() => void runTest()}
-                      disabled={testing || !form.baseUrl || !form.key}
-                    >
-                      {testing ? "刷新中…" : "刷新模型列表"}
-                    </button>
                   </span>
                   {modelChoices.length > 0 ? (
                     <select value={form.model} onChange={(e) => set({ model: e.target.value })}>
@@ -589,26 +581,37 @@ export function AddProviderPanel({
                 />
               </details>
 
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={form.useCommonConfig}
-                  onChange={(e) => set({ useCommonConfig: e.target.checked })}
-                />
-                合并全局公共配置片段 (writeCommonConfig)
-              </label>
+              <div className="provider-settings-stack">
+                <label className="checkbox-label provider-setting-row">
+                  <input
+                    type="checkbox"
+                    checked={form.useCommonConfig}
+                    onChange={(e) => set({ useCommonConfig: e.target.checked })}
+                  />
+                  合并全局公共配置片段 (writeCommonConfig)
+                </label>
 
-              <div className="provider-tool-row">
-                <button type="button" onClick={() => setCommonOpen((v) => !v)} disabled={commonSaving}>
-                  {commonOpen ? "收起公共配置" : "编辑公共配置片段"}
-                </button>
-                <button
-                  type="button"
-                  onClick={runTest}
-                  disabled={testing || !form.baseUrl || !form.key}
-                >
-                  {testing ? "测试中…" : "测试连接"}
-                </button>
+                <label className="checkbox-label provider-setting-row">
+                  <input
+                    type="checkbox"
+                    checked={form.disableStorage}
+                    onChange={(e) => set({ disableStorage: e.target.checked })}
+                  />
+                  禁用响应存储 (disable_response_storage — 中转站通常要求)
+                </label>
+
+                <div className="provider-tool-row provider-setting-row">
+                  <button type="button" onClick={() => setCommonOpen((v) => !v)} disabled={commonSaving}>
+                    {commonOpen ? "收起公共配置" : "编辑公共配置片段"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={runTest}
+                    disabled={testing || !form.baseUrl || !form.key}
+                  >
+                    {testing ? "测试中…" : "测试连接并刷新模型列表"}
+                  </button>
+                </div>
               </div>
               {commonOpen && (
                 <div className="common-editor">
@@ -627,14 +630,6 @@ export function AddProviderPanel({
                   </div>
                 </div>
               )}
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={form.disableStorage}
-                  onChange={(e) => set({ disableStorage: e.target.checked })}
-                />
-                禁用响应存储 (disable_response_storage — 中转站通常要求)
-              </label>
               <div className="test-result-row">
                 {testResult && (
                   <span className={testResult.ok ? "ok" : "error"}>
