@@ -472,6 +472,18 @@ button.danger.armed:hover:not(:disabled) {
 
 .form { display: flex; flex-direction: column; gap: 10px; }
 .form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--dim); }
+.provider-field-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.provider-refresh-models {
+  min-height: 24px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.2;
+}
 .form input {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -479,6 +491,7 @@ button.danger.armed:hover:not(:disabled) {
   padding: 8px 10px;
   color: var(--text);
   font-size: 13px;
+  min-height: 36px;
 }
 .form input:focus { outline: none; border-color: var(--accent); }
 .form select,
@@ -492,6 +505,9 @@ button.danger.armed:hover:not(:disabled) {
   font-family: var(--mono, ui-monospace, monospace);
   resize: vertical;
 }
+.form select {
+  min-height: 36px;
+}
 .form select:focus,
 .form textarea:focus { outline: none; border-color: var(--accent); }
 .form details {
@@ -504,6 +520,18 @@ button.danger.armed:hover:not(:disabled) {
 .form details summary:hover { color: var(--accent); }
 .form details textarea { margin-top: 8px; width: 100%; }
 .form-actions { display: flex; gap: 8px; margin-top: 4px; }
+.provider-tool-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.test-result-row {
+  min-height: 20px;
+}
+.provider-form-actions {
+  justify-content: flex-end;
+}
 .dns-check-actions {
   display: flex;
   align-items: center;

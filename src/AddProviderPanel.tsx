@@ -468,7 +468,17 @@ export function AddProviderPanel({
                 <input value={form.baseUrl} onChange={(e) => set({ baseUrl: e.target.value })} placeholder="https://api.example.com/v1" required />
               </label>
               <label>
-                默认模型 (可选, 写入 config 顶层)
+                <span className="provider-field-label">
+                  <span>默认模型</span>
+                  <button
+                    type="button"
+                    className="provider-refresh-models"
+                    onClick={() => void runTest()}
+                    disabled={testing || !form.baseUrl || !form.key}
+                  >
+                    {testing ? "刷新中…" : "刷新模型列表"}
+                  </button>
+                </span>
                 {modelChoices.length > 0 ? (
                   <select value={form.model} onChange={(e) => set({ model: e.target.value })}>
                     <option value="">使用供应商默认模型</option>
@@ -487,7 +497,7 @@ export function AddProviderPanel({
                 )}
               </label>
               <label>
-                Wire API 格式
+                API 格式
                 <select value={form.wireApi} onChange={(e) => set({ wireApi: e.target.value })}>
                   <option value="responses">Responses (openai_responses)</option>
                   <option value="chat">Chat Completions (openai_chat)</option>
@@ -591,33 +601,36 @@ export function AddProviderPanel({
                 合并全局公共配置片段 (writeCommonConfig)
               </label>
 
-              <div className="test-row">
+              <div className="provider-tool-row">
                 <button type="button" onClick={() => setCommonOpen((v) => !v)} disabled={commonSaving}>
                   {commonOpen ? "收起公共配置" : "编辑公共配置片段"}
                 </button>
-                {commonOpen && (
-                  <div className="common-editor">
-                    <textarea
-                      value={commonSnippet}
-                      onChange={(e) => setCommonSnippet(e.target.value)}
-                      placeholder={'model_reasoning_effort = "high"'}
-                      rows={6}
-                      spellCheck={false}
-                    />
-                    <div className="test-row">
-                      <button type="button" className="primary" onClick={saveCommon} disabled={commonSaving}>
-                        {commonSaving ? "保存中…" : "保存片段"}
-                      </button>
-                      <span className="hint">保存后启用"合并全局公共配置片段"的 profile 自动跟随</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="test-row">
-                <button type="button" onClick={runTest} disabled={testing || !form.baseUrl || !form.key}>
+                <button
+                  type="button"
+                  onClick={runTest}
+                  disabled={testing || !form.baseUrl || !form.key}
+                >
                   {testing ? "测试中…" : "测试连接"}
                 </button>
+              </div>
+              {commonOpen && (
+                <div className="common-editor">
+                  <textarea
+                    value={commonSnippet}
+                    onChange={(e) => setCommonSnippet(e.target.value)}
+                    placeholder={'model_reasoning_effort = "high"'}
+                    rows={6}
+                    spellCheck={false}
+                  />
+                  <div className="test-row">
+                    <button type="button" className="primary" onClick={saveCommon} disabled={commonSaving}>
+                      {commonSaving ? "保存中…" : "保存片段"}
+                    </button>
+                    <span className="hint">保存后启用"合并全局公共配置片段"的 profile 自动跟随</span>
+                  </div>
+                </div>
+              )}
+              <div className="test-result-row">
                 {testResult && (
                   <span className={testResult.ok ? "ok" : "error"}>
                     {testResult.ok
@@ -633,11 +646,11 @@ export function AddProviderPanel({
                 )}
               </div>
               {err && <p className="error">{err}</p>}
-              <div className="form-actions">
+              <div className="form-actions provider-form-actions">
                 <button type="submit" className="primary" disabled={busy}>
                   {editing ? "保存修改" : "添加"}
                 </button>
-                <button type="button" onClick={() => setStage("presets")} disabled={busy}>
+                <button type="button" onClick={onClose} disabled={busy}>
                   取消
                 </button>
               </div>
