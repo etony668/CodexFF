@@ -54,6 +54,11 @@ static REASONING_POLICY: LazyLock<Mutex<HashMap<String, bool>>> =
 /// 后续任务级模型覆盖会自动回到 profile 默认模型。
 static DENIED_MODELS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 审批模型的容量不足或连续首段断流只做短期运行时降级，不持久化到配置。
+/// 容量属于瞬态状态；若写入 denied_models，会导致模型恢复后仍被永久绕开。
+static APPROVAL_MODEL_COOLDOWNS: LazyLock<Mutex<HashMap<(String, String), i64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const APPROVAL_MODEL_COOLDOWN_MS: i64 = 5 * 60 * 1_000;
 
 struct RuntimeState {
     shutdown: Option<oneshot::Sender<()>>,
@@ -909,6 +914,11 @@ fn retryable_upstream_status(status: u16, body: &[u8]) -> bool {
     if !matches!(status, 502 | 503 | 504) {
         return false;
     }
+    // 模型容量不足不是网关瞬态错误；重复发送同一模型只会延长审批等待，
+    // 应立即交给审批模型回退逻辑选择其它候选。
+    if is_model_capacity_failure(status, body) {
+        return false;
+    }
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     // 这是供应商对模型/账号权限的确定性拒绝；重发同一个模型没有意义，
     // 应交给上层切换到 profile 默认模型。
@@ -1079,21 +1089,104 @@ fn is_access_forbidden_failure(status: u16, body: &[u8]) -> bool {
             .contains("upstream access forbidden")
 }
 
-/// 系统审批请求可能携带独立的 Luna 模型，即使主会话当前选择的是 Sol。
-/// 对 GPT/Terra 兼容的第三方供应商，将这类审批请求固定交给 Terra；
-/// DeepSeek 等供应商继续使用自身默认模型，避免发送不支持的模型名。
-fn approval_fallback_model(profile: &profiles::RelayProfile, approval_luna: bool) -> &str {
-    if approval_luna
-        && (profile.model.to_ascii_lowercase().starts_with("gpt-")
-            || profile
-                .supported_models
-                .iter()
-                .any(|model| model == "gpt-5.6-terra"))
-    {
-        "gpt-5.6-terra"
-    } else {
-        profile.model.as_str()
+/// 系统审批请求有时会携带独立的 Luna 模型，即使主会话当前选择的是其它模型。
+/// 对 GPT/Terra 兼容的中转，审批请求优先使用 Terra；若 Terra 容量不足，
+/// 由运行时冷却逻辑切换到 Sol。这样保留 Luna → Terra 的既定兼容约定，
+/// DeepSeek 等供应商继续使用自身默认模型，避免把不支持 GPT 模型名发给上游。
+fn approval_fallback_model_with_unavailable<'a>(
+    profile: &'a profiles::RelayProfile,
+    approval_luna: bool,
+    unavailable: &HashSet<String>,
+) -> &'a str {
+    if !approval_luna {
+        return profile.model.as_str();
     }
+
+    let default = profile.model.as_str();
+    let candidates = if default == "gpt-5.6-luna" {
+        ["gpt-5.6-terra", "gpt-5.6-sol"]
+    } else {
+        ["gpt-5.6-terra", "gpt-5.6-sol"]
+    };
+    for candidate in candidates {
+        if profile
+            .supported_models
+            .iter()
+            .any(|model| model == candidate)
+            && !unavailable.contains(candidate)
+        {
+            return candidate;
+        }
+    }
+    profile.model.as_str()
+}
+
+fn approval_fallback_model(profile: &profiles::RelayProfile, approval_luna: bool) -> &str {
+    let now = now_ms();
+    let unavailable = APPROVAL_MODEL_COOLDOWNS
+        .lock()
+        .map(|mut cooldowns| {
+            cooldowns.retain(|_, until| *until > now);
+            cooldowns
+                .iter()
+                .filter(|((provider_id, _), _)| provider_id == &profile.id)
+                .map(|((_, model), _)| model.clone())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    approval_fallback_model_with_unavailable(profile, approval_luna, &unavailable)
+}
+
+fn approval_model_is_cooling(profile_id: &str, model: &str) -> bool {
+    let now = now_ms();
+    APPROVAL_MODEL_COOLDOWNS
+        .lock()
+        .map(|mut cooldowns| {
+            cooldowns.retain(|_, until| *until > now);
+            cooldowns
+                .get(&(profile_id.to_string(), model.to_string()))
+                .is_some_and(|until| *until > now)
+        })
+        .unwrap_or(false)
+}
+
+fn is_model_capacity_failure(status: u16, body: &[u8]) -> bool {
+    if status != 429 && status < 500 {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("selected model is at capacity")
+        || text.contains("model is at capacity")
+        || text.contains("model capacity")
+        || text.contains("capacity exceeded")
+        || text.contains("overloaded")
+}
+
+/// 将当前审批模型短暂放入冷却，并确认同一供应商确实存在另一个可用候选。
+/// 返回 true 时调用方可安全地用原始请求重新进入路由；否则保留原错误。
+fn cool_down_approval_model(
+    profile: &profiles::RelayProfile,
+    approval_luna: bool,
+    current_model: &str,
+) -> bool {
+    if !approval_luna {
+        return false;
+    }
+    let inserted = APPROVAL_MODEL_COOLDOWNS
+        .lock()
+        .map(|mut cooldowns| {
+            cooldowns.insert(
+                (profile.id.clone(), current_model.to_string()),
+                now_ms() + APPROVAL_MODEL_COOLDOWN_MS,
+            );
+            true
+        })
+        .unwrap_or(false);
+    if !inserted {
+        return false;
+    }
+    let next = approval_fallback_model(profile, approval_luna);
+    next != current_model && next != "gpt-5.6-luna" && !approval_model_is_cooling(&profile.id, next)
 }
 
 /// 某些中转不会返回标准的 model-not-found/403，而是把旧会话携带的
@@ -1551,6 +1644,19 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                     }
                     let error_body = read_upstream_error_body(resp).await;
                     last_status = Some(status);
+                    let request_model_name = request_model(&request_body);
+                    if is_model_capacity_failure(status, &error_body)
+                        && request_model_name
+                            .as_deref()
+                            .is_some_and(|model| cool_down_approval_model(p, approval_luna, model))
+                    {
+                        log::warn!(
+                            "relay {} approval model {} is at capacity; retrying with a non-cooled model",
+                            p.name,
+                            request_model_name.as_deref().unwrap_or_default()
+                        );
+                        return Box::pin(forward(method, uri, headers, body)).await;
+                    }
                     last_error = Some(upstream_http_failure(p, status, &error_body, &pkey));
                     continue;
                 }
@@ -1641,6 +1747,27 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                             }
                         }
                         InitialStream::TransientFailure(message) => {
+                            // 审批请求在 HTTP 200 后无正文断流时，中转通常不会把
+                            // “容量不足”写进 SSE；将这类首段失败也视为当前审批
+                            // 模型不可用，切到同一供应商的下一个候选。若没有候选，
+                            // 不再对同一模型盲目重发，避免审批命令长时间卡住。
+                            if approval_luna && cool_down_approval_model(p, true, fallback_model) {
+                                log::warn!(
+                                    "relay {} approval model {} failed before SSE output; retrying with a non-cooled model",
+                                    p.name,
+                                    fallback_model
+                                );
+                                return Box::pin(forward(method, uri, headers, body)).await;
+                            }
+                            if approval_luna {
+                                let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
+                                last_status = Some(502);
+                                last_error = Some(format!(
+                                    "upstream {} ({}) approval stream failed before output: {}",
+                                    p.name, p.id, message
+                                ));
+                                continue;
+                            }
                             let stream_model = incoming_model.as_deref();
                             if let Some(model) = stream_model {
                                 if model != p.model && learn_denied_model(&p.id, model) {
@@ -1919,6 +2046,23 @@ fn set_manually_paused(paused: bool) {
     MANUALLY_PAUSED.store(paused, Ordering::Release);
 }
 
+fn stop_runtime() {
+    let runtime = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(rt) = runtime else {
+        return;
+    };
+    if let Some(tx) = rt.shutdown {
+        let _ = tx.send(());
+    }
+    // Graceful shutdown is asynchronous. Do not report the route as stopped
+    // while the old listener still owns 19331, otherwise an immediate restart
+    // or provider switch can hit "address already in use" and surface a 502.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while rt.alive.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Codex 是否仍指向本地路由 (config 的 base_url 被改写且未还原)。
 ///
 /// 只要 Codex 还在用本地地址, 无论路由服务当前是否存活都不能退出 App —
@@ -1953,11 +2097,7 @@ pub fn shutdown() -> Result<(), String> {
     // 1. 先还原 base_url, 让 Codex 后续请求走真实中转 (不再依赖本地路由)
     restore_config(&mut s)?;
     // 2. 再停止本地代理服务
-    if let Some(rt) = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        if let Some(tx) = rt.shutdown {
-            let _ = tx.send(());
-        }
-    }
+    stop_runtime();
     s.enabled = false;
     s.automatic = if resume_after_restart {
         previous_automatic
@@ -2057,11 +2197,7 @@ async fn start_runtime(automatic: bool, takeover: bool) -> Result<RouterStatus, 
                 s.enabled = false;
                 s.automatic = false;
                 save_state(&s)?;
-                if let Some(rt) = RUNTIME.lock().unwrap_or_else(|err| err.into_inner()).take() {
-                    if let Some(tx) = rt.shutdown {
-                        let _ = tx.send(());
-                    }
-                }
+                stop_runtime();
             } else {
                 // 配置仍可能指向 localhost，必须保留监听器，避免直接制造 502。
                 s.enabled = listener_running();
@@ -2127,11 +2263,7 @@ pub fn cancel_prepared_compatibility() -> Result<(), String> {
         // made the cancellation irreversible in memory.
         save_state(&s)?;
     }
-    if let Some(rt) = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        if let Some(tx) = rt.shutdown {
-            let _ = tx.send(());
-        }
-    }
+    stop_runtime();
     Ok(())
 }
 
@@ -2252,11 +2384,7 @@ fn disable_runtime(force: bool) -> Result<(), String> {
     s.automatic = false;
     s.resume_after_restart = false;
     save_state(&s)?;
-    if let Some(rt) = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        if let Some(tx) = rt.shutdown {
-            let _ = tx.send(());
-        }
-    }
+    stop_runtime();
     Ok(())
 }
 
@@ -2749,6 +2877,10 @@ data: {"type":"response.completed","response":{"id":"r1","model":"deepseek-v4-pr
         ));
         assert!(retryable_upstream_status(503, b"service unavailable"));
         assert!(retryable_upstream_status(504, b"gateway timeout"));
+        assert!(!retryable_upstream_status(
+            503,
+            b"Selected model is at capacity. Please try a different model."
+        ));
         assert!(!retryable_upstream_status(500, b"internal error"));
         assert!(!retryable_upstream_status(502, b"invalid account"));
         assert!(!retryable_upstream_status(429, b"too many requests"));
@@ -2784,6 +2916,67 @@ data: {"type":"response.completed","response":{"id":"r1","model":"deepseek-v4-pr
         let ordinary = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"Please review this code change."}]}]}"#;
         assert!(is_approval_review_request(approval));
         assert!(!is_approval_review_request(ordinary));
+    }
+
+    #[test]
+    fn approval_luna_uses_terra_for_gpt_relay_only() {
+        let gpt = profiles::RelayProfile {
+            model: "gpt-5.6-sol".into(),
+            supported_models: vec!["gpt-5.6-sol".into(), "gpt-5.6-terra".into()],
+            ..Default::default()
+        };
+        assert_eq!(approval_fallback_model(&gpt, true), "gpt-5.6-terra");
+        assert_eq!(approval_fallback_model(&gpt, false), "gpt-5.6-sol");
+
+        let luna = profiles::RelayProfile {
+            id: "luna-relay".into(),
+            model: "gpt-5.6-luna".into(),
+            supported_models: vec![
+                "gpt-5.6-luna".into(),
+                "gpt-5.6-terra".into(),
+                "gpt-5.6-sol".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(approval_fallback_model(&luna, true), "gpt-5.6-terra");
+
+        let deepseek = profiles::RelayProfile {
+            model: "deepseek-v4-pro".into(),
+            supported_models: vec!["deepseek-v4-pro".into()],
+            ..Default::default()
+        };
+        assert_eq!(approval_fallback_model(&deepseek, true), "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn capacity_errors_are_recognized_without_treating_all_429_as_capacity() {
+        assert!(is_model_capacity_failure(
+            429,
+            br#"{"error":{"message":"Selected model is at capacity. Please try a different model."}}"#
+        ));
+        assert!(is_model_capacity_failure(503, b"upstream overloaded"));
+        assert!(!is_model_capacity_failure(429, b"rate limit exceeded"));
+        assert!(!is_model_capacity_failure(400, b"model is at capacity"));
+    }
+
+    #[test]
+    fn approval_capacity_cooldown_selects_next_model_once() {
+        let profile = profiles::RelayProfile {
+            id: "capacity-relay".into(),
+            model: "gpt-5.6-luna".into(),
+            supported_models: vec![
+                "gpt-5.6-luna".into(),
+                "gpt-5.6-terra".into(),
+                "gpt-5.6-sol".into(),
+            ],
+            ..Default::default()
+        };
+        let _ = APPROVAL_MODEL_COOLDOWNS
+            .lock()
+            .map(|mut cooldowns| cooldowns.clear());
+        assert!(cool_down_approval_model(&profile, true, "gpt-5.6-terra"));
+        assert_eq!(approval_fallback_model(&profile, true), "gpt-5.6-sol");
+        assert!(!cool_down_approval_model(&profile, true, "gpt-5.6-sol"));
     }
 
     #[test]
