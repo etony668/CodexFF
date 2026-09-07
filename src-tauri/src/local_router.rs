@@ -27,6 +27,11 @@ pub const DEFAULT_PORT: u16 = 19331;
 const BREAKER_THRESHOLD: u32 = 3;
 const BREAKER_COOLDOWN_SECS: i64 = 30;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
+/// 单个 Codex 请求最多允许重新进入完整路由的次数。
+/// 递归重进会重新执行供应商遍历、网关重试和 SSE 首段探测；
+/// 不设总预算时，审批回退可能叠加成数分钟等待。
+const MAX_FORWARD_REENTRIES: u8 = 2;
+const INITIAL_SSE_TIMEOUT: Duration = Duration::from_secs(20);
 const UPSTREAM_ERROR_BODY_LIMIT: usize = 8 * 1024;
 const UPSTREAM_ERROR_TEXT_LIMIT: usize = 1200;
 /// 网关偶发返回 502/503/504 时，在尚未收到任何模型输出前给同一供应商
@@ -473,29 +478,37 @@ async fn inspect_initial_sse(resp: reqwest::Response, current_policy: bool) -> I
     let mut stream = Box::pin(resp.bytes_stream());
     let mut prefix = Vec::new();
     while prefix.len() < PREFIX_CAP {
-        match stream.next().await {
-            Some(Ok(chunk)) => {
-                prefix.extend_from_slice(&chunk);
-                if sse_has_valid_output(&prefix) {
-                    break;
-                }
-                if let Some(next) = reasoning_error_policy(&prefix, current_policy) {
-                    return InitialStream::Retry(next);
-                }
-                if let Some(message) = sse_terminal_failure(&prefix) {
-                    return InitialStream::TransientFailure(message);
-                }
-                // 一个完整 SSE 事件已到达但只是 created/in_progress，继续等
-                // 后续首个有效输出或明确错误。
-            }
-            Some(Err(e)) => {
-                return InitialStream::TransientFailure(e.to_string());
-            }
-            None => {
+        match tokio::time::timeout(INITIAL_SSE_TIMEOUT, stream.next()).await {
+            Err(_) => {
                 return InitialStream::TransientFailure(
-                    "upstream stream ended before the first valid output".to_string(),
+                    "upstream stream produced no valid output before the startup timeout"
+                        .to_string(),
                 );
             }
+            Ok(item) => match item {
+                Some(Ok(chunk)) => {
+                    prefix.extend_from_slice(&chunk);
+                    if sse_has_valid_output(&prefix) {
+                        break;
+                    }
+                    if let Some(next) = reasoning_error_policy(&prefix, current_policy) {
+                        return InitialStream::Retry(next);
+                    }
+                    if let Some(message) = sse_terminal_failure(&prefix) {
+                        return InitialStream::TransientFailure(message);
+                    }
+                    // 一个完整 SSE 事件已到达但只是 created/in_progress，继续等
+                    // 后续首个有效输出或明确错误。
+                }
+                Some(Err(e)) => {
+                    return InitialStream::TransientFailure(e.to_string());
+                }
+                None => {
+                    return InitialStream::TransientFailure(
+                        "upstream stream ended before the first valid output".to_string(),
+                    );
+                }
+            },
         }
     }
     InitialStream::Forward(BufferedStream {
@@ -1472,7 +1485,13 @@ pub fn sync_active() -> Result<RouterStatus, String> {
     apply
 }
 
-async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+async fn forward(
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+    reentries: u8,
+) -> Response {
     let Some((active_profile, _)) = active_relay() else {
         return router_error_response(StatusCode::BAD_GATEWAY, "no active relay provider");
     };
@@ -1655,7 +1674,15 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                             p.name,
                             request_model_name.as_deref().unwrap_or_default()
                         );
-                        return Box::pin(forward(method, uri, headers, body)).await;
+                        if reentries < MAX_FORWARD_REENTRIES {
+                            return Box::pin(forward(method, uri, headers, body, reentries + 1))
+                                .await;
+                        }
+                        last_error = Some(format!(
+                            "approval model fallback exhausted after {} route re-entries",
+                            reentries
+                        ));
+                        continue;
                     }
                     last_error = Some(upstream_http_failure(p, status, &error_body, &pkey));
                     continue;
@@ -1757,7 +1784,22 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                                     p.name,
                                     fallback_model
                                 );
-                                return Box::pin(forward(method, uri, headers, body)).await;
+                                if reentries < MAX_FORWARD_REENTRIES {
+                                    return Box::pin(forward(
+                                        method,
+                                        uri,
+                                        headers,
+                                        body,
+                                        reentries + 1,
+                                    ))
+                                    .await;
+                                }
+                                last_status = Some(502);
+                                last_error = Some(format!(
+                                    "approval stream fallback exhausted after {} route re-entries",
+                                    reentries
+                                ));
+                                continue;
                             }
                             if approval_luna {
                                 let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
@@ -1777,7 +1819,22 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                                         model,
                                         p.model
                                     );
-                                    return Box::pin(forward(method, uri, headers, body)).await;
+                                    if reentries < MAX_FORWARD_REENTRIES {
+                                        return Box::pin(forward(
+                                            method,
+                                            uri,
+                                            headers,
+                                            body,
+                                            reentries + 1,
+                                        ))
+                                        .await;
+                                    }
+                                    last_status = Some(502);
+                                    last_error = Some(format!(
+                                        "task model fallback exhausted after {} route re-entries",
+                                        reentries
+                                    ));
+                                    continue;
                                 }
                             }
                             // HTTP 已是 200，但上游在首个有效输出前断流。此时尚未
@@ -1944,7 +2001,22 @@ async fn forward(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> R
                             );
                             // 当前请求尚未产生任何 SSE 输出，可以安全地用刚学习的
                             // 默认模型重新进入一次路由；DENIED_MODELS 保证不会递归循环。
-                            return Box::pin(forward(method, uri, headers, body)).await;
+                            if reentries < MAX_FORWARD_REENTRIES {
+                                return Box::pin(forward(
+                                    method,
+                                    uri,
+                                    headers,
+                                    body,
+                                    reentries + 1,
+                                ))
+                                .await;
+                            }
+                            last_status = Some(status);
+                            last_error = Some(format!(
+                                "model rejection fallback exhausted after {} route re-entries",
+                                reentries
+                            ));
+                            continue;
                         }
                     }
                 }
@@ -2422,7 +2494,7 @@ async fn handler(method: Method, uri: Uri, headers: HeaderMap, body: Body) -> Re
                 .unwrap()
         }
     };
-    forward(method, uri, headers, bytes).await
+    forward(method, uri, headers, bytes, 0).await
 }
 
 #[cfg(test)]
