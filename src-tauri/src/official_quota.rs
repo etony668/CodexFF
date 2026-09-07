@@ -47,6 +47,7 @@ impl OfficialQuota {
 
 /// macOS 系统代理 (scutil --proxy): HTTPS 优先, 无则 HTTP, 再则 SOCKS;
 /// 显式代理全关时回退到 CFNetwork 解析 PAC。
+#[cfg(target_os = "macos")]
 fn explicit_system_proxy_url() -> Option<String> {
     let mut command = std::process::Command::new("scutil");
     crate::process_utils::hide_console_window(&mut command);
@@ -109,6 +110,70 @@ fn explicit_system_proxy_url() -> Option<String> {
     None
 }
 
+/// Windows 系统代理：优先读取标准代理环境变量，再读取 WinINET
+/// HKCU 设置。只返回代理地址，不修改系统网络；后台 PowerShell 不创建控制台。
+#[cfg(windows)]
+fn explicit_system_proxy_url() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Some(value) = std::env::var_os(key)
+            .and_then(|v| v.into_string().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(if value.contains("://") {
+                value
+            } else {
+                format!("http://{value}")
+            });
+        }
+    }
+    let mut command = std::process::Command::new("powershell.exe");
+    crate::process_utils::hide_console_window(&mut command);
+    let script = r#"
+$p = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+if ($p.ProxyEnable -eq 1 -and $p.ProxyServer) { [Console]::Out.Write($p.ProxyServer) }
+"#;
+    let output = command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    // WinINET may expose protocol-specific entries such as http=host:port;
+    // the HTTPS entry is the safest one for upstream API requests.
+    let selected = value
+        .split(';')
+        .find_map(|entry| {
+            let (scheme, address) = entry.split_once('=')?;
+            scheme
+                .eq_ignore_ascii_case("https")
+                .then_some(address.trim())
+        })
+        .unwrap_or(value.as_str());
+    Some(if selected.contains("://") {
+        selected.to_string()
+    } else {
+        format!("http://{selected}")
+    })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn explicit_system_proxy_url() -> Option<String> {
+    None
+}
+
 pub(crate) fn system_proxy_url() -> Option<String> {
     system_proxy_url_for("https://1.1.1.1/dns-query")
 }
@@ -141,6 +206,7 @@ pub(crate) fn system_proxy_url_for(target: &str) -> Option<String> {
 }
 
 /// 通过进程名判断 PID 是否为常见代理客户端 (避免把普通本地服务当代理)。
+#[cfg(not(windows))]
 fn is_known_proxy_process(pid: u32) -> bool {
     const KEYWORDS: &[&str] = &[
         "flclash",
@@ -193,6 +259,7 @@ fn is_known_proxy_process(pid: u32) -> bool {
 
 /// 系统代理为空时, 扫描常见代理客户端的本地监听端口 (TUN/增强模式
 /// 不写系统代理, 但客户端通常仍在本机开 7890 等混合端口)。
+#[cfg(not(windows))]
 pub(crate) fn fallback_local_proxy_url() -> Option<String> {
     const CANDIDATES: &[(u16, &str)] = &[
         (7890, "http"),
@@ -228,6 +295,13 @@ pub(crate) fn fallback_local_proxy_url() -> Option<String> {
             return Some(format!("{scheme}://127.0.0.1:{port}"));
         }
     }
+    None
+}
+
+/// Windows 代理客户端通常通过 WinINET、环境变量或 TUN 接管网络。
+/// 不执行 macOS 的 lsof 扫描，也不猜测本地端口，避免把普通服务误当成代理。
+#[cfg(windows)]
+pub(crate) fn fallback_local_proxy_url() -> Option<String> {
     None
 }
 
@@ -437,6 +511,9 @@ pub async fn query_official_quota() -> Result<OfficialQuota, String> {
     if let Some(id) = account_id {
         req = req.header("ChatGPT-Account-Id", id);
     }
+    // 官方账号刚切换时，chatgpt.com 可能在极短时间内仍使用旧会话边界。
+    // 401/403 先做一次有界重试，避免把切换竞态误报成“登录已过期”；
+    // 真正过期仍在重试后明确返回，不会无限请求。
     let mut resp = req.send().await.map_err(|e| format!("网络错误: {e}"))?;
     let mut status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
