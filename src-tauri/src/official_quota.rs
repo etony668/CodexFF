@@ -437,8 +437,20 @@ pub async fn query_official_quota() -> Result<OfficialQuota, String> {
     if let Some(id) = account_id {
         req = req.header("ChatGPT-Account-Id", id);
     }
-    let resp = req.send().await.map_err(|e| format!("网络错误: {e}"))?;
-    let status = resp.status();
+    let mut resp = req.send().await.map_err(|e| format!("网络错误: {e}"))?;
+    let mut status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let mut retry = client
+            .get("https://chatgpt.com/backend-api/wham/usage")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/json");
+        if let Some(id) = account_id {
+            retry = retry.header("ChatGPT-Account-Id", id);
+        }
+        resp = retry.send().await.map_err(|e| format!("网络错误: {e}"))?;
+        status = resp.status();
+    }
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Ok(OfficialQuota::fail(format!(
             "官方登录已过期 (HTTP {status}) — 请切到官方并重新 codex login"

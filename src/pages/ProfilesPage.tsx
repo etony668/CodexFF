@@ -181,6 +181,8 @@ export function ProfilesPage({
   const [officialQuota, setOfficialQuota] = useState<OfficialQuota | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(false);
   const quotaInFlight = useRef(false);
+  const quotaRefreshPending = useRef(false);
+  const quotaRequestSeq = useRef(0);
   const quotaFailures = useRef(0);
   const quotaNextAt = useRef(0);
 
@@ -295,12 +297,17 @@ export function ProfilesPage({
   }, []);
 
   async function queryOfficialQuota(force = false) {
-    if (quotaInFlight.current) return;
+    if (quotaInFlight.current) {
+      if (force) quotaRefreshPending.current = true;
+      return;
+    }
     if (!force && Date.now() < quotaNextAt.current) return;
+    const requestSeq = ++quotaRequestSeq.current;
     quotaInFlight.current = true;
     setQuotaLoading(true);
     try {
       const result = await getOfficialQuota();
+      if (requestSeq !== quotaRequestSeq.current) return;
       setOfficialQuota(result);
       if (result.error) {
         quotaFailures.current += 1;
@@ -311,6 +318,7 @@ export function ProfilesPage({
         quotaNextAt.current = Date.now() + 10 * 60 * 1000;
       }
     } catch (e) {
+      if (requestSeq !== quotaRequestSeq.current) return;
       setOfficialQuota({ ...emptyQuota, error: errMsg(e) });
       quotaFailures.current += 1;
       const delayMinutes = Math.min(60, 10 * 2 ** quotaFailures.current);
@@ -318,12 +326,17 @@ export function ProfilesPage({
     } finally {
       quotaInFlight.current = false;
       setQuotaLoading(false);
+      if (quotaRefreshPending.current) {
+        quotaRefreshPending.current = false;
+        void queryOfficialQuota(true);
+      }
     }
   }
 
   // 每次进入官方态自动查询 (挂载时官方态 / 切到官方 / 切走再切回都触发)
   useEffect(() => {
     if (status?.active?.kind !== "official") return;
+    quotaRequestSeq.current += 1;
     quotaFailures.current = 0;
     quotaNextAt.current = 0;
     setOfficialQuota(null);
