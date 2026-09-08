@@ -231,6 +231,7 @@ export function getBalance(profileId: string): Promise<BalanceInfo> {
 export interface UsageDailyPoint {
   date: string;
   balance: number | null;
+  tokens: number;
 }
 
 export interface ProviderUsage {

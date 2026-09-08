@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AppStatus,
   BalanceInfo,
@@ -17,6 +17,7 @@ import {
   prepareOfficialAccountLogin,
   UsageDailyPoint,
   UsageOverview,
+  ProviderUsage,
   RouterStatus,
   listUsageStats,
   localRouterStatus,
@@ -111,43 +112,140 @@ function QuotaBar({
   );
 }
 
-/** 30 天余额趋势迷你图 */
-function UsageSparkline({ series }: { series: UsageDailyPoint[] }) {
-  const values = series.map((d) => d.balance).filter((v): v is number => v != null);
-  const w = 180;
-  const h = 34;
-  if (values.length === 0) {
-    return <span className="dim usage-empty">暂无趋势</span>;
+const usageLineColors = [
+  "#4f8cff",
+  "#22c55e",
+  "#f59e0b",
+  "#e879f9",
+  "#06b6d4",
+  "#f97316",
+];
+
+/** 最近 7 天各供应商 Token 消耗趋势；同名供应商合并为一条线。 */
+function OverallUsageChart({ providers }: { providers: ProviderUsage[] }) {
+  const groups = useMemo(() => {
+    const map = new Map<string, { name: string; series: UsageDailyPoint[] }>();
+    for (const provider of providers) {
+      const name = provider.provider_name.trim() || provider.provider_id;
+      const key = name.toLocaleLowerCase();
+      const current = map.get(key);
+      if (!current) {
+        map.set(key, {
+          name,
+          series: provider.series.slice(-7).map((point) => ({ ...point })),
+        });
+        continue;
+      }
+      const byDate = new Map(current.series.map((point) => [point.date, point]));
+      for (const point of provider.series.slice(-7)) {
+        const existing = byDate.get(point.date);
+        if (existing) existing.tokens += point.tokens;
+      }
+    }
+    return [...map.values()];
+  }, [providers]);
+
+  if (groups.length === 0) {
+    return <p className="hint usage-empty">还没有余额记录，先点一次「刷新余额」。</p>;
   }
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min || 1;
-  const pts = series
-    .map((d, i) => {
-      if (d.balance == null) return null;
-      const x = series.length <= 1 ? 0 : (i / (series.length - 1)) * (w - 2) + 1;
-      const y = h - 2 - ((d.balance - min) / span) * (h - 6);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .filter((p): p is string => p != null)
-    .join(" ");
+
+  const width = 820;
+  const height = 220;
+  const padX = 126;
+  const padY = 18;
+  const allValues = groups.flatMap((group) =>
+    group.series.map((point) => point.tokens),
+  );
+  const max = Math.max(...allValues, 0);
+  const span = max || 1;
+  const dateCount = Math.max(...groups.map((group) => group.series.length), 1);
+  const xFor = (index: number) =>
+    dateCount <= 1
+      ? padX
+      : padX + (index / (dateCount - 1)) * (width - padX * 2);
+  const yFor = (value: number) =>
+    height - padY - (value / span) * (height - padY * 2);
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map((ratio) => ({
+    value: Math.round(max * ratio),
+    y: height - padY - ratio * (height - padY * 2),
+  }));
+  const dateLabels = groups[0]?.series ?? [];
+  const dateLabelIndexes = [...new Set([
+    0,
+    Math.floor((dateLabels.length - 1) / 2),
+    dateLabels.length - 1,
+  ])].filter((index) => index >= 0 && index < dateLabels.length);
+
   return (
-    <svg
-      className="usage-spark"
-      width={w}
-      height={h}
-      viewBox={`0 0 ${w} ${h}`}
-      role="img"
-      aria-label="最近30天余额趋势"
-    >
-      <polyline
-        points={pts}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinejoin="round"
-      />
-    </svg>
+    <div className="usage-chart-wrap">
+      <div className="usage-chart-frame">
+        <div className="usage-chart-y-title">Token 消耗量</div>
+        <svg
+          className="usage-chart"
+          viewBox={`0 0 ${width} ${height}`}
+          role="img"
+          aria-label="最近7天各供应商 Token 消耗趋势"
+        >
+          {yTicks.map((tick) => (
+            <g key={tick.value}>
+              <line className="usage-chart-grid" x1={padX} x2={width - 12} y1={tick.y} y2={tick.y} />
+              <text className="usage-chart-axis-label" x={padX - 12} y={tick.y + 4} textAnchor="end">
+                {tick.value.toLocaleString()}
+              </text>
+            </g>
+          ))}
+          {dateLabelIndexes.map((index) => (
+            <text
+              className="usage-chart-axis-label"
+              key={dateLabels[index].date}
+              x={xFor(index)}
+              y={height - 3}
+              textAnchor={index === 0 ? "start" : index === dateLabels.length - 1 ? "end" : "middle"}
+            >
+              {dateLabels[index].date.slice(5)}
+            </text>
+          ))}
+          {groups.map((group, groupIndex) => {
+            const segments: string[] = [];
+            let segment: string[] = [];
+            group.series.forEach((point, index) => {
+              if (point.tokens === 0) {
+                if (segment.length > 1) segments.push(segment.join(" "));
+                segment = [];
+                return;
+              }
+              segment.push(`${xFor(index).toFixed(1)},${yFor(point.tokens).toFixed(1)}`);
+            });
+            if (segment.length > 1) segments.push(segment.join(" "));
+            return segments.map((points, index) => (
+              <polyline
+                key={`${group.name}-${index}`}
+                points={points}
+                fill="none"
+                stroke={usageLineColors[groupIndex % usageLineColors.length]}
+                strokeWidth="1.6"
+                strokeLinejoin="round"
+                strokeLinecap="round"
+              />
+            ));
+          })}
+        </svg>
+      </div>
+      <div className="usage-chart-legend">
+        {groups.map((group, index) => (
+          <div className="usage-chart-legend-item" key={group.name}>
+            <span
+              className="usage-chart-swatch"
+              style={{ backgroundColor: usageLineColors[index % usageLineColors.length] }}
+            />
+            <strong>{group.name}</strong>
+            <span className="dim">
+              总计 {group.series.reduce((sum, point) => sum + point.tokens, 0).toLocaleString()} tokens
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -933,24 +1031,7 @@ export function ProfilesPage({
                 {usage.session_tokens.toLocaleString()} Token
               </p>
             )}
-            <div className="usage-rows">
-              {usage.providers.length === 0 && (
-                <p className="hint usage-empty">还没有余额记录，先点一次「刷新余额」。</p>
-              )}
-              {usage.providers.map((p) => (
-                <div key={p.provider_id} className="usage-row">
-                  <div className="usage-row-main">
-                    <strong>{p.provider_name}</strong>
-                    <span className="dim">
-                      {p.latest
-                        ? `余额 ${p.latest.balance?.toFixed(2) ?? "-"} ${p.latest.currency ?? ""} · 更新于 ${new Date(p.latest.ts_ms).toLocaleString()}`
-                        : "暂无余额记录"}
-                    </span>
-                  </div>
-                  <UsageSparkline series={p.series} />
-                </div>
-              ))}
-            </div>
+            <OverallUsageChart providers={usage.providers} />
           </>
         )}
       </section>

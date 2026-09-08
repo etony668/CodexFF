@@ -1365,6 +1365,66 @@ button .btn-icon {
 .usage-metric strong { font-size: 18px; line-height: 1.2; }
 .usage-metric span { font-size: 12px; color: var(--dim); }
 .usage-rows { display: flex; flex-direction: column; gap: 8px; }
+.usage-chart-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.usage-chart-frame {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+}
+.usage-chart {
+  display: block;
+  width: 100%;
+  min-height: 180px;
+  overflow: visible;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+}
+.usage-chart-y-title {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  writing-mode: vertical-rl;
+}
+.usage-chart-grid {
+  stroke: color-mix(in srgb, var(--border) 70%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 3 5;
+}
+.usage-chart-axis-label {
+  fill: var(--dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.usage-chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+}
+.usage-chart-swatch {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+}
 .usage-row {
   display: flex;
   align-items: center;
