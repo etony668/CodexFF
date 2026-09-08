@@ -519,6 +519,11 @@ export function quitApp(): Promise<void> {
   return invoke("quit_app");
 }
 
+/** 关闭本地路由后自动退出应用 */
+export function confirmQuitApp(): Promise<void> {
+  return invoke("confirm_quit_app");
+}
+
 /** Codex 桌面/CLI 是否在运行 (隔离前预检) */
 export function isCodexRunning(): Promise<boolean> {
   return invoke("is_codex_running");

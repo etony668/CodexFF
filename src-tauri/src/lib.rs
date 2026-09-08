@@ -24,6 +24,7 @@ pub mod vault;
 pub mod workflow;
 
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 #[cfg(target_os = "macos")]
 use tauri::Manager;
@@ -34,6 +35,7 @@ use profiles::{ActiveSelection, ProfilesError, RelayProfile, RelayProfileInput};
 /// 覆盖完整的 async 供应商事务：预检、路由解除、profile 写入、接管验证、
 /// 补偿回滚和切换记录都必须串行，不能只锁住中间的同步文件写入阶段。
 static PROVIDER_SWITCH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+static QUIT_CONFIRMATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize)]
 struct ApiError {
@@ -712,6 +714,32 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// 用户确认退出时，先还原 Codex 的真实供应商地址并停止本地路由，
+/// 完成后自动退出 App，避免用户重复点击退出。
+#[tauri::command]
+fn confirm_quit_app(app: tauri::AppHandle) -> Result<(), ApiError> {
+    if QUIT_CONFIRMATION_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    let result = if local_router::codex_may_depend_on_router() || local_router::status().enabled {
+        local_router::shutdown().map_err(|e| ApiError {
+            message: format!("关闭本地路由失败，App 未退出: {e}"),
+        })
+    } else {
+        Ok(())
+    };
+    match result {
+        Ok(()) => {
+            app.exit(0);
+            Ok(())
+        }
+        Err(error) => {
+            QUIT_CONFIRMATION_IN_PROGRESS.store(false, Ordering::Release);
+            Err(error)
+        }
+    }
+}
+
 /// Codex 桌面/CLI 是否在运行 (前端隔离前预检, 弹悬浮提示用)
 #[tauri::command]
 fn is_codex_running() -> Result<bool, ApiError> {
@@ -1094,6 +1122,7 @@ pub fn run() {
             uninstall_workflow_preset,
             restore_workflow_preset,
             quit_app,
+            confirm_quit_app,
             is_codex_running,
             is_codex_installed,
             codex_install_status,
@@ -1169,10 +1198,8 @@ pub fn run() {
         if let tauri::RunEvent::Reopen { .. } = event {
             tray::show_main_window(app_handle);
         }
-        // 退出拦截: 本地路由正在为 Codex 转发时, 直接退出会让 Codex 下一请求
-        // 打到已关闭的本地端口 → 502/会话连接失败。提示用户先退出 Codex;
-        // 只要 Codex 仍依赖本地路由，就必须阻止退出，避免下一请求命中
-        // 已关闭的 19331 端口。不存在绕过此保护的“强制退出”入口。
+        // 路由正在被 Codex 使用时，退出请求只拦截一次并弹出确认框；
+        // 用户确认后由 confirm_quit_app 先还原真实地址、关闭路由，再自动退出。
         if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
             use tauri::Emitter;
             if local_router::codex_may_depend_on_router() && crate::session_manager::codex_running()

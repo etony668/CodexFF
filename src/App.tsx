@@ -10,6 +10,7 @@ import {
   errMsg,
   getStatus,
   takePendingDeeplink,
+  confirmQuitApp,
 } from "./api";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { listen } from "@tauri-apps/api/event";
@@ -329,12 +330,19 @@ function App() {
   // 退出拦截: 路由开启 + Codex 运行中时，后端阻止退出并显示倒计时提示。
   useEffect(() => {
     const unlisten = listen("exit-blocked", () => {
-      // 退出被拦截时回到供应商切换首页，用户可直接关闭本地路由后重试退出。
-      setTab("profiles");
-      showErrorToast(
-        "暂时无法退出",
-        "Codex 正在使用本地路由。请先完全退出 Codex / ChatGPT 桌面端与命令行，再退出 CodexFF。",
-      );
+      setConfirmState({
+        title: "退出前关闭本地路由？",
+        message:
+          "Codex 当前正在使用本地路由。确认后将先关闭路由并恢复真实供应商地址，完成后自动退出 CodexFF。",
+        confirmLabel: "关闭路由并退出",
+        cancelLabel: "取消",
+        onConfirm: () => {
+          setConfirmState(null);
+          void confirmQuitApp().catch((error) => {
+            showErrorToast("退出失败", errMsg(error));
+          });
+        },
+      });
     });
     return () => {
       unlisten.then((f) => f());
