@@ -1274,6 +1274,16 @@ pub fn activate_official_with_progress(
                 "官方项目索引同步失败: {e}; 凭证回滚={auth_ok}"
             )));
         }
+        if let Err(e) = crate::session_manager::sync_recents_visibility_for(true) {
+            restore_config_or_remove(&backup);
+            let auth_ok = rollback_auth(&prev_active);
+            let _ = crate::session_unify::sync_project_visibility(
+                crate::codex_config::SHARED_MODEL_PROVIDER,
+            );
+            return Err(ProfilesError::RolledBack(format!(
+                "官方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
+            )));
+        }
     }
 
     vault::clear_relay_state();
@@ -1296,6 +1306,10 @@ pub fn activate_official_with_progress(
         if project_scope_changed && !previous_provider.is_empty() {
             let _ = crate::session_unify::sync_project_visibility(previous_provider);
         }
+        let _ = crate::session_manager::sync_recents_visibility_for(matches!(
+            prev_active,
+            Some(ActiveSelection::Official)
+        ));
         return Err(ProfilesError::RolledBack(format!(
             "保存官方切换状态失败: {e}; 凭证回滚={auth_ok}"
         )));
@@ -1424,6 +1438,23 @@ pub fn activate_relay_with_progress(
             )));
         }
     }
+    // Recents/最近不是只在官方↔第三方变化时才需要校正：第三方
+    // DeepSeek↔PixelAPI 热切换也可能期间产生了新的官方索引行，
+    // 或 Codex 更新后重新写回了旧索引。因此每次切换供应商都执行
+    // 同一份可逆投影，不能用 project_scope_changed 跳过。
+    if let Err(e) = crate::session_manager::sync_recents_visibility_for(false) {
+        restore_config_or_remove(&backup);
+        let auth_ok = rollback_auth(&prev_active);
+        let _ = vault::save_relay_state(&relay_state_before);
+        if project_scope_changed {
+            let _ = crate::session_unify::sync_project_visibility(
+                crate::codex_config::OFFICIAL_MODEL_PROVIDER,
+            );
+        }
+        return Err(ProfilesError::RolledBack(format!(
+            "第三方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
+        )));
+    }
 
     profiles.active = Some(ActiveSelection::Relay {
         profile_id: profile_id.to_string(),
@@ -1440,6 +1471,10 @@ pub fn activate_relay_with_progress(
         if project_scope_changed && !previous_provider.is_empty() {
             let _ = crate::session_unify::sync_project_visibility(previous_provider);
         }
+        let _ = crate::session_manager::sync_recents_visibility_for(matches!(
+            prev_active,
+            Some(ActiveSelection::Official)
+        ));
         return Err(ProfilesError::RolledBack(format!(
             "保存第三方切换状态失败: {e}; 凭证回滚={auth_ok}"
         )));

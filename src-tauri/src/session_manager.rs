@@ -321,6 +321,11 @@ pub(crate) fn normalize_title(s: &str) -> String {
 const THREADS_ISOLATED_TABLE: &str = "threads_codexff_isolated";
 const SECTIONS_ISOLATED_TABLE: &str = "thread_sections_codexff_isolated";
 const TOOLS_ISOLATED_TABLE: &str = "thread_dynamic_tools_codexff_isolated";
+/// Recents 可见性投影使用独立表，绝不复用旧的“会话隔离”标记表。
+/// 这里仅隐藏线程索引，rollout 文件仍留在原目录，切换回来可恢复。
+const THREADS_RECENTS_HIDDEN_TABLE: &str = "threads_codexff_recents_hidden";
+const SECTIONS_RECENTS_HIDDEN_TABLE: &str = "thread_sections_codexff_recents_hidden";
+const TOOLS_RECENTS_HIDDEN_TABLE: &str = "thread_dynamic_tools_codexff_recents_hidden";
 
 pub(crate) fn state_db_conn_rw() -> Result<Connection, SessionError> {
     let conn = Connection::open(codex_config::codex_state_db_path())?;
@@ -408,6 +413,293 @@ fn ensure_db_backup_tables(conn: &mut Connection) -> Result<(), SessionError> {
         ))?;
         tx.commit()?;
     }
+    Ok(())
+}
+
+/// 确保 Recents 投影的隐藏表存在且与当前 Codex schema 对齐。
+///
+/// Codex 升级会给 `threads` 增加列；隐藏表必须跟随列集变化，否则下一次
+/// 切换会因 `INSERT ... SELECT *` 列数不一致而失败。旧隐藏行只回填共有列，
+/// 新列使用主表定义的默认值。
+fn ensure_recents_hidden_tables(conn: &mut Connection) -> Result<(), SessionError> {
+    for (src, dst) in [
+        ("threads", THREADS_RECENTS_HIDDEN_TABLE),
+        ("thread_sections", SECTIONS_RECENTS_HIDDEN_TABLE),
+        ("thread_dynamic_tools", TOOLS_RECENTS_HIDDEN_TABLE),
+    ] {
+        if !table_exists(conn, src) {
+            continue;
+        }
+        if !table_exists(conn, dst) {
+            conn.execute(
+                &format!("CREATE TABLE {dst} AS SELECT * FROM {src} WHERE 1=0"),
+                [],
+            )?;
+        } else {
+            let src_cols = table_columns(conn, src);
+            let dst_cols = table_columns(conn, dst);
+            let drifted = src_cols.len() != dst_cols.len()
+                || src_cols.iter().any(|col| !dst_cols.contains(col))
+                || dst_cols.iter().any(|col| !src_cols.contains(col));
+            if drifted {
+                let tx = conn.transaction()?;
+                let staging = format!("{dst}_codexff_rebuild");
+                tx.execute_batch(&format!(
+                    "DROP TABLE IF EXISTS {staging}; \
+                     CREATE TABLE {staging} AS SELECT * FROM {src} WHERE 1=0;"
+                ))?;
+                let common: Vec<&String> =
+                    src_cols.iter().filter(|c| dst_cols.contains(c)).collect();
+                if !common.is_empty() {
+                    let cols = common
+                        .iter()
+                        .map(|c| quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tx.execute(
+                        &format!("INSERT INTO {staging} ({cols}) SELECT {cols} FROM {dst}"),
+                        [],
+                    )?;
+                }
+                tx.execute_batch(&format!(
+                    "DROP TABLE {dst}; ALTER TABLE {staging} RENAME TO {dst};"
+                ))?;
+                tx.commit()?;
+            }
+        }
+    }
+    // CREATE TABLE AS 不复制主键；补唯一索引，防止重复切换积累同一线程的
+    // 隐藏副本。旧表若已有重复行，先保留最早一行再建索引。
+    conn.execute(
+        &format!(
+            "DELETE FROM {THREADS_RECENTS_HIDDEN_TABLE}
+             WHERE rowid NOT IN (
+               SELECT MIN(rowid) FROM {THREADS_RECENTS_HIDDEN_TABLE} GROUP BY id
+             )"
+        ),
+        [],
+    )?;
+    if table_exists(conn, SECTIONS_RECENTS_HIDDEN_TABLE) {
+        conn.execute(
+            &format!(
+                "DELETE FROM {SECTIONS_RECENTS_HIDDEN_TABLE}
+                 WHERE rowid NOT IN (
+                   SELECT MIN(rowid) FROM {SECTIONS_RECENTS_HIDDEN_TABLE} GROUP BY id
+                 )"
+            ),
+            [],
+        )?;
+    }
+    if table_exists(conn, TOOLS_RECENTS_HIDDEN_TABLE) {
+        conn.execute(
+            &format!(
+                "DELETE FROM {TOOLS_RECENTS_HIDDEN_TABLE}
+                 WHERE rowid NOT IN (
+                   SELECT MIN(rowid) FROM {TOOLS_RECENTS_HIDDEN_TABLE}
+                   GROUP BY thread_id, position
+                 )"
+            ),
+            [],
+        )?;
+    }
+    conn.execute(
+        &format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_{THREADS_RECENTS_HIDDEN_TABLE}_id
+             ON {THREADS_RECENTS_HIDDEN_TABLE}(id)"
+        ),
+        [],
+    )?;
+    if table_exists(conn, SECTIONS_RECENTS_HIDDEN_TABLE) {
+        conn.execute(
+            &format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_{SECTIONS_RECENTS_HIDDEN_TABLE}_id
+                 ON {SECTIONS_RECENTS_HIDDEN_TABLE}(id)"
+            ),
+            [],
+        )?;
+    }
+    if table_exists(conn, TOOLS_RECENTS_HIDDEN_TABLE) {
+        conn.execute(
+            &format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_{TOOLS_RECENTS_HIDDEN_TABLE}_key
+                 ON {TOOLS_RECENTS_HIDDEN_TABLE}(thread_id, position)"
+            ),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// 将不属于当前渠道的线程从 Codex 主索引隐藏，或把当前渠道的线程恢复。
+///
+/// 这是 Recents/最近的索引级投影：
+/// - `official=true` 只保留 `openai` 在主表，`custom` 放入隐藏表；
+/// - `official=false` 只保留 `custom` 在主表，`openai` 放入隐藏表。
+///
+/// 不读取或移动任何 JSONL，不改写线程 provider，不依赖旧会话隔离开关。
+/// 所有操作在一个 SQLite 事务内完成，失败自动回滚。
+pub fn sync_recents_visibility_for(official: bool) -> Result<(), SessionError> {
+    let db_path = codex_config::codex_state_db_path();
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let mut conn = state_db_conn_rw()?;
+    if !table_exists(&conn, "threads") {
+        return Ok(());
+    }
+    ensure_recents_hidden_tables(&mut conn)?;
+    let visible_provider = if official {
+        codex_config::OFFICIAL_MODEL_PROVIDER
+    } else {
+        codex_config::SHARED_MODEL_PROVIDER
+    };
+    let hidden_provider = if official {
+        codex_config::SHARED_MODEL_PROVIDER
+    } else {
+        codex_config::OFFICIAL_MODEL_PROVIDER
+    };
+    let tx = conn.transaction()?;
+    let has_tools = table_exists(&tx, "thread_dynamic_tools");
+    let has_sections = table_exists(&tx, "thread_sections");
+
+    // 先恢复目标渠道之前隐藏的线程，保证切换回来时 Recents 完整。
+    let restore_ids = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id FROM {THREADS_RECENTS_HIDDEN_TABLE} WHERE model_provider=?1"
+        ))?;
+        let rows = stmt.query_map([visible_provider], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for thread_id in restore_ids {
+        let section_id: Option<String> = tx
+            .query_row(
+                &format!(
+                    "SELECT thread_section_id FROM {THREADS_RECENTS_HIDDEN_TABLE} WHERE id=?1"
+                ),
+                [&thread_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO threads SELECT * FROM {THREADS_RECENTS_HIDDEN_TABLE} WHERE id=?1"
+            ),
+            [&thread_id],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM {THREADS_RECENTS_HIDDEN_TABLE} WHERE id=?1"),
+            [&thread_id],
+        )?;
+        if has_sections {
+            if let Some(section_id) = section_id {
+                tx.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO thread_sections SELECT * FROM {SECTIONS_RECENTS_HIDDEN_TABLE} WHERE id=?1"
+                    ),
+                    [&section_id],
+                )?;
+                tx.execute(
+                    &format!("DELETE FROM {SECTIONS_RECENTS_HIDDEN_TABLE} WHERE id=?1"),
+                    [&section_id],
+                )?;
+            }
+        }
+        if has_tools {
+            tx.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO thread_dynamic_tools \
+                     SELECT * FROM {TOOLS_RECENTS_HIDDEN_TABLE} WHERE thread_id=?1"
+                ),
+                [&thread_id],
+            )?;
+            tx.execute(
+                &format!("DELETE FROM {TOOLS_RECENTS_HIDDEN_TABLE} WHERE thread_id=?1"),
+                [&thread_id],
+            )?;
+        }
+    }
+
+    // 再把另一渠道从主索引移入独立隐藏表。线程正文和 provider 字段均不变。
+    let hidden_ids = {
+        let mut stmt = tx.prepare("SELECT id FROM threads WHERE model_provider=?1")?;
+        let rows = stmt.query_map([hidden_provider], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for thread_id in hidden_ids {
+        let section_id: Option<String> = tx
+            .query_row(
+                "SELECT thread_section_id FROM threads WHERE id=?1",
+                [&thread_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {THREADS_RECENTS_HIDDEN_TABLE} \
+                 SELECT * FROM threads WHERE id=?1"
+            ),
+            [&thread_id],
+        )?;
+        if has_tools {
+            tx.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO {TOOLS_RECENTS_HIDDEN_TABLE} \
+                     SELECT * FROM thread_dynamic_tools WHERE thread_id=?1"
+                ),
+                [&thread_id],
+            )?;
+            tx.execute(
+                "DELETE FROM thread_dynamic_tools WHERE thread_id=?1",
+                [&thread_id],
+            )?;
+        }
+        tx.execute("DELETE FROM threads WHERE id=?1", [&thread_id])?;
+        if has_sections {
+            if let Some(section_id) = section_id {
+                let refs: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM threads WHERE thread_section_id=?1",
+                        [&section_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                if refs == 0 {
+                    tx.execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO {SECTIONS_RECENTS_HIDDEN_TABLE} \
+                             SELECT * FROM thread_sections WHERE id=?1"
+                        ),
+                        [&section_id],
+                    )?;
+                    tx.execute("DELETE FROM thread_sections WHERE id=?1", [&section_id])?;
+                }
+            }
+        }
+    }
+    tx.commit()?;
+
+    // Codex Desktop 的 Recents 还会读取 session_index.jsonl。同步这份轻量索引，
+    // 否则 SQLite 已隐藏的线程仍可能在“最近”中出现。只读取每行 id，不读取正文。
+    let mut visible_ids = HashSet::new();
+    let mut hidden_ids = HashSet::new();
+    for table in ["threads", THREADS_RECENTS_HIDDEN_TABLE] {
+        let conn = state_db_conn_ro()?;
+        let mut stmt = conn.prepare(&format!("SELECT id FROM {table} WHERE model_provider=?1"))?;
+        for row in stmt.query_map([visible_provider], |row| row.get::<_, String>(0))? {
+            visible_ids.insert(row?);
+        }
+    }
+    for table in ["threads", THREADS_RECENTS_HIDDEN_TABLE] {
+        let conn = state_db_conn_ro()?;
+        let mut stmt = conn.prepare(&format!("SELECT id FROM {table} WHERE model_provider=?1"))?;
+        for row in stmt.query_map([hidden_provider], |row| row.get::<_, String>(0))? {
+            hidden_ids.insert(row?);
+        }
+    }
+    sync_recents_session_index(visible_provider, hidden_provider, &visible_ids, &hidden_ids)?;
+    sync_recents_catalog(official)?;
     Ok(())
 }
 
@@ -822,6 +1114,295 @@ fn codex_global_state_path() -> std::path::PathBuf {
 
 fn global_state_quarantine_root() -> std::path::PathBuf {
     vault::vault_dir().join("global-state-quarantine")
+}
+
+fn recents_index_quarantine_root() -> std::path::PathBuf {
+    vault::vault_dir().join("recents-index-quarantine")
+}
+
+/// 仅按 session_index.jsonl 的顶层 id 字段做 Recents 可见性投影。
+///
+/// 这里把每一行视为不透明索引记录：不读取标题、消息、rollout 或任何会话正文。
+/// 被隐藏的原始行按线程 ID 保存，切换回来时原样恢复。
+fn sync_recents_session_index(
+    visible_provider: &str,
+    hidden_provider: &str,
+    visible_ids: &HashSet<String>,
+    hidden_ids: &HashSet<String>,
+) -> Result<(), SessionError> {
+    let path = session_index_path();
+    let quarantine_root = recents_index_quarantine_root();
+    sync_recents_session_index_at(
+        &path,
+        &quarantine_root,
+        visible_provider,
+        hidden_provider,
+        visible_ids,
+        hidden_ids,
+    )
+}
+
+fn sync_recents_session_index_at(
+    path: &Path,
+    quarantine_root: &Path,
+    visible_provider: &str,
+    hidden_provider: &str,
+    visible_ids: &HashSet<String>,
+    hidden_ids: &HashSet<String>,
+) -> Result<(), SessionError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&path)?;
+
+    // 先恢复当前渠道此前隐藏的索引行；文件内容只按原始行处理。
+    let restore_dir = quarantine_root.join(visible_provider);
+    let mut restored = String::new();
+    let mut restore_files = Vec::new();
+    if restore_dir.exists() {
+        for entry in std::fs::read_dir(&restore_dir)? {
+            let entry = entry?;
+            let file = entry.path();
+            if file.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            restored.push_str(&std::fs::read_to_string(&file)?);
+            restore_files.push(file);
+        }
+    }
+
+    let mut existing_ids = HashSet::new();
+    for line in text.lines() {
+        let Some(id) = index_record_id(line) else {
+            continue;
+        };
+        existing_ids.insert(id);
+    }
+    let mut merged = text;
+    if !merged.is_empty() && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    if !restored.is_empty() {
+        let current_ids = existing_ids.clone();
+        for line in restored.lines() {
+            let Some(id) = index_record_id(line) else {
+                continue;
+            };
+            // 对同一线程的多条索引记录全部原样恢复；仅跳过当前索引中
+            // 已存在的线程，避免重复切换造成重复行。
+            if !current_ids.contains(&id) {
+                merged.push_str(line);
+                merged.push('\n');
+            }
+        }
+    }
+
+    // 再隐藏当前属于另一渠道的索引行，原样保存，不触碰会话文件。
+    let mut keep = String::with_capacity(merged.len());
+    let mut removed: HashMap<String, String> = HashMap::new();
+    for line in merged.lines() {
+        let Some(id) = index_record_id(line) else {
+            keep.push_str(line);
+            keep.push('\n');
+            continue;
+        };
+        if hidden_ids.contains(&id) && !visible_ids.contains(&id) {
+            let entry = removed.entry(id).or_default();
+            entry.push_str(line);
+            entry.push('\n');
+        } else {
+            keep.push_str(line);
+            keep.push('\n');
+        }
+    }
+
+    let changed = keep != merged || !restored.is_empty();
+    if changed {
+        vault::atomic_write_bytes(&path, keep.as_bytes()).map_err(|e| {
+            SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("写入 Recents 索引失败: {e}"),
+            ))
+        })?;
+    }
+    if !removed.is_empty() {
+        let dir = quarantine_root.join(hidden_provider);
+        std::fs::create_dir_all(&dir)?;
+        for (id, lines) in removed {
+            std::fs::write(dir.join(format!("{id}.jsonl")), lines)?;
+        }
+    }
+    for file in restore_files {
+        let _ = std::fs::remove_file(file);
+    }
+    Ok(())
+}
+
+/// 从 session_index.jsonl 一行中提取唯一线程 ID；不解析任何其他字段。
+fn index_record_id(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line).ok().and_then(|value| {
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+const RECENTS_CATALOG_HIDDEN_TABLE: &str = "local_thread_catalog_codexff_recents_hidden";
+const RECENTS_CATALOG_SCAN_HIDDEN_TABLE: &str =
+    "local_thread_catalog_scan_entries_codexff_recents_hidden";
+
+/// 同步 Codex Desktop 的本地 Recents catalog。
+///
+/// 只处理 catalog 的 host/thread/provider 索引字段；display_title、cwd、
+/// source_detail 等列作为不透明数据整体搬运，不读取其内容，也不触碰 rollout。
+fn sync_recents_catalog(official: bool) -> Result<(), SessionError> {
+    let path = codex_config::codex_config_dir().join("sqlite/codex-dev.db");
+    sync_recents_catalog_at(&path, official)
+}
+
+fn sync_recents_catalog_at(path: &Path, official: bool) -> Result<(), SessionError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    if !table_exists(&conn, "local_thread_catalog") {
+        return Ok(());
+    }
+    let visible_provider = if official {
+        codex_config::OFFICIAL_MODEL_PROVIDER
+    } else {
+        codex_config::SHARED_MODEL_PROVIDER
+    };
+    let hidden_provider = if official {
+        codex_config::SHARED_MODEL_PROVIDER
+    } else {
+        codex_config::OFFICIAL_MODEL_PROVIDER
+    };
+    let provider_predicate = |provider: &str| {
+        if provider == codex_config::OFFICIAL_MODEL_PROVIDER {
+            "(
+                model_provider=?1
+                OR (model_provider IS NULL AND host_id LIKE 'chatgpt:%')
+            )"
+        } else {
+            "model_provider=?1"
+        }
+    };
+
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {RECENTS_CATALOG_HIDDEN_TABLE}
+             AS SELECT * FROM local_thread_catalog WHERE 1=0"
+        ),
+        [],
+    )?;
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {RECENTS_CATALOG_SCAN_HIDDEN_TABLE}
+             AS SELECT * FROM local_thread_catalog_scan_entries WHERE 1=0"
+        ),
+        [],
+    )?;
+    conn.execute(
+        &format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_{RECENTS_CATALOG_HIDDEN_TABLE}_key
+             ON {RECENTS_CATALOG_HIDDEN_TABLE}(host_id, thread_id)"
+        ),
+        [],
+    )?;
+    conn.execute(
+        &format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_{RECENTS_CATALOG_SCAN_HIDDEN_TABLE}_key
+             ON {RECENTS_CATALOG_SCAN_HIDDEN_TABLE}(host_id, thread_id)"
+        ),
+        [],
+    )?;
+
+    let tx = conn.transaction()?;
+    let restore_ids = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT host_id, thread_id FROM {RECENTS_CATALOG_HIDDEN_TABLE}
+             WHERE {}",
+            provider_predicate(visible_provider)
+        ))?;
+        let rows = stmt.query_map([visible_provider], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (host_id, thread_id) in restore_ids {
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO local_thread_catalog
+                 SELECT * FROM {RECENTS_CATALOG_HIDDEN_TABLE}
+                 WHERE host_id=?1 AND thread_id=?2"
+            ),
+            [&host_id, &thread_id],
+        )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM {RECENTS_CATALOG_HIDDEN_TABLE}
+                 WHERE host_id=?1 AND thread_id=?2"
+            ),
+            [&host_id, &thread_id],
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO local_thread_catalog_scan_entries
+                 SELECT * FROM {RECENTS_CATALOG_SCAN_HIDDEN_TABLE}
+                 WHERE host_id=?1 AND thread_id=?2"
+            ),
+            [&host_id, &thread_id],
+        )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM {RECENTS_CATALOG_SCAN_HIDDEN_TABLE}
+                 WHERE host_id=?1 AND thread_id=?2"
+            ),
+            [&host_id, &thread_id],
+        )?;
+    }
+
+    let hide_ids = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT host_id, thread_id FROM local_thread_catalog WHERE {}",
+            provider_predicate(hidden_provider)
+        ))?;
+        let rows = stmt.query_map([hidden_provider], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (host_id, thread_id) in hide_ids {
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {RECENTS_CATALOG_HIDDEN_TABLE}
+                 SELECT * FROM local_thread_catalog
+                 WHERE host_id=?1 AND thread_id=?2"
+            ),
+            [&host_id, &thread_id],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM local_thread_catalog WHERE host_id=?1 AND thread_id=?2"),
+            [&host_id, &thread_id],
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {RECENTS_CATALOG_SCAN_HIDDEN_TABLE}
+                 SELECT * FROM local_thread_catalog_scan_entries
+                 WHERE host_id=?1 AND thread_id=?2"
+            ),
+            [&host_id, &thread_id],
+        )?;
+        tx.execute(
+            "DELETE FROM local_thread_catalog_scan_entries WHERE host_id=?1 AND thread_id=?2",
+            [&host_id, &thread_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// 隔离时清理 Codex 桌面端全局状态里的项目/线程记录 (local-projects、
@@ -2551,6 +3132,174 @@ mod tests {
         );
         assert_eq!(normalize_title("  前后 空白  "), "前后 空白");
         assert_eq!(normalize_title("普通标题"), "普通标题");
+    }
+
+    #[test]
+    fn recents_session_index_roundtrip_uses_only_record_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("session_index.jsonl");
+        let quarantine = dir.path().join("hidden");
+        let official_line =
+            r#"{"id":"official-1","thread_name":"opaque official index value","updated_at":"1"}"#;
+        let custom_line =
+            r#"{"id":"custom-1","thread_name":"opaque custom index value","updated_at":"2"}"#;
+        std::fs::write(&index, format!("{official_line}\n{custom_line}\n")).unwrap();
+
+        sync_recents_session_index_at(
+            &index,
+            &quarantine,
+            "custom",
+            "openai",
+            &HashSet::from(["custom-1".to_string()]),
+            &HashSet::from(["official-1".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&index).unwrap(),
+            format!("{custom_line}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(quarantine.join("openai/official-1.jsonl")).unwrap(),
+            format!("{official_line}\n")
+        );
+
+        sync_recents_session_index_at(
+            &index,
+            &quarantine,
+            "openai",
+            "custom",
+            &HashSet::from(["official-1".to_string()]),
+            &HashSet::from(["custom-1".to_string()]),
+        )
+        .unwrap();
+        let restored = std::fs::read_to_string(&index).unwrap();
+        assert!(restored.contains(official_line));
+        assert!(!restored.contains(custom_line));
+        assert!(!quarantine.join("openai/official-1.jsonl").exists());
+        assert_eq!(
+            std::fs::read_to_string(quarantine.join("custom/custom-1.jsonl")).unwrap(),
+            format!("{custom_line}\n")
+        );
+    }
+
+    #[test]
+    fn recents_session_index_same_provider_sync_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("session_index.jsonl");
+        let quarantine = dir.path().join("hidden");
+        let custom_line = r#"{"id":"custom-1","thread_name":"custom"}"#;
+        let official_line = r#"{"id":"official-1","thread_name":"official"}"#;
+        std::fs::write(&index, format!("{custom_line}\n{official_line}\n")).unwrap();
+        let visible = HashSet::from(["custom-1".to_string()]);
+        let hidden = HashSet::from(["official-1".to_string()]);
+
+        for _ in 0..2 {
+            sync_recents_session_index_at(
+                &index,
+                &quarantine,
+                "custom",
+                "openai",
+                &visible,
+                &hidden,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&index).unwrap(),
+            format!("{custom_line}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(quarantine.join("openai/official-1.jsonl")).unwrap(),
+            format!("{official_line}\n")
+        );
+    }
+
+    #[test]
+    fn recents_catalog_roundtrip_hides_only_provider_index_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("codex-dev.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE local_thread_catalog (
+                host_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                display_title TEXT NOT NULL,
+                source_created_at REAL NOT NULL,
+                source_updated_at REAL NOT NULL,
+                cwd TEXT,
+                source_kind TEXT NOT NULL,
+                source_detail TEXT,
+                model_provider TEXT,
+                git_branch TEXT,
+                observation_sequence INTEGER NOT NULL,
+                missing_candidate INTEGER NOT NULL DEFAULT 0,
+                thread_source TEXT,
+                source_recency_at REAL NOT NULL DEFAULT 0,
+                pending_observed_title INTEGER NOT NULL DEFAULT 0,
+                project_id TEXT,
+                conversation_origin TEXT,
+                PRIMARY KEY(host_id, thread_id)
+            );
+            CREATE TABLE local_thread_catalog_scan_entries (
+                host_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                removed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(host_id, thread_id)
+            ) WITHOUT ROWID;
+            INSERT INTO local_thread_catalog
+            (host_id,thread_id,display_title,source_created_at,source_updated_at,
+             source_kind,model_provider,observation_sequence)
+            VALUES
+            ('local','o1','opaque official title',1,1,'session','openai',1),
+            ('chatgpt:test','o2','opaque official host title',1,1,'session',NULL,1),
+            ('local','c1','opaque custom title',1,1,'session','custom',1);
+            INSERT INTO local_thread_catalog_scan_entries(host_id,thread_id)
+            VALUES ('local','o1'),('chatgpt:test','o2'),('local','c1');
+            "#,
+        )
+        .unwrap();
+
+        sync_recents_catalog_at(&db, false).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let visible: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id='c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let hidden: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {RECENTS_CATALOG_HIDDEN_TABLE}
+                     WHERE thread_id IN ('o1','o2')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((visible, hidden), (1, 2));
+
+        sync_recents_catalog_at(&db, true).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let official_visible: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id='o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let custom_hidden: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {RECENTS_CATALOG_HIDDEN_TABLE} WHERE thread_id='c1'"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((official_visible, custom_hidden), (1, 1));
     }
 
     #[test]
