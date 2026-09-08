@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -32,6 +32,9 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// 不设总预算时，审批回退可能叠加成数分钟等待。
 const MAX_FORWARD_REENTRIES: u8 = 2;
 const INITIAL_SSE_TIMEOUT: Duration = Duration::from_secs(20);
+/// 自动审批只负责判断工具调用是否需要授权，不应因为中转容量或首段断流
+/// 把整个 Codex 请求拖成数分钟。该预算覆盖 HTTP 重试、模型回退和备用供应商遍历。
+const APPROVAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
 const UPSTREAM_ERROR_BODY_LIMIT: usize = 8 * 1024;
 const UPSTREAM_ERROR_TEXT_LIMIT: usize = 1200;
 /// 网关偶发返回 502/503/504 时，在尚未收到任何模型输出前给同一供应商
@@ -473,12 +476,26 @@ fn sse_terminal_failure(bytes: &[u8]) -> Option<String> {
 /// 中转有时以 HTTP 200 建立 SSE，随后才通过 event:error/response.failed
 /// 返回 reasoning schema 错误。先缓存一个很小的起始窗口；仅在尚无有效
 /// 输出时允许重试一次。缓存上限防止异常服务一直不发标准事件而占用内存。
-async fn inspect_initial_sse(resp: reqwest::Response, current_policy: bool) -> InitialStream {
+async fn inspect_initial_sse(
+    resp: reqwest::Response,
+    current_policy: bool,
+    request_deadline: Option<Instant>,
+) -> InitialStream {
     const PREFIX_CAP: usize = 256 * 1024;
     let mut stream = Box::pin(resp.bytes_stream());
     let mut prefix = Vec::new();
+    let startup_deadline = Instant::now() + INITIAL_SSE_TIMEOUT;
+    let deadline = request_deadline
+        .map(|global| global.min(startup_deadline))
+        .unwrap_or(startup_deadline);
     while prefix.len() < PREFIX_CAP {
-        match tokio::time::timeout(INITIAL_SSE_TIMEOUT, stream.next()).await {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return InitialStream::TransientFailure(
+                "upstream stream produced no valid output before the startup timeout".to_string(),
+            );
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
             Err(_) => {
                 return InitialStream::TransientFailure(
                     "upstream stream produced no valid output before the startup timeout"
@@ -522,6 +539,7 @@ fn response_from_buffered_stream(
     content_type: String,
     buffered: BufferedStream,
     provider: profiles::RelayProfile,
+    request_deadline: Option<Instant>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     tokio::spawn(async move {
@@ -534,7 +552,37 @@ fn response_from_buffered_stream(
             }
         }
         let mut stream = buffered.stream;
-        while let Some(item) = stream.next().await {
+        loop {
+            let next = match request_deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "automatic approval stream exceeded the bounded retry window",
+                            )))
+                            .await;
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, stream.next()).await {
+                        Ok(item) => item,
+                        Err(_) => {
+                            let _ = tx
+                                .send(Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "automatic approval stream exceeded the bounded retry window",
+                                )))
+                                .await;
+                            break;
+                        }
+                    }
+                }
+                None => stream.next().await,
+            };
+            let Some(item) = next else {
+                break;
+            };
             match item {
                 Ok(bytes) => {
                     if sample.len() < SAMPLE_CAP {
@@ -1095,6 +1143,10 @@ fn is_approval_review_request(body: &[u8]) -> bool {
     body.windows(MARKER.len()).any(|window| window == MARKER)
 }
 
+fn is_approval_request(body: &[u8]) -> bool {
+    request_model(body).as_deref() == Some("gpt-5.6-luna") && is_approval_review_request(body)
+}
+
 fn is_access_forbidden_failure(status: u16, body: &[u8]) -> bool {
     status == 502
         && String::from_utf8_lossy(body)
@@ -1491,6 +1543,7 @@ async fn forward(
     headers: HeaderMap,
     body: Bytes,
     reentries: u8,
+    request_deadline: Option<Instant>,
 ) -> Response {
     let Some((active_profile, _)) = active_relay() else {
         return router_error_response(StatusCode::BAD_GATEWAY, "no active relay provider");
@@ -1552,8 +1605,7 @@ async fn forward(
         // (fallback chain 里各供应商模型不同, 不能复用同一个 body)。
         let empty_reasoning_content = reasoning_policy_for(p);
         let incoming_model = request_model(&body);
-        let approval_luna =
-            incoming_model.as_deref() == Some("gpt-5.6-luna") && is_approval_review_request(&body);
+        let approval_luna = is_approval_request(&body);
         let fallback_model = approval_fallback_model(p, approval_luna);
         let supported_models = if approval_luna
             || incoming_model
@@ -1630,7 +1682,47 @@ async fn forward(
                                                 mpsc::channel::<Result<Bytes, std::io::Error>>(32);
                                             let mut stream = retry_resp.bytes_stream();
                                             tokio::spawn(async move {
-                                                while let Some(item) = stream.next().await {
+                                                loop {
+                                                    let next = match request_deadline {
+                                                        Some(deadline) => {
+                                                            let remaining = deadline
+                                                                .saturating_duration_since(
+                                                                    Instant::now(),
+                                                                );
+                                                            if remaining.is_zero() {
+                                                                let _ = tx
+                                                                    .send(Err(std::io::Error::new(
+                                                                        std::io::ErrorKind::TimedOut,
+                                                                        "automatic approval stream exceeded the bounded retry window",
+                                                                    )))
+                                                                    .await;
+                                                                break;
+                                                            }
+                                                            match tokio::time::timeout(
+                                                                remaining,
+                                                                stream.next(),
+                                                            )
+                                                            .await
+                                                            {
+                                                                Ok(item) => item,
+                                                                Err(_) => {
+                                                                    let _ = tx
+                                                                        .send(Err(
+                                                                            std::io::Error::new(
+                                                                                std::io::ErrorKind::TimedOut,
+                                                                                "automatic approval stream exceeded the bounded retry window",
+                                                                            ),
+                                                                        ))
+                                                                        .await;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        None => stream.next().await,
+                                                    };
+                                                    let Some(item) = next else {
+                                                        break;
+                                                    };
                                                     if tx
                                                         .send(item.map_err(|e| {
                                                             std::io::Error::other(e.to_string())
@@ -1675,8 +1767,15 @@ async fn forward(
                             request_model_name.as_deref().unwrap_or_default()
                         );
                         if reentries < MAX_FORWARD_REENTRIES {
-                            return Box::pin(forward(method, uri, headers, body, reentries + 1))
-                                .await;
+                            return Box::pin(forward(
+                                method,
+                                uri,
+                                headers,
+                                body,
+                                reentries + 1,
+                                request_deadline,
+                            ))
+                            .await;
                         }
                         last_error = Some(format!(
                             "approval model fallback exhausted after {} route re-entries",
@@ -1694,7 +1793,8 @@ async fn forward(
                     .unwrap_or_else(|| "application/json".to_string());
                 let is_sse = ct.to_ascii_lowercase().contains("text/event-stream");
                 let buffered = if is_sse {
-                    match inspect_initial_sse(resp, empty_reasoning_content).await {
+                    match inspect_initial_sse(resp, empty_reasoning_content, request_deadline).await
+                    {
                         InitialStream::Forward(stream) => stream,
                         InitialStream::Retry(next_policy) => {
                             let retry_body = sanitize_responses_body(
@@ -1722,7 +1822,9 @@ async fn forward(
                                         .unwrap_or("text/event-stream")
                                         .to_string();
                                     learn_reasoning_policy(&p.id, next_policy);
-                                    match inspect_initial_sse(retry, next_policy).await {
+                                    match inspect_initial_sse(retry, next_policy, request_deadline)
+                                        .await
+                                    {
                                         InitialStream::Forward(stream) => {
                                             let _ =
                                                 BREAKER.lock().map(|mut b| b.record_success(&p.id));
@@ -1734,6 +1836,7 @@ async fn forward(
                                                 retry_ct,
                                                 stream,
                                                 p.clone(),
+                                                request_deadline,
                                             );
                                         }
                                         InitialStream::Retry(_) => {
@@ -1791,6 +1894,7 @@ async fn forward(
                                         headers,
                                         body,
                                         reentries + 1,
+                                        request_deadline,
                                     ))
                                     .await;
                                 }
@@ -1826,6 +1930,7 @@ async fn forward(
                                             headers,
                                             body,
                                             reentries + 1,
+                                            request_deadline,
                                         ))
                                         .await;
                                     }
@@ -1879,6 +1984,7 @@ async fn forward(
                                         match inspect_initial_sse(
                                             retry_resp,
                                             empty_reasoning_content,
+                                            request_deadline,
                                         )
                                         .await
                                         {
@@ -1894,6 +2000,7 @@ async fn forward(
                                                     retry_ct,
                                                     stream,
                                                     p.clone(),
+                                                    request_deadline,
                                                 );
                                             }
                                             InitialStream::Retry(_) => {
@@ -1927,7 +2034,70 @@ async fn forward(
                                                 .unwrap_or(StatusCode::OK),
                                         )
                                         .header("content-type", retry_ct)
-                                        .body(Body::from_stream(retry_resp.bytes_stream()))
+                                        .body(Body::from_stream(RxStream {
+                                            rx: {
+                                                let (tx, rx) = mpsc::channel::<
+                                                    Result<Bytes, std::io::Error>,
+                                                >(32);
+                                                let mut stream = retry_resp.bytes_stream();
+                                                tokio::spawn(async move {
+                                                    loop {
+                                                        let next = match request_deadline {
+                                                            Some(deadline) => {
+                                                                let remaining = deadline
+                                                                    .saturating_duration_since(
+                                                                        Instant::now(),
+                                                                    );
+                                                                if remaining.is_zero() {
+                                                                    let _ = tx
+                                                                        .send(Err(
+                                                                            std::io::Error::new(
+                                                                                std::io::ErrorKind::TimedOut,
+                                                                                "automatic approval stream exceeded the bounded retry window",
+                                                                            ),
+                                                                        ))
+                                                                        .await;
+                                                                    break;
+                                                                }
+                                                                match tokio::time::timeout(
+                                                                    remaining,
+                                                                    stream.next(),
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(item) => item,
+                                                                    Err(_) => {
+                                                                        let _ = tx
+                                                                            .send(Err(
+                                                                                std::io::Error::new(
+                                                                                    std::io::ErrorKind::TimedOut,
+                                                                                    "automatic approval stream exceeded the bounded retry window",
+                                                                                ),
+                                                                            ))
+                                                                            .await;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                            None => stream.next().await,
+                                                        };
+                                                        let Some(item) = next else {
+                                                            break;
+                                                        };
+                                                        if tx
+                                                            .send(item.map_err(|e| {
+                                                                std::io::Error::other(e.to_string())
+                                                            }))
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                });
+                                                rx
+                                            },
+                                        }))
                                         .unwrap();
                                 }
                                 Ok(UpstreamAttempt::HttpFailure {
@@ -1972,7 +2142,13 @@ async fn forward(
                 if p.id != primary_id {
                     record_fallback(&p.id);
                 }
-                return response_from_buffered_stream(status, ct, buffered, p.clone());
+                return response_from_buffered_stream(
+                    status,
+                    ct,
+                    buffered,
+                    p.clone(),
+                    request_deadline,
+                );
             }
             Ok(UpstreamAttempt::HttpFailure {
                 status,
@@ -2008,6 +2184,7 @@ async fn forward(
                                     headers,
                                     body,
                                     reentries + 1,
+                                    request_deadline,
                                 ))
                                 .await;
                             }
@@ -2494,7 +2671,22 @@ async fn handler(method: Method, uri: Uri, headers: HeaderMap, body: Body) -> Re
                 .unwrap()
         }
     };
-    forward(method, uri, headers, bytes, 0).await
+    if is_approval_request(&bytes) {
+        let request_deadline = Instant::now() + APPROVAL_TOTAL_TIMEOUT;
+        return match tokio::time::timeout(
+            APPROVAL_TOTAL_TIMEOUT,
+            forward(method, uri, headers, bytes, 0, Some(request_deadline)),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => router_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "automatic approval request exceeded the bounded retry window",
+            ),
+        };
+    }
+    forward(method, uri, headers, bytes, 0, None).await
 }
 
 #[cfg(test)]
@@ -2988,6 +3180,16 @@ data: {"type":"response.completed","response":{"id":"r1","model":"deepseek-v4-pr
         let ordinary = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"Please review this code change."}]}]}"#;
         assert!(is_approval_review_request(approval));
         assert!(!is_approval_review_request(ordinary));
+    }
+
+    #[test]
+    fn approval_request_requires_luna_model_and_review_marker() {
+        let approval = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing."}]}]}"#;
+        let ordinary_luna = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"Please review this code change."}]}]}"#;
+        let ordinary_review = br#"{"model":"gpt-5.6-sol","input":[{"type":"message","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing."}]}]}"#;
+        assert!(is_approval_request(approval));
+        assert!(!is_approval_request(ordinary_luna));
+        assert!(!is_approval_request(ordinary_review));
     }
 
     #[test]
