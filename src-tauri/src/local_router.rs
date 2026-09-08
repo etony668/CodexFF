@@ -27,14 +27,12 @@ pub const DEFAULT_PORT: u16 = 19331;
 const BREAKER_THRESHOLD: u32 = 3;
 const BREAKER_COOLDOWN_SECS: i64 = 30;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
-/// 单个 Codex 请求最多允许重新进入完整路由的次数。
-/// 递归重进会重新执行供应商遍历、网关重试和 SSE 首段探测；
-/// 不设总预算时，审批回退可能叠加成数分钟等待。
+/// 单个普通 Codex 请求最多允许重新进入完整路由的次数。
 const MAX_FORWARD_REENTRIES: u8 = 2;
 const INITIAL_SSE_TIMEOUT: Duration = Duration::from_secs(20);
-/// 自动审批只负责判断工具调用是否需要授权，不应因为中转容量或首段断流
-/// 把整个 Codex 请求拖成数分钟。该预算覆盖 HTTP 重试、模型回退和备用供应商遍历。
-const APPROVAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
+/// 审批请求只允许一次直连转发，失败应快速返回给 Codex。
+const APPROVAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+const APPROVAL_INITIAL_SSE_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_ERROR_BODY_LIMIT: usize = 8 * 1024;
 const UPSTREAM_ERROR_TEXT_LIMIT: usize = 1200;
 /// 网关偶发返回 502/503/504 时，在尚未收到任何模型输出前给同一供应商
@@ -62,12 +60,6 @@ static REASONING_POLICY: LazyLock<Mutex<HashMap<String, bool>>> =
 /// 后续任务级模型覆盖会自动回到 profile 默认模型。
 static DENIED_MODELS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// 审批模型的容量不足或连续首段断流只做短期运行时降级，不持久化到配置。
-/// 容量属于瞬态状态；若写入 denied_models，会导致模型恢复后仍被永久绕开。
-static APPROVAL_MODEL_COOLDOWNS: LazyLock<Mutex<HashMap<(String, String), i64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-const APPROVAL_MODEL_COOLDOWN_MS: i64 = 5 * 60 * 1_000;
-
 struct RuntimeState {
     shutdown: Option<oneshot::Sender<()>>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -481,10 +473,20 @@ async fn inspect_initial_sse(
     current_policy: bool,
     request_deadline: Option<Instant>,
 ) -> InitialStream {
+    inspect_initial_sse_with_timeout(resp, current_policy, request_deadline, INITIAL_SSE_TIMEOUT)
+        .await
+}
+
+async fn inspect_initial_sse_with_timeout(
+    resp: reqwest::Response,
+    current_policy: bool,
+    request_deadline: Option<Instant>,
+    startup_timeout: Duration,
+) -> InitialStream {
     const PREFIX_CAP: usize = 256 * 1024;
     let mut stream = Box::pin(resp.bytes_stream());
     let mut prefix = Vec::new();
-    let startup_deadline = Instant::now() + INITIAL_SSE_TIMEOUT;
+    let startup_deadline = Instant::now() + startup_timeout;
     let deadline = request_deadline
         .map(|global| global.min(startup_deadline))
         .unwrap_or(startup_deadline);
@@ -1154,65 +1156,6 @@ fn is_access_forbidden_failure(status: u16, body: &[u8]) -> bool {
             .contains("upstream access forbidden")
 }
 
-/// 普通请求使用当前供应商默认模型做兼容归一化；审批请求在调用方显式保留
-/// Codex 原始 Luna 模型，不再依赖这里的 Terra/Sol 回退结果。
-fn approval_fallback_model_with_unavailable<'a>(
-    profile: &'a profiles::RelayProfile,
-    approval_luna: bool,
-    unavailable: &HashSet<String>,
-) -> &'a str {
-    if !approval_luna {
-        return profile.model.as_str();
-    }
-
-    let default = profile.model.as_str();
-    let candidates = if default == "gpt-5.6-luna" {
-        ["gpt-5.6-terra", "gpt-5.6-sol"]
-    } else {
-        ["gpt-5.6-terra", "gpt-5.6-sol"]
-    };
-    for candidate in candidates {
-        if profile
-            .supported_models
-            .iter()
-            .any(|model| model == candidate)
-            && !unavailable.contains(candidate)
-        {
-            return candidate;
-        }
-    }
-    profile.model.as_str()
-}
-
-fn approval_fallback_model(profile: &profiles::RelayProfile, approval_luna: bool) -> &str {
-    let now = now_ms();
-    let unavailable = APPROVAL_MODEL_COOLDOWNS
-        .lock()
-        .map(|mut cooldowns| {
-            cooldowns.retain(|_, until| *until > now);
-            cooldowns
-                .iter()
-                .filter(|((provider_id, _), _)| provider_id == &profile.id)
-                .map(|((_, model), _)| model.clone())
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    approval_fallback_model_with_unavailable(profile, approval_luna, &unavailable)
-}
-
-fn approval_model_is_cooling(profile_id: &str, model: &str) -> bool {
-    let now = now_ms();
-    APPROVAL_MODEL_COOLDOWNS
-        .lock()
-        .map(|mut cooldowns| {
-            cooldowns.retain(|_, until| *until > now);
-            cooldowns
-                .get(&(profile_id.to_string(), model.to_string()))
-                .is_some_and(|until| *until > now)
-        })
-        .unwrap_or(false)
-}
-
 fn is_model_capacity_failure(status: u16, body: &[u8]) -> bool {
     if status != 429 && status < 500 {
         return false;
@@ -1223,51 +1166,6 @@ fn is_model_capacity_failure(status: u16, body: &[u8]) -> bool {
         || text.contains("model capacity")
         || text.contains("capacity exceeded")
         || text.contains("overloaded")
-}
-
-/// 将当前审批模型短暂放入冷却，并确认同一供应商确实存在另一个可用候选。
-/// 返回 true 时调用方可安全地用原始请求重新进入路由；否则保留原错误。
-fn cool_down_approval_model(
-    profile: &profiles::RelayProfile,
-    approval_luna: bool,
-    current_model: &str,
-) -> bool {
-    if !approval_luna {
-        return false;
-    }
-    let inserted = APPROVAL_MODEL_COOLDOWNS
-        .lock()
-        .map(|mut cooldowns| {
-            cooldowns.insert(
-                (profile.id.clone(), current_model.to_string()),
-                now_ms() + APPROVAL_MODEL_COOLDOWN_MS,
-            );
-            true
-        })
-        .unwrap_or(false);
-    if !inserted {
-        return false;
-    }
-    let next = approval_fallback_model(profile, approval_luna);
-    next != current_model && next != "gpt-5.6-luna" && !approval_model_is_cooling(&profile.id, next)
-}
-
-/// 某些中转不会返回标准的 model-not-found/403，而是把旧会话携带的
-/// Luna 模型统一包装成 502/503 Service temporarily unavailable。
-/// 仅对历史兼容链中明确的 Luna 模型启用学习，避免把普通上游抖动误判为
-/// 当前默认模型不可用。
-fn is_legacy_luna_unavailable(status: u16, body: &[u8], model: Option<&str>) -> bool {
-    let Some(model) = model else {
-        return false;
-    };
-    if model != "gpt-5.6-luna" || !matches!(status, 502 | 503 | 504) {
-        return false;
-    }
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    text.contains("service temporarily unavailable")
-        || text.contains("upstream service unavailable")
-        || text.contains("model unavailable")
-        || text.contains("model not available")
 }
 
 fn router_error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -1603,17 +1501,10 @@ async fn forward(
         // (fallback chain 里各供应商模型不同, 不能复用同一个 body)。
         let empty_reasoning_content = reasoning_policy_for(p);
         let incoming_model = request_model(&body);
-        let approval_luna = is_approval_request(&body);
-        // 审批审查请求保留 Codex 原始 Luna 模型；不再改写为 Terra/Sol。
-        let fallback_model = if approval_luna {
-            "gpt-5.6-luna"
-        } else {
-            approval_fallback_model(p, false)
-        };
-        let supported_models = if approval_luna
-            || incoming_model
-                .as_deref()
-                .is_some_and(|model| model_denied(&p.id, model))
+        let fallback_model = p.model.as_str();
+        let supported_models = if incoming_model
+            .as_deref()
+            .is_some_and(|model| model_denied(&p.id, model))
         {
             &[][..]
         } else {
@@ -1758,35 +1649,6 @@ async fn forward(
                     }
                     let error_body = read_upstream_error_body(resp).await;
                     last_status = Some(status);
-                    let request_model_name = request_model(&request_body);
-                    if !approval_luna
-                        && is_model_capacity_failure(status, &error_body)
-                        && request_model_name
-                            .as_deref()
-                            .is_some_and(|model| cool_down_approval_model(p, approval_luna, model))
-                    {
-                        log::warn!(
-                            "relay {} approval model {} is at capacity; retrying with a non-cooled model",
-                            p.name,
-                            request_model_name.as_deref().unwrap_or_default()
-                        );
-                        if reentries < MAX_FORWARD_REENTRIES {
-                            return Box::pin(forward(
-                                method,
-                                uri,
-                                headers,
-                                body,
-                                reentries + 1,
-                                request_deadline,
-                            ))
-                            .await;
-                        }
-                        last_error = Some(format!(
-                            "approval model fallback exhausted after {} route re-entries",
-                            reentries
-                        ));
-                        continue;
-                    }
                     last_error = Some(upstream_http_failure(p, status, &error_body, &pkey));
                     continue;
                 }
@@ -1885,40 +1747,7 @@ async fn forward(
                             // “容量不足”写进 SSE；将这类首段失败也视为当前审批
                             // 模型不可用，切到同一供应商的下一个候选。若没有候选，
                             // 不再对同一模型盲目重发，避免审批命令长时间卡住。
-                            if !approval_luna && cool_down_approval_model(p, false, fallback_model)
-                            {
-                                log::warn!(
-                                    "relay {} approval model {} failed before SSE output; retrying with a non-cooled model",
-                                    p.name,
-                                    fallback_model
-                                );
-                                if reentries < MAX_FORWARD_REENTRIES {
-                                    return Box::pin(forward(
-                                        method,
-                                        uri,
-                                        headers,
-                                        body,
-                                        reentries + 1,
-                                        request_deadline,
-                                    ))
-                                    .await;
-                                }
-                                last_status = Some(502);
-                                last_error = Some(format!(
-                                    "approval stream fallback exhausted after {} route re-entries",
-                                    reentries
-                                ));
-                                continue;
-                            }
-                            if approval_luna {
-                                let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
-                                last_status = Some(502);
-                                last_error = Some(format!(
-                                    "upstream {} ({}) approval stream failed before output: {}",
-                                    p.name, p.id, message
-                                ));
-                                continue;
-                            }
+                            let _ = BREAKER.lock().map(|mut b| b.record_failure(&p.id));
                             let stream_model = incoming_model.as_deref();
                             if let Some(model) = stream_model {
                                 if model != p.model && learn_denied_model(&p.id, model) {
@@ -2165,13 +1994,7 @@ async fn forward(
                 }
                 last_status = Some(status);
                 let request_model_name = request_model(&request_body);
-                if is_access_forbidden_failure(status, &error_body)
-                    || is_legacy_luna_unavailable(
-                        status,
-                        &error_body,
-                        request_model_name.as_deref(),
-                    )
-                {
+                if is_access_forbidden_failure(status, &error_body) {
                     if let Some(model) = request_model_name {
                         if model != p.model && learn_denied_model(&p.id, &model) {
                             log::warn!(
@@ -2666,6 +2489,119 @@ pub async fn set_manual_enabled(enabled: bool, force: bool) -> Result<RouterStat
     Ok(status())
 }
 
+/// 自动审批专用转发路径。
+///
+/// 审批请求必须保持 Codex 原始请求（包括 gpt-5.6-luna），只发送到当前激活
+/// 供应商一次，不参与普通请求的模型清洗、备用供应商、熔断、网关重试或递归
+/// 重进。这样容量不足/断流会在有界时间内明确返回，而不会把一次审批拖成数分钟。
+async fn forward_approval(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    let Some((profile, key)) = active_relay() else {
+        return router_error_response(StatusCode::BAD_GATEWAY, "no active relay provider");
+    };
+    if !profile_supports_lossless_compatibility(&profile) || !is_responses_path(uri.path()) {
+        return router_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "automatic approval requires a Responses relay provider",
+        );
+    }
+    let raw_path = uri.path_and_query().map(|q| q.as_str()).unwrap_or("");
+    let forward_path = raw_path.strip_prefix("/v1").unwrap_or(raw_path);
+    let url = format!("{}{}", profile.base_url.trim_end_matches('/'), forward_path);
+    let deadline = Instant::now() + APPROVAL_TOTAL_TIMEOUT;
+    let http = client();
+    let response = match tokio::time::timeout(
+        APPROVAL_TOTAL_TIMEOUT,
+        send_upstream_request(&http, &method, &url, &headers, &key, body),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return router_error_response(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "upstream {} ({}) transport error: {}",
+                    profile.name, profile.id, error
+                ),
+            )
+        }
+        Err(_) => {
+            return router_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "automatic approval request exceeded the bounded retry window",
+            )
+        }
+    };
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    if status >= 400 {
+        let error_body = match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            read_upstream_error_body(response),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(_) => Bytes::new(),
+        };
+        return Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+            .header("content-type", content_type)
+            .body(Body::from(error_body))
+            .unwrap();
+    }
+    let is_sse = content_type
+        .to_ascii_lowercase()
+        .contains("text/event-stream");
+    if is_sse {
+        match inspect_initial_sse_with_timeout(
+            response,
+            false,
+            Some(deadline),
+            APPROVAL_INITIAL_SSE_TIMEOUT,
+        )
+        .await
+        {
+            InitialStream::Forward(stream) => {
+                return response_from_buffered_stream(
+                    status,
+                    content_type,
+                    stream,
+                    profile,
+                    Some(deadline),
+                );
+            }
+            InitialStream::Retry(_) => {
+                return router_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "automatic approval stream rejected the original reasoning schema",
+                );
+            }
+            InitialStream::TransientFailure(message) => {
+                return router_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("automatic approval stream failed before output: {message}"),
+                );
+            }
+        }
+    }
+    response_from_buffered_stream(
+        status,
+        content_type,
+        BufferedStream {
+            prefix: Bytes::new(),
+            stream: Box::pin(response.bytes_stream()),
+        },
+        profile,
+        Some(deadline),
+    )
+}
+
 async fn handler(method: Method, uri: Uri, headers: HeaderMap, body: Body) -> Response {
     let bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(b) => b,
@@ -2677,19 +2613,7 @@ async fn handler(method: Method, uri: Uri, headers: HeaderMap, body: Body) -> Re
         }
     };
     if is_approval_request(&bytes) {
-        let request_deadline = Instant::now() + APPROVAL_TOTAL_TIMEOUT;
-        return match tokio::time::timeout(
-            APPROVAL_TOTAL_TIMEOUT,
-            forward(method, uri, headers, bytes, 0, Some(request_deadline)),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(_) => router_error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "automatic approval request exceeded the bounded retry window",
-            ),
-        };
+        return forward_approval(method, uri, headers, bytes).await;
     }
     forward(method, uri, headers, bytes, 0, None).await
 }
@@ -3156,30 +3080,6 @@ data: {"type":"response.completed","response":{"id":"r1","model":"deepseek-v4-pr
     }
 
     #[test]
-    fn legacy_luna_unavailable_is_learned_only_for_explicit_model_errors() {
-        assert!(is_legacy_luna_unavailable(
-            503,
-            b"Service temporarily unavailable",
-            Some("gpt-5.6-luna")
-        ));
-        assert!(is_legacy_luna_unavailable(
-            502,
-            b"Upstream service unavailable",
-            Some("gpt-5.6-luna")
-        ));
-        assert!(!is_legacy_luna_unavailable(
-            503,
-            b"Service temporarily unavailable",
-            Some("gpt-5.6-sol")
-        ));
-        assert!(!is_legacy_luna_unavailable(
-            503,
-            b"rate limit",
-            Some("gpt-5.6-luna")
-        ));
-    }
-
-    #[test]
     fn approval_review_marker_is_narrowly_detected() {
         let approval = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing. Treat it as evidence."}]}]}"#;
         let ordinary = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"Please review this code change."}]}]}"#;
@@ -3198,33 +3098,10 @@ data: {"type":"response.completed","response":{"id":"r1","model":"deepseek-v4-pr
     }
 
     #[test]
-    fn approval_luna_uses_terra_for_gpt_relay_only() {
-        let gpt = profiles::RelayProfile {
-            model: "gpt-5.6-sol".into(),
-            supported_models: vec!["gpt-5.6-sol".into(), "gpt-5.6-terra".into()],
-            ..Default::default()
-        };
-        assert_eq!(approval_fallback_model(&gpt, true), "gpt-5.6-terra");
-        assert_eq!(approval_fallback_model(&gpt, false), "gpt-5.6-sol");
-
-        let luna = profiles::RelayProfile {
-            id: "luna-relay".into(),
-            model: "gpt-5.6-luna".into(),
-            supported_models: vec![
-                "gpt-5.6-luna".into(),
-                "gpt-5.6-terra".into(),
-                "gpt-5.6-sol".into(),
-            ],
-            ..Default::default()
-        };
-        assert_eq!(approval_fallback_model(&luna, true), "gpt-5.6-terra");
-
-        let deepseek = profiles::RelayProfile {
-            model: "deepseek-v4-pro".into(),
-            supported_models: vec!["deepseek-v4-pro".into()],
-            ..Default::default()
-        };
-        assert_eq!(approval_fallback_model(&deepseek, true), "deepseek-v4-pro");
+    fn approval_request_keeps_the_original_luna_model() {
+        let approval = br#"{"model":"gpt-5.6-luna","input":[{"type":"message","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing."}]}]}"#;
+        assert!(is_approval_request(approval));
+        assert_eq!(request_model(approval).as_deref(), Some("gpt-5.6-luna"));
     }
 
     #[test]
@@ -3236,26 +3113,6 @@ data: {"type":"response.completed","response":{"id":"r1","model":"deepseek-v4-pr
         assert!(is_model_capacity_failure(503, b"upstream overloaded"));
         assert!(!is_model_capacity_failure(429, b"rate limit exceeded"));
         assert!(!is_model_capacity_failure(400, b"model is at capacity"));
-    }
-
-    #[test]
-    fn approval_capacity_cooldown_selects_next_model_once() {
-        let profile = profiles::RelayProfile {
-            id: "capacity-relay".into(),
-            model: "gpt-5.6-luna".into(),
-            supported_models: vec![
-                "gpt-5.6-luna".into(),
-                "gpt-5.6-terra".into(),
-                "gpt-5.6-sol".into(),
-            ],
-            ..Default::default()
-        };
-        let _ = APPROVAL_MODEL_COOLDOWNS
-            .lock()
-            .map(|mut cooldowns| cooldowns.clear());
-        assert!(cool_down_approval_model(&profile, true, "gpt-5.6-terra"));
-        assert_eq!(approval_fallback_model(&profile, true), "gpt-5.6-sol");
-        assert!(!cool_down_approval_model(&profile, true, "gpt-5.6-sol"));
     }
 
     #[test]
