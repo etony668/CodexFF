@@ -329,6 +329,8 @@ function App() {
   // 退出拦截: 路由开启 + Codex 运行中时，后端阻止退出并显示倒计时提示。
   useEffect(() => {
     const unlisten = listen("exit-blocked", () => {
+      // 退出被拦截时回到供应商切换首页，用户可直接关闭本地路由后重试退出。
+      setTab("profiles");
       showErrorToast(
         "暂时无法退出",
         "Codex 正在使用本地路由。请先完全退出 Codex / ChatGPT 桌面端与命令行，再退出 CodexFF。",
@@ -448,7 +450,13 @@ function App() {
             className={tab === "profiles" ? "tab active" : "tab"}
             onClick={() => setTab("profiles")}
           >
-            Profile 切换
+            供应商切换
+          </button>
+          <button
+            className={tab === "security" ? "tab active" : "tab"}
+            onClick={() => setTab("security")}
+          >
+            安全守护
           </button>
           <button
             className={tab === "workflow" ? "tab active" : "tab"}
@@ -461,12 +469,6 @@ function App() {
             onClick={() => setTab("pets")}
           >
             Codex宠物
-          </button>
-          <button
-            className={tab === "security" ? "tab active" : "tab"}
-            onClick={() => setTab("security")}
-          >
-            安全守护
           </button>
           <button
             className={tab === "settings" ? "tab active" : "tab"}
