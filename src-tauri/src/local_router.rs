@@ -1154,10 +1154,8 @@ fn is_access_forbidden_failure(status: u16, body: &[u8]) -> bool {
             .contains("upstream access forbidden")
 }
 
-/// 系统审批请求有时会携带独立的 Luna 模型，即使主会话当前选择的是其它模型。
-/// 对 GPT/Terra 兼容的中转，审批请求优先使用 Terra；若 Terra 容量不足，
-/// 由运行时冷却逻辑切换到 Sol。这样保留 Luna → Terra 的既定兼容约定，
-/// DeepSeek 等供应商继续使用自身默认模型，避免把不支持 GPT 模型名发给上游。
+/// 普通请求使用当前供应商默认模型做兼容归一化；审批请求在调用方显式保留
+/// Codex 原始 Luna 模型，不再依赖这里的 Terra/Sol 回退结果。
 fn approval_fallback_model_with_unavailable<'a>(
     profile: &'a profiles::RelayProfile,
     approval_luna: bool,
@@ -1606,7 +1604,12 @@ async fn forward(
         let empty_reasoning_content = reasoning_policy_for(p);
         let incoming_model = request_model(&body);
         let approval_luna = is_approval_request(&body);
-        let fallback_model = approval_fallback_model(p, approval_luna);
+        // 审批审查请求保留 Codex 原始 Luna 模型；不再改写为 Terra/Sol。
+        let fallback_model = if approval_luna {
+            "gpt-5.6-luna"
+        } else {
+            approval_fallback_model(p, false)
+        };
         let supported_models = if approval_luna
             || incoming_model
                 .as_deref()
@@ -1756,7 +1759,8 @@ async fn forward(
                     let error_body = read_upstream_error_body(resp).await;
                     last_status = Some(status);
                     let request_model_name = request_model(&request_body);
-                    if is_model_capacity_failure(status, &error_body)
+                    if !approval_luna
+                        && is_model_capacity_failure(status, &error_body)
                         && request_model_name
                             .as_deref()
                             .is_some_and(|model| cool_down_approval_model(p, approval_luna, model))
@@ -1881,7 +1885,8 @@ async fn forward(
                             // “容量不足”写进 SSE；将这类首段失败也视为当前审批
                             // 模型不可用，切到同一供应商的下一个候选。若没有候选，
                             // 不再对同一模型盲目重发，避免审批命令长时间卡住。
-                            if approval_luna && cool_down_approval_model(p, true, fallback_model) {
+                            if !approval_luna && cool_down_approval_model(p, false, fallback_model)
+                            {
                                 log::warn!(
                                     "relay {} approval model {} failed before SSE output; retrying with a non-cooled model",
                                     p.name,
