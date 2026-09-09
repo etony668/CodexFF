@@ -464,7 +464,7 @@ function App() {
             className={tab === "security" ? "tab active" : "tab"}
             onClick={() => setTab("security")}
           >
-            安全守护
+            网络守护
           </button>
           <button
             className={tab === "workflow" ? "tab active" : "tab"}

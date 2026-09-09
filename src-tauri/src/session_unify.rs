@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,7 +14,6 @@ use std::time::Duration;
 use rusqlite::{backup::Backup, params_from_iter, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::codex_config;
 use crate::session_manager;
@@ -331,91 +331,6 @@ pub fn state() -> UnifiedState {
         .unwrap_or_default()
 }
 
-fn provider_cwds(provider: &str) -> Result<Vec<String>, session_manager::SessionError> {
-    let db = codex_config::codex_state_db_path();
-    if !db.exists() {
-        return Ok(Vec::new());
-    }
-    let conn = Connection::open_with_flags(
-        db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let _ = conn.busy_timeout(Duration::from_secs(2));
-    let has_threads = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'",
-            [],
-            |_| Ok(1),
-        )
-        .is_ok();
-    if !has_threads {
-        return Ok(Vec::new());
-    }
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT cwd FROM threads
-         WHERE model_provider = ?1 AND archived = 0 AND cwd IS NOT NULL AND cwd <> ''",
-    )?;
-    let rows = stmt.query_map([provider], |row| row.get::<_, String>(0))?;
-    Ok(rows.filter_map(Result::ok).collect())
-}
-
-fn provider_thread_ids(
-    provider: &str,
-) -> Result<Option<HashSet<String>>, session_manager::SessionError> {
-    let db = codex_config::codex_state_db_path();
-    if !db.exists() {
-        return Ok(None);
-    }
-    let conn = Connection::open_with_flags(
-        db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let _ = conn.busy_timeout(Duration::from_secs(2));
-    let has_threads = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'",
-            [],
-            |_| Ok(1),
-        )
-        .is_ok();
-    if !has_threads {
-        return Ok(None);
-    }
-    let mut stmt = conn.prepare(
-        "SELECT id FROM threads
-         WHERE model_provider = ?1 AND archived = 0 AND id IS NOT NULL AND id <> ''",
-    )?;
-    let rows = stmt.query_map([provider], |row| row.get::<_, String>(0))?;
-    Ok(Some(rows.filter_map(Result::ok).collect()))
-}
-
-fn project_has_visible_assignment(
-    project_id: &str,
-    project: &Value,
-    visible_threads: &HashSet<String>,
-    assignments: &serde_json::Map<String, Value>,
-    cwds: &[String],
-) -> bool {
-    let assigned: Vec<(&String, &Value)> = assignments
-        .iter()
-        .filter(|(_, value)| value.get("projectId").and_then(Value::as_str) == Some(project_id))
-        .collect();
-    if !assigned.is_empty() {
-        // Assignment 是比 cwd 更精确的归属来源；混合 provider 项目不会因共享 cwd
-        // 被错误地完整显示到另一个 provider。
-        return assigned
-            .iter()
-            .any(|(thread_id, _)| visible_threads.contains(thread_id.as_str()));
-    }
-    // 新 schema 里没有 assignment 的项目不能安全删除，避免用户手动创建但
-    // 尚未产生线程的项目被误删。只有整个索引没有 assignment 时，才回退到 cwd。
-    if assignments.is_empty() {
-        project_has_visible_cwd(project, cwds)
-    } else {
-        true
-    }
-}
-
 fn read_project_visibility_backup(
     provider: &str,
 ) -> Result<Option<ProjectVisibilityBackup>, session_manager::SessionError> {
@@ -437,87 +352,26 @@ fn read_project_visibility_backup(
     }))
 }
 
-fn merge_removed_value(existing: &mut Value, incoming: &Value) {
-    let (Some(dst), Some(src)) = (existing.as_object_mut(), incoming.as_object()) else {
-        return;
-    };
-    for (key, value) in src {
-        match key.as_str() {
-            "local-projects" | "thread-project-assignments" => {
-                let target = dst
-                    .entry(key.clone())
-                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                if let (Some(target), Some(source)) = (target.as_object_mut(), value.as_object()) {
-                    for (id, item) in source {
-                        target.entry(id.clone()).or_insert_with(|| item.clone());
-                    }
-                }
-            }
-            "project-order" => {
-                let target = dst
-                    .entry(key.clone())
-                    .or_insert_with(|| Value::Array(Vec::new()));
-                if let (Some(target), Some(source)) = (target.as_array_mut(), value.as_array()) {
-                    for item in source {
-                        if !target.contains(item) {
-                            target.push(item.clone());
-                        }
-                    }
-                }
-            }
-            _ => {
-                dst.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-        }
-    }
-}
-
-fn save_project_visibility_backup(
+fn write_project_visibility_backup(
     provider: &str,
     removed: Value,
-    source_sha256: String,
 ) -> Result<(), session_manager::SessionError> {
-    let is_empty = removed
-        .as_object()
-        .map(|object| object.is_empty())
-        .unwrap_or(true);
-    if is_empty {
-        return Ok(());
-    }
-    if let Some(parent) = project_visibility_backup_path(provider).parent() {
+    let path = project_visibility_backup_path(provider);
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut backup = read_project_visibility_backup(provider)?.unwrap_or(ProjectVisibilityBackup {
-        version: 2,
+    let backup = ProjectVisibilityBackup {
+        version: 3,
         provider: provider.to_string(),
         created_at: chrono::Local::now().to_rfc3339(),
-        source_sha256,
-        removed: Value::Object(serde_json::Map::new()),
-    });
-    merge_removed_value(&mut backup.removed, &removed);
-    vault::atomic_write_bytes(
-        &project_visibility_backup_path(provider),
-        &serde_json::to_vec_pretty(&backup)?,
-    )
-    .map_err(|e| {
+        source_sha256: String::new(),
+        removed,
+    };
+    vault::atomic_write_bytes(&path, &serde_json::to_vec_pretty(&backup)?).map_err(|e| {
         session_manager::SessionError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("备份项目索引失败: {e}"),
         ))
-    })?;
-    Ok(())
-}
-
-fn project_has_visible_cwd(project: &Value, cwds: &[String]) -> bool {
-    let Some(roots) = project.get("rootPaths").and_then(Value::as_array) else {
-        return false;
-    };
-    roots.iter().any(|root| {
-        let Some(root) = root.as_str() else {
-            return false;
-        };
-        cwds.iter()
-            .any(|cwd| cwd == root || cwd.starts_with(&format!("{root}/")))
     })
 }
 
@@ -584,6 +438,397 @@ fn restore_project_visibility(
     Ok(())
 }
 
+/// 当 Codex 全局状态中的项目索引被旧版本清空时，仅根据 Desktop catalog
+/// 保存的 cwd 重建最小项目索引。不会读取标题、预览或会话正文。
+fn rebuild_project_index_from_catalog(
+    root: &mut Value,
+) -> Result<bool, session_manager::SessionError> {
+    let path = codex_config::codex_config_dir().join("sqlite/codex-dev.db");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let has_catalog = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_thread_catalog'",
+            [],
+            |_| Ok(1),
+        )
+        .is_ok();
+    if !has_catalog {
+        return Ok(false);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT cwd FROM local_thread_catalog
+         WHERE cwd IS NOT NULL AND trim(cwd) <> ''",
+    )?;
+    let cwds = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if cwds.is_empty() {
+        return Ok(false);
+    }
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(false);
+    };
+    let mut projects = obj
+        .remove("local-projects")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut order = obj
+        .remove("project-order")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let mut covered_roots = projects
+        .values()
+        .filter_map(|project| project.get("rootPaths").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|root| root.trim_end_matches('/').to_string())
+        .collect::<HashSet<_>>();
+    let mut changed = false;
+
+    // 旧版本曾在项目索引为空时从 catalog 补建节点，可能与原有节点
+    // 产生相同 rootPaths 的重复项目。保留带稳定 id/时间字段的原始节点，
+    // 移除重复索引节点；这里只改项目元数据，不读取会话内容。
+    let mut canonical_by_root = HashMap::<String, String>::new();
+    let mut duplicate_ids = HashSet::new();
+    let ordered_ids = order
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .chain(projects.keys().cloned())
+        .collect::<Vec<_>>();
+    for id in ordered_ids {
+        let Some(project) = projects.get(&id) else {
+            continue;
+        };
+        let Some(root_paths) = project.get("rootPaths").and_then(Value::as_array) else {
+            continue;
+        };
+        for root_path in root_paths.iter().filter_map(Value::as_str) {
+            let normalized = root_path.trim_end_matches('/').to_string();
+            if normalized.is_empty() {
+                continue;
+            }
+            match canonical_by_root.get(&normalized) {
+                None => {
+                    canonical_by_root.insert(normalized, id.clone());
+                }
+                Some(existing) if existing != &id => {
+                    let existing_is_recovered = existing.starts_with("codexff-recovered-");
+                    let current_is_recovered = id.starts_with("codexff-recovered-");
+                    if existing_is_recovered && !current_is_recovered {
+                        duplicate_ids.insert(existing.clone());
+                        canonical_by_root.insert(normalized, id.clone());
+                    } else {
+                        duplicate_ids.insert(id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !duplicate_ids.is_empty() {
+        for id in &duplicate_ids {
+            projects.remove(id);
+        }
+        order.retain(|value| {
+            value
+                .as_str()
+                .map(|id| !duplicate_ids.contains(id))
+                .unwrap_or(true)
+        });
+        if obj
+            .get("selected-project")
+            .and_then(|value| value.get("projectId"))
+            .and_then(Value::as_str)
+            .map(|id| duplicate_ids.contains(id))
+            .unwrap_or(false)
+        {
+            obj.remove("selected-project");
+        }
+        covered_roots = projects
+            .values()
+            .filter_map(|project| project.get("rootPaths").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|root| root.trim_end_matches('/').to_string())
+            .collect();
+        changed = true;
+    }
+
+    for cwd in cwds {
+        let cwd = cwd.trim_end_matches('/').to_string();
+        if cwd.is_empty() || covered_roots.contains(&cwd) {
+            continue;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        cwd.hash(&mut hasher);
+        let id = format!("codexff-recovered-{hash:016x}", hash = hasher.finish());
+        if projects.contains_key(&id) {
+            continue;
+        }
+        let name = Path::new(&cwd)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&cwd)
+            .to_string();
+        projects.insert(
+            id.clone(),
+            serde_json::json!({
+                "name": name,
+                "rootPaths": [cwd],
+            }),
+        );
+        order.push(Value::String(id));
+        covered_roots.insert(cwd);
+        changed = true;
+    }
+    obj.insert("local-projects".into(), Value::Object(projects));
+    obj.insert("project-order".into(), Value::Array(order));
+    Ok(changed)
+}
+
+fn provider_project_cwds(
+    provider: &str,
+    hidden: bool,
+) -> Result<HashSet<String>, session_manager::SessionError> {
+    let path = codex_config::codex_state_db_path();
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let mut result = HashSet::new();
+    let table = if hidden {
+        "threads_codexff_recents_hidden"
+    } else {
+        "threads"
+    };
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |_| Ok(1),
+        )
+        .is_ok();
+    if !exists {
+        return Ok(result);
+    }
+    // subagent 线程有时会携带自己的 custom provider，但其父线程属于
+    // 官方渠道。项目归属应沿 source.thread_spawn.parent_thread_id 追溯，
+    // 否则官方项目会被一条派生线程错误地保留在中转侧。
+    let mut provider_by_id = HashMap::<String, String>::new();
+    let mut source_by_id = HashMap::<String, Option<String>>::new();
+    for source_table in ["threads", "threads_codexff_recents_hidden"] {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [source_table],
+                |_| Ok(1),
+            )
+            .is_ok();
+        if !exists {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, model_provider, source FROM {source_table}
+             WHERE id IS NOT NULL AND id<>''"
+        ))?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })? {
+            let (id, row_provider, source) = row?;
+            provider_by_id.entry(id.clone()).or_insert(row_provider);
+            source_by_id.entry(id).or_insert(source);
+        }
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, model_provider, source, cwd FROM {table}
+         WHERE archived=0 AND cwd IS NOT NULL AND trim(cwd)<>''"
+    ))?;
+    for row in stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })? {
+        let (id, row_provider, source, cwd) = row?;
+        let effective = effective_thread_provider(
+            &id,
+            &row_provider,
+            source.as_deref(),
+            &provider_by_id,
+            &source_by_id,
+            &mut HashSet::new(),
+        );
+        if effective == provider {
+            result.insert(cwd.trim_end_matches('/').to_string());
+        }
+    }
+    Ok(result)
+}
+
+fn provider_project_ids(
+    provider: &str,
+    hidden: bool,
+) -> Result<HashSet<String>, session_manager::SessionError> {
+    let path = codex_config::codex_state_db_path();
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let table = if hidden {
+        "threads_codexff_recents_hidden"
+    } else {
+        "threads"
+    };
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |_| Ok(1),
+        )
+        .is_ok();
+    if !exists {
+        return Ok(HashSet::new());
+    }
+    let has_project_id = conn
+        .prepare(&format!("SELECT project_id FROM {table} LIMIT 0"))
+        .is_ok();
+    if !has_project_id {
+        return Ok(HashSet::new());
+    }
+
+    let mut provider_by_id = HashMap::<String, String>::new();
+    let mut source_by_id = HashMap::<String, Option<String>>::new();
+    for source_table in ["threads", "threads_codexff_recents_hidden"] {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [source_table],
+                |_| Ok(1),
+            )
+            .is_ok();
+        if !exists {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, model_provider, source FROM {source_table}
+             WHERE id IS NOT NULL AND id<>''"
+        ))?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })? {
+            let (id, row_provider, source) = row?;
+            provider_by_id.entry(id.clone()).or_insert(row_provider);
+            source_by_id.entry(id).or_insert(source);
+        }
+    }
+
+    let mut result = HashSet::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, model_provider, source, project_id FROM {table}
+         WHERE archived=0 AND project_id IS NOT NULL AND trim(project_id)<>''"
+    ))?;
+    for row in stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })? {
+        let (id, row_provider, source, project_id) = row?;
+        let effective = effective_thread_provider(
+            &id,
+            &row_provider,
+            source.as_deref(),
+            &provider_by_id,
+            &source_by_id,
+            &mut HashSet::new(),
+        );
+        if effective == provider {
+            result.insert(project_id);
+        }
+    }
+    Ok(result)
+}
+
+fn effective_thread_provider(
+    thread_id: &str,
+    own_provider: &str,
+    source: Option<&str>,
+    provider_by_id: &HashMap<String, String>,
+    source_by_id: &HashMap<String, Option<String>>,
+    seen: &mut HashSet<String>,
+) -> String {
+    if !seen.insert(thread_id.to_string()) {
+        return own_provider.to_string();
+    }
+    let parent_id = source
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("subagent")
+                .and_then(|value| value.get("thread_spawn"))
+                .and_then(|value| value.get("parent_thread_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+    let Some(parent_id) = parent_id.as_deref() else {
+        return own_provider.to_string();
+    };
+    let Some(parent_provider) = provider_by_id.get(parent_id) else {
+        return own_provider.to_string();
+    };
+    let parent_source = source_by_id.get(parent_id).and_then(Option::as_deref);
+    effective_thread_provider(
+        parent_id,
+        parent_provider,
+        parent_source,
+        provider_by_id,
+        source_by_id,
+        seen,
+    )
+}
+
+fn project_matches_cwds(project: &Value, cwds: &HashSet<String>) -> bool {
+    project
+        .get("rootPaths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|root| root.trim_end_matches('/'))
+        .any(|root| {
+            cwds.iter()
+                .any(|cwd| cwd == root || cwd.starts_with(&format!("{root}/")))
+        })
+}
+
 pub fn restore_project_visibility_for_provider(
     provider: &str,
 ) -> Result<(), session_manager::SessionError> {
@@ -608,144 +853,181 @@ pub fn restore_project_visibility_for_provider(
     Ok(())
 }
 
-/// 按目标 provider 清理 Codex 侧边栏项目索引。
-/// 只移除没有该 provider 活跃线程的项目节点，并把清理前的完整 global-state
-/// 保存到 vault；切换回该 provider 时先合并恢复，避免项目名称和线程归属丢失。
+/// 按当前 provider 投影 Codex 侧边栏项目节点。
+///
+/// 完整项目索引会先从本地备份和 Desktop catalog 恢复，再仅隐藏能明确
+/// 判断为另一 provider 的项目。没有可靠归属的项目保持可见。
 pub fn sync_project_visibility(provider: &str) -> Result<(), session_manager::SessionError> {
     if provider != OPENAI_BUCKET && provider != SHARED_BUCKET {
         return Ok(());
     }
-    let Some(visible_threads) = provider_thread_ids(provider)? else {
-        // 没有可靠线程归属时不猜测、不删除任何项目。
-        return Ok(());
-    };
-    let cwds = provider_cwds(provider)?;
     let path = codex_config::codex_config_dir().join(".codex-global-state.json");
     if !path.exists() {
         return Ok(());
     }
-    let source_sha256 = sha256_file(&path)?;
     let mut root: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    // 每次都先合并两个渠道的轻量项目索引，再按目标渠道过滤。这里保存的
-    // 只有项目名、路径、顺序和线程映射，不包含 rollout 正文或会话备份。
-    // 若只恢复目标渠道自身的索引，第一次从 custom 切到 openai 时，
-    // IdeaHatch 会因为上一轮已从全局状态移除而无法重新出现。
+    let before = root.clone();
+    let rebuilt = rebuild_project_index_from_catalog(&mut root)?;
     restore_project_visibility(OPENAI_BUCKET, &mut root)?;
     restore_project_visibility(SHARED_BUCKET, &mut root)?;
-    let Some(obj) = root.as_object_mut() else {
-        return Ok(());
+    let other_provider = if provider == OPENAI_BUCKET {
+        SHARED_BUCKET
+    } else {
+        OPENAI_BUCKET
     };
-    let Some(projects_snapshot) = obj
-        .get("local-projects")
-        .and_then(Value::as_object)
-        .cloned()
-    else {
-        return Ok(());
-    };
-    let assignments = obj
-        .get("thread-project-assignments")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut removed_snapshot = serde_json::Map::new();
-    let removed: HashSet<String> = {
-        projects_snapshot
+    // Recents 投影完成后，当前 provider 的线程位于主表，另一 provider
+    // 位于隐藏表。分开读取，不能把两个表合并，否则同一 cwd 的旧隐藏
+    // 索引会把应隐藏的空项目重新判定为“当前渠道可见”。
+    let visible_cwds = provider_project_cwds(provider, false)?;
+    let other_cwds = provider_project_cwds(other_provider, true)?;
+    let visible_project_ids = provider_project_ids(provider, false)?;
+    let other_project_ids = provider_project_ids(other_provider, true)?;
+    let mut removed = serde_json::Map::new();
+    if !visible_cwds.is_empty()
+        || !other_cwds.is_empty()
+        || !visible_project_ids.is_empty()
+        || !other_project_ids.is_empty()
+    {
+        let Some(obj) = root.as_object_mut() else {
+            return Ok(());
+        };
+        let projects_snapshot = obj
+            .get("local-projects")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let hidden_ids = projects_snapshot
             .iter()
             .filter_map(|(id, project)| {
-                (!project_has_visible_assignment(
-                    id,
-                    project,
-                    &visible_threads,
-                    &assignments,
-                    &cwds,
-                ))
-                .then(|| id.clone())
+                let visible = project_matches_cwds(project, &visible_cwds);
+                let belongs_to_other = project_matches_cwds(project, &other_cwds);
+                let visible_by_id = visible_project_ids.contains(id);
+                let belongs_to_other_by_id = other_project_ids.contains(id);
+                ((!visible && !visible_by_id) && (belongs_to_other || belongs_to_other_by_id))
+                    .then(|| id.clone())
             })
-            .collect()
-    };
-    if removed.is_empty() {
-        return Ok(());
-    }
-    let mut removed_projects = serde_json::Map::new();
-    let Some(projects) = obj.get_mut("local-projects").and_then(Value::as_object_mut) else {
-        return Ok(());
-    };
-    for id in &removed {
-        if let Some(value) = projects.remove(id) {
-            removed_projects.insert(id.clone(), value);
-        }
-    }
-    removed_snapshot.insert("local-projects".into(), Value::Object(removed_projects));
-    if let Some(order) = obj.get_mut("project-order").and_then(Value::as_array_mut) {
-        let mut removed_order = Vec::new();
-        order.retain(|value| {
-            let remove = value
-                .as_str()
-                .map(|id| removed.contains(id))
-                .unwrap_or(false);
-            if remove {
-                removed_order.push(value.clone());
+            .collect::<HashSet<_>>();
+        if !hidden_ids.is_empty() {
+            let mut hidden_projects = serde_json::Map::new();
+            if let Some(projects) = obj.get_mut("local-projects").and_then(Value::as_object_mut) {
+                for id in &hidden_ids {
+                    if let Some(project) = projects.remove(id) {
+                        hidden_projects.insert(id.clone(), project);
+                    }
+                }
             }
-            !remove
-        });
-        if !removed_order.is_empty() {
-            removed_snapshot.insert("project-order".into(), Value::Array(removed_order));
-        }
-    }
-    let expanded: Vec<String> = obj
-        .keys()
-        .filter(|key| {
-            key.starts_with("sidebar-project-expanded-v1-codex:")
-                && removed.iter().any(|id| key.contains(id))
-        })
-        .cloned()
-        .collect();
-    for key in expanded {
-        if let Some(value) = obj.remove(&key) {
-            removed_snapshot.insert(key, value);
-        }
-    }
-    if let Some(assignments) = obj
-        .get_mut("thread-project-assignments")
-        .and_then(Value::as_object_mut)
-    {
-        let mut removed_assignments = serde_json::Map::new();
-        assignments.retain(|thread_id, value| {
-            let remove = value
-                .get("projectId")
+            removed.insert("local-projects".into(), Value::Object(hidden_projects));
+            if let Some(order) = obj.get_mut("project-order").and_then(Value::as_array_mut) {
+                let mut hidden_order = Vec::new();
+                order.retain(|value| {
+                    let hide = value
+                        .as_str()
+                        .map(|id| hidden_ids.contains(id))
+                        .unwrap_or(false);
+                    if hide {
+                        hidden_order.push(value.clone());
+                    }
+                    !hide
+                });
+                removed.insert("project-order".into(), Value::Array(hidden_order));
+            }
+            if obj
+                .get("selected-project")
+                .and_then(|value| value.get("projectId"))
                 .and_then(Value::as_str)
-                .map(|id| removed.contains(id))
-                .unwrap_or(false);
-            if remove {
-                removed_assignments.insert(thread_id.clone(), value.clone());
+                .map(|id| hidden_ids.contains(id))
+                .unwrap_or(false)
+            {
+                if let Some(selected) = obj.remove("selected-project") {
+                    removed.insert("selected-project".into(), selected);
+                }
             }
-            !remove
-        });
-        if !removed_assignments.is_empty() {
-            removed_snapshot.insert(
-                "thread-project-assignments".into(),
-                Value::Object(removed_assignments),
-            );
         }
     }
-    if obj
-        .get("selected-project")
-        .and_then(|v| v.get("projectId"))
-        .and_then(Value::as_str)
-        .map(|id| removed.contains(id))
-        .unwrap_or(false)
-    {
-        if let Some(value) = obj.remove("selected-project") {
-            removed_snapshot.insert("selected-project".into(), value);
-        }
+    if !removed.is_empty() {
+        write_project_visibility_backup(other_provider, Value::Object(removed))?;
     }
-    save_project_visibility_backup(provider, Value::Object(removed_snapshot), source_sha256)?;
+    if !rebuilt && root == before {
+        return Ok(());
+    }
     vault::atomic_write_bytes(&path, &serde_json::to_vec_pretty(&root)?).map_err(|e| {
         session_manager::SessionError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("写入项目索引失败: {e}"),
+            format!("恢复项目索引失败: {e}"),
         ))
     })?;
+    // 写回 SQLite 的轻量项目归属字段，使桌面端项目列表与全局索引一致。
+    // 仅更新 cwd/project_id 元数据，不读取或改写会话正文。
+    let _ = sync_catalog_project_ids();
+    let _ = sync_sqlite_project_bindings();
+    Ok(())
+}
+
+fn sync_catalog_project_ids() -> Result<(), session_manager::SessionError> {
+    let state_path = codex_config::codex_config_dir().join(".codex-global-state.json");
+    let root: Value = serde_json::from_str(&std::fs::read_to_string(state_path)?)?;
+    let Some(projects) = root.get("local-projects").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut roots = Vec::<(String, String)>::new();
+    for (id, project) in projects {
+        if let Some(items) = project.get("rootPaths").and_then(Value::as_array) {
+            for root in items.iter().filter_map(Value::as_str) {
+                roots.push((root.trim_end_matches('/').to_string(), id.clone()));
+            }
+        }
+    }
+    let db_path = codex_config::codex_config_dir().join("sqlite/codex-dev.db");
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let mut conn = Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let has_catalog = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_thread_catalog'",
+            [],
+            |_| Ok(1),
+        )
+        .is_ok();
+    if !has_catalog {
+        return Ok(());
+    }
+    let has_project_id = conn
+        .prepare("SELECT project_id FROM local_thread_catalog LIMIT 0")
+        .is_ok();
+    if !has_project_id {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare("SELECT host_id, thread_id, cwd FROM local_thread_catalog")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let tx = conn.transaction()?;
+    for (host_id, thread_id, cwd) in rows {
+        let Some(cwd) = cwd else {
+            continue;
+        };
+        let cwd = cwd.trim_end_matches('/');
+        let project_id = roots
+            .iter()
+            .find(|(root, _)| cwd_matches_root(cwd, root))
+            .map(|(_, id)| id);
+        if let Some(project_id) = project_id {
+            tx.execute(
+                "UPDATE local_thread_catalog SET project_id=?1 WHERE host_id=?2 AND thread_id=?3",
+                rusqlite::params![project_id, host_id, thread_id],
+            )?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -762,20 +1044,6 @@ fn save_state(next: &UnifiedState) -> Result<(), session_manager::SessionError> 
 
 fn account_marker() -> String {
     crate::profiles::active_account_marker()
-}
-
-fn sha256_file(path: &Path) -> Result<String, session_manager::SessionError> {
-    let mut file = std::fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn file_fingerprint(path: &Path) -> Result<FileFingerprint, session_manager::SessionError> {
@@ -2371,86 +2639,29 @@ mod tests {
     }
 
     #[test]
-    fn project_visibility_uses_path_boundaries() {
-        let project = serde_json::json!({
-            "rootPaths": ["/Users/test/DeepSeek Harness Glass"]
-        });
-        assert!(project_has_visible_cwd(
-            &project,
-            &["/Users/test/DeepSeek Harness Glass/src".to_string()]
-        ));
-        assert!(!project_has_visible_cwd(
-            &project,
-            &["/Users/test/DeepSeek Harness Glass-old".to_string()]
-        ));
-    }
-
-    #[test]
-    fn project_visibility_uses_thread_assignments_for_mixed_projects() {
-        let project = serde_json::json!({
-            "rootPaths": ["/Users/test/shared"]
-        });
-        let assignments = serde_json::json!({
-            "thread-official": {"projectId": "p1"},
-            "thread-relay": {"projectId": "p1"}
-        });
-        let assignments = assignments.as_object().expect("object");
-        let official = HashSet::from(["thread-official".to_string()]);
-        let relay = HashSet::from(["thread-relay".to_string()]);
-        assert!(project_has_visible_assignment(
-            "p1",
-            &project,
-            &official,
-            assignments,
-            &["/Users/test/shared".to_string()]
-        ));
-        assert!(project_has_visible_assignment(
-            "p1",
-            &project,
-            &relay,
-            assignments,
-            &["/Users/test/shared".to_string()]
-        ));
-        assert!(!project_has_visible_assignment(
-            "p1",
-            &project,
-            &HashSet::new(),
-            assignments,
-            &["/Users/test/shared".to_string()]
-        ));
-    }
-
-    #[test]
-    fn unassigned_project_is_preserved_when_assignments_are_available() {
-        let project = serde_json::json!({"rootPaths": ["/Users/test/unknown"]});
-        let assignments = serde_json::json!({
-            "thread-1": {"projectId": "other"}
-        });
-        assert!(project_has_visible_assignment(
-            "unassigned",
-            &project,
-            &HashSet::new(),
-            assignments.as_object().expect("object"),
-            &[]
-        ));
-    }
-
-    #[test]
-    fn project_visibility_backup_merge_keeps_first_snapshot() {
-        let mut existing = serde_json::json!({
-            "local-projects": {"p1": {"name": "original"}},
-            "project-order": ["p1"]
-        });
-        let incoming = serde_json::json!({
-            "local-projects": {
-                "p1": {"name": "changed"},
-                "p2": {"name": "new"}
-            },
-            "project-order": ["p2"]
-        });
-        merge_removed_value(&mut existing, &incoming);
-        assert_eq!(existing["local-projects"]["p1"]["name"], "original");
-        assert_eq!(existing["local-projects"]["p2"]["name"], "new");
-        assert_eq!(existing["project-order"], serde_json::json!(["p1", "p2"]));
+    fn subagent_project_uses_parent_provider() {
+        let providers = HashMap::from([
+            ("official-parent".to_string(), OPENAI_BUCKET.to_string()),
+            ("relay-child".to_string(), SHARED_BUCKET.to_string()),
+        ]);
+        let sources = HashMap::from([
+            ("official-parent".to_string(), None),
+            (
+                "relay-child".to_string(),
+                Some(
+                    r#"{"subagent":{"thread_spawn":{"parent_thread_id":"official-parent"}}}"#
+                        .to_string(),
+                ),
+            ),
+        ]);
+        let effective = effective_thread_provider(
+            "relay-child",
+            SHARED_BUCKET,
+            sources.get("relay-child").and_then(Option::as_deref),
+            &providers,
+            &sources,
+            &mut HashSet::new(),
+        );
+        assert_eq!(effective, OPENAI_BUCKET);
     }
 }

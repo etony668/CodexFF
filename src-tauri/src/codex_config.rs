@@ -294,6 +294,27 @@ pub fn build_relay_config(
                     merged[key] = item.clone();
                 }
             }
+            // Codex 的界面语言/区域设置由桌面端写在 [desktop] 中。
+            // profile 底稿是历史快照，不能在切换供应商时覆盖用户当前设置；
+            // 这里显式保留语言字段，避免后续合并规则调整时回退为英文。
+            const RUNTIME_LOCALE_KEYS: &[&str] =
+                &["language", "locale", "ui_language", "preferred_language"];
+            for key in RUNTIME_LOCALE_KEYS {
+                if let Some(item) = disk.get(key) {
+                    merged[key] = item.clone();
+                }
+            }
+            if let Some(locale) = disk
+                .get("desktop")
+                .and_then(Item::as_table_like)
+                .and_then(|desktop| desktop.get("localeOverride"))
+            {
+                let desktop = merged.entry("desktop").or_insert(Item::Table(Table::new()));
+                desktop
+                    .as_table_like_mut()
+                    .ok_or_else(|| CodexConfigError::TomlParse("desktop 不是表".into()))?
+                    .insert("localeOverride", locale.clone());
+            }
             // model_providers: 保留磁盘上的非 custom 表 (用户自定义 provider)
             if let Some(disk_providers) = disk.get("model_providers").and_then(Item::as_table) {
                 let tbl = merged
@@ -1061,6 +1082,7 @@ codexff_relay = true
 [desktop]
 conversationDetailMode = "STEPS_COMMANDS"
 selected-avatar-id = "custom:susuta--xiangzi529"
+localeOverride = "zh-CN"
 
 [plugins."browser@openai-bundled"]
 enabled = true
@@ -1081,6 +1103,7 @@ base_url = "https://api.deepseek.com"
 
 [desktop]
 conversationDetailMode = "STEPS_COMMANDS"
+localeOverride = "en-US"
 
 [plugins."browser@openai-bundled"]
 enabled = true
@@ -1107,6 +1130,10 @@ enabled = true
         assert!(
             text.contains("[plugins.\"visualize@openai-bundled\"]"),
             "新插件应来自磁盘实时状态: {text}"
+        );
+        assert!(
+            text.contains("localeOverride = \"zh-CN\""),
+            "中转切换不应把 Codex 界面语言回退为英文: {text}"
         );
 
         std::env::remove_var("CODEX_HOME");

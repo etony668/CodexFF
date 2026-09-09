@@ -1147,6 +1147,38 @@ pub fn run() {
             get_switch_stats,
         ])
         .setup(|app| {
+            // 启动早期: 把旧的大写 CodexFF 用户数据目录一次性合并到小写 codexff
+            // (仅区分大小写的文件系统上真正执行, 幂等; 详见 vault::migrate_legacy_data_dir_if_needed)
+            crate::vault::migrate_legacy_data_dir_if_needed();
+            if let Err(e) = crate::session_unify::retire_session_management(&|step| {
+                log::info!("session management retirement: {step}");
+            }) {
+                log::warn!("会话管理退役迁移失败，保留备份并等待下次启动重试: {e}");
+            }
+            // 退役迁移完成后仍需让 Codex 的轻量项目索引跟随当前渠道。
+            // 只在 Codex/ChatGPT 完全退出时写入，避免与桌面端同时保存
+            // .codex-global-state.json；不会读取或搬动任何 rollout 正文。
+            if !crate::session_manager::codex_running() {
+                let provider = match crate::profiles::current_active() {
+                    Ok(crate::profiles::ActiveSelection::Official) => {
+                        crate::codex_config::OFFICIAL_MODEL_PROVIDER
+                    }
+                    Ok(crate::profiles::ActiveSelection::Relay { .. }) => {
+                        crate::codex_config::SHARED_MODEL_PROVIDER
+                    }
+                    Err(_) => "",
+                };
+                if !provider.is_empty() {
+                    let official = provider == crate::codex_config::OFFICIAL_MODEL_PROVIDER;
+                    if let Err(e) = crate::session_manager::sync_recents_visibility_for(official) {
+                        log::warn!("启动时同步最近会话索引失败: {e}");
+                    }
+                    if let Err(e) = crate::session_unify::sync_project_visibility(provider) {
+                        log::warn!("启动时同步渠道项目索引失败: {e}");
+                    }
+                }
+            }
+
             #[cfg(desktop)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;

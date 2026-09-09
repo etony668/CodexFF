@@ -622,9 +622,54 @@ pub fn sync_recents_visibility_for(official: bool) -> Result<(), SessionError> {
 
     // 再把另一渠道从主索引移入独立隐藏表。线程正文和 provider 字段均不变。
     let hidden_ids = {
-        let mut stmt = tx.prepare("SELECT id FROM threads WHERE model_provider=?1")?;
-        let rows = stmt.query_map([hidden_provider], |row| row.get::<_, String>(0))?;
-        rows.collect::<Result<Vec<_>, _>>()?
+        // 派生 subagent 有时会把自己的 provider 写成 custom，但其父线程仍
+        // 属于官方。Recents 的可见性必须跟随根线程，否则会把官方项目节点
+        // 通过一条“custom”派生线程重新带回当前渠道。
+        let mut provider_by_id = HashMap::<String, String>::new();
+        let mut source_by_id = HashMap::<String, Option<String>>::new();
+        for source_table in ["threads", THREADS_RECENTS_HIDDEN_TABLE] {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, model_provider, source FROM {source_table}
+                 WHERE id IS NOT NULL AND id<>''"
+            ))?;
+            for row in stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })? {
+                let (id, provider, source) = row?;
+                provider_by_id.entry(id.clone()).or_insert(provider);
+                source_by_id.entry(id).or_insert(source);
+            }
+        }
+        let mut stmt = tx.prepare(
+            "SELECT id, model_provider, source FROM threads
+             WHERE model_provider=?1 OR model_provider=?2",
+        )?;
+        let mut ids = Vec::new();
+        for row in stmt.query_map([visible_provider, hidden_provider], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })? {
+            let (id, own_provider, source) = row?;
+            let effective = effective_thread_provider(
+                &id,
+                &own_provider,
+                source.as_deref(),
+                &provider_by_id,
+                &source_by_id,
+                &mut HashSet::new(),
+            );
+            if effective == hidden_provider {
+                ids.push(id);
+            }
+        }
+        ids
     };
     for thread_id in hidden_ids {
         let section_id: Option<String> = tx
@@ -682,25 +727,109 @@ pub fn sync_recents_visibility_for(official: bool) -> Result<(), SessionError> {
 
     // Codex Desktop 的 Recents 还会读取 session_index.jsonl。同步这份轻量索引，
     // 否则 SQLite 已隐藏的线程仍可能在“最近”中出现。只读取每行 id，不读取正文。
-    let mut visible_ids = HashSet::new();
-    let mut hidden_ids = HashSet::new();
-    for table in ["threads", THREADS_RECENTS_HIDDEN_TABLE] {
-        let conn = state_db_conn_ro()?;
-        let mut stmt = conn.prepare(&format!("SELECT id FROM {table} WHERE model_provider=?1"))?;
-        for row in stmt.query_map([visible_provider], |row| row.get::<_, String>(0))? {
-            visible_ids.insert(row?);
-        }
-    }
-    for table in ["threads", THREADS_RECENTS_HIDDEN_TABLE] {
-        let conn = state_db_conn_ro()?;
-        let mut stmt = conn.prepare(&format!("SELECT id FROM {table} WHERE model_provider=?1"))?;
-        for row in stmt.query_map([hidden_provider], |row| row.get::<_, String>(0))? {
-            hidden_ids.insert(row?);
-        }
-    }
+    let visible_ids = thread_ids_for_effective_provider(visible_provider)?;
+    let hidden_ids = thread_ids_for_effective_provider(hidden_provider)?;
     sync_recents_session_index(visible_provider, hidden_provider, &visible_ids, &hidden_ids)?;
     sync_recents_catalog(official)?;
     Ok(())
+}
+
+fn thread_ids_for_effective_provider(
+    target_provider: &str,
+) -> Result<HashSet<String>, SessionError> {
+    let conn = state_db_conn_ro()?;
+    let mut provider_by_id = HashMap::<String, String>::new();
+    let mut source_by_id = HashMap::<String, Option<String>>::new();
+    for table in ["threads", THREADS_RECENTS_HIDDEN_TABLE] {
+        if !table_exists(&conn, table) {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, model_provider, source FROM {table}
+             WHERE id IS NOT NULL AND id<>''"
+        ))?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })? {
+            let (id, provider, source) = row?;
+            provider_by_id.entry(id.clone()).or_insert(provider);
+            source_by_id.entry(id).or_insert(source);
+        }
+    }
+
+    let mut result = HashSet::new();
+    for table in ["threads", THREADS_RECENTS_HIDDEN_TABLE] {
+        if !table_exists(&conn, table) {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, model_provider, source FROM {table}
+             WHERE id IS NOT NULL AND id<>''"
+        ))?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })? {
+            let (id, own_provider, source) = row?;
+            let effective = effective_thread_provider(
+                &id,
+                &own_provider,
+                source.as_deref(),
+                &provider_by_id,
+                &source_by_id,
+                &mut HashSet::new(),
+            );
+            if effective == target_provider {
+                result.insert(id);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn effective_thread_provider(
+    thread_id: &str,
+    own_provider: &str,
+    source: Option<&str>,
+    provider_by_id: &HashMap<String, String>,
+    source_by_id: &HashMap<String, Option<String>>,
+    seen: &mut HashSet<String>,
+) -> String {
+    if !seen.insert(thread_id.to_string()) {
+        return own_provider.to_string();
+    }
+    let parent_id = source
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("subagent")
+                .and_then(|value| value.get("thread_spawn"))
+                .and_then(|value| value.get("parent_thread_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+    let Some(parent_id) = parent_id else {
+        return own_provider.to_string();
+    };
+    let Some(parent_provider) = provider_by_id.get(&parent_id) else {
+        return own_provider.to_string();
+    };
+    let parent_source = source_by_id.get(&parent_id).and_then(Option::as_deref);
+    effective_thread_provider(
+        &parent_id,
+        parent_provider,
+        parent_source,
+        provider_by_id,
+        source_by_id,
+        seen,
+    )
 }
 
 fn table_exists(conn: &Connection, name: &str) -> bool {

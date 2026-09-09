@@ -1264,24 +1264,25 @@ pub fn activate_official_with_progress(
 
     let project_scope_changed = !matches!(prev_active, Some(ActiveSelection::Official));
     if project_scope_changed {
+        if let Err(e) = crate::session_manager::sync_recents_visibility_for(true) {
+            restore_config_or_remove(&backup);
+            let auth_ok = rollback_auth(&prev_active);
+            return Err(ProfilesError::RolledBack(format!(
+                "官方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
+            )));
+        }
         progress("同步官方项目索引…");
         if let Err(e) = crate::session_unify::sync_project_visibility(
             crate::codex_config::OFFICIAL_MODEL_PROVIDER,
         ) {
             restore_config_or_remove(&backup);
             let auth_ok = rollback_auth(&prev_active);
+            let _ = crate::session_manager::sync_recents_visibility_for(matches!(
+                prev_active,
+                Some(ActiveSelection::Official)
+            ));
             return Err(ProfilesError::RolledBack(format!(
                 "官方项目索引同步失败: {e}; 凭证回滚={auth_ok}"
-            )));
-        }
-        if let Err(e) = crate::session_manager::sync_recents_visibility_for(true) {
-            restore_config_or_remove(&backup);
-            let auth_ok = rollback_auth(&prev_active);
-            let _ = crate::session_unify::sync_project_visibility(
-                crate::codex_config::SHARED_MODEL_PROVIDER,
-            );
-            return Err(ProfilesError::RolledBack(format!(
-                "官方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
             )));
         }
     }
@@ -1426,6 +1427,14 @@ pub fn activate_relay_with_progress(
 
     let project_scope_changed = !matches!(prev_active, Some(ActiveSelection::Relay { .. }));
     if project_scope_changed {
+        if let Err(e) = crate::session_manager::sync_recents_visibility_for(false) {
+            restore_config_or_remove(&backup);
+            let auth_ok = rollback_auth(&prev_active);
+            let _ = vault::save_relay_state(&relay_state_before);
+            return Err(ProfilesError::RolledBack(format!(
+                "第三方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
+            )));
+        }
         progress("同步第三方项目索引…");
         if let Err(e) = crate::session_unify::sync_project_visibility(
             crate::codex_config::SHARED_MODEL_PROVIDER,
@@ -1442,18 +1451,15 @@ pub fn activate_relay_with_progress(
     // DeepSeek↔PixelAPI 热切换也可能期间产生了新的官方索引行，
     // 或 Codex 更新后重新写回了旧索引。因此每次切换供应商都执行
     // 同一份可逆投影，不能用 project_scope_changed 跳过。
-    if let Err(e) = crate::session_manager::sync_recents_visibility_for(false) {
-        restore_config_or_remove(&backup);
-        let auth_ok = rollback_auth(&prev_active);
-        let _ = vault::save_relay_state(&relay_state_before);
-        if project_scope_changed {
-            let _ = crate::session_unify::sync_project_visibility(
-                crate::codex_config::OFFICIAL_MODEL_PROVIDER,
-            );
+    if !project_scope_changed {
+        if let Err(e) = crate::session_manager::sync_recents_visibility_for(false) {
+            restore_config_or_remove(&backup);
+            let auth_ok = rollback_auth(&prev_active);
+            let _ = vault::save_relay_state(&relay_state_before);
+            return Err(ProfilesError::RolledBack(format!(
+                "第三方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
+            )));
         }
-        return Err(ProfilesError::RolledBack(format!(
-            "第三方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
-        )));
     }
 
     profiles.active = Some(ActiveSelection::Relay {
