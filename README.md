@@ -1,4 +1,4 @@
-# CodexFF（免费版）
+# CodexFF
 
 Codex 供应商切换与本地安全小工具（macOS · Tauri 2 + React + Rust）。
 
