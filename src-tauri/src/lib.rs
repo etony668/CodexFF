@@ -1173,9 +1173,11 @@ pub fn run() {
                     if let Err(e) = crate::session_manager::sync_recents_visibility_for(official) {
                         log::warn!("启动时同步最近会话索引失败: {e}");
                     }
-                    if let Err(e) = crate::session_unify::sync_project_visibility(provider) {
-                        log::warn!("启动时同步渠道项目索引失败: {e}");
-                    }
+                    // 启动阶段不要改写 .codex-global-state.json。Codex 桌面端
+                    // 可能仍在恢复 electron-persisted-atom-state（包括审批模式），
+                    // 此时写项目索引会与其首次持久化发生竞态，导致第一次重启
+                    // 显示为初始审批状态、第二次才恢复。供应商切换事务会在
+                    // Codex 完全退出时完成项目投影；启动这里只同步 SQLite Recents。
                 }
             }
 
