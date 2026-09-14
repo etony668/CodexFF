@@ -1558,7 +1558,6 @@ fn sync_global_state(thread_id: &str, official: bool) -> Result<(), SessionError
             "thread-workspace-root-hints",
             "thread-writable-roots",
             "prompt-history",
-            "heartbeat-thread-permissions-by-id",
             "thread-descriptions-v1",
         ] {
             if let Some(map) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
@@ -1687,6 +1686,20 @@ fn sync_global_state(thread_id: &str, official: bool) -> Result<(), SessionError
         if let Some(removed_obj) = removed.as_object() {
             for (k, v) in removed_obj {
                 match k.as_str() {
+                    "heartbeat-thread-permissions-by-id" => {
+                        // 旧版本曾把审批状态一起放入隔离备份。只补回当前
+                        // 全局状态中缺失的线程项，绝不覆盖用户后来选择的
+                        // “请求审批/帮我审批/完全访问”或 sandbox profile。
+                        let dst = obj
+                            .entry(k.clone())
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let (Some(d), Some(s)) = (dst.as_object_mut(), v.as_object()) {
+                            for (thread_id, permission) in s {
+                                d.entry(thread_id.clone())
+                                    .or_insert_with(|| permission.clone());
+                            }
+                        }
+                    }
                     "local-projects" => {
                         let dst = obj
                             .entry(k.clone())

@@ -294,6 +294,20 @@ pub fn build_relay_config(
                     merged[key] = item.clone();
                 }
             }
+            // 权限/审批是 Codex 桌面端运行时状态，不属于供应商 profile。
+            // 旧 profile 底稿不能在切换或重启后把当前选择覆盖回默认值。
+            const RUNTIME_PERMISSION_KEYS: &[&str] = &[
+                "approval_policy",
+                "approval_mode",
+                "approvals_reviewer",
+                "sandbox_mode",
+                "network_access",
+            ];
+            for key in RUNTIME_PERMISSION_KEYS {
+                if let Some(item) = disk.get(key) {
+                    merged[key] = item.clone();
+                }
+            }
             // Codex 的界面语言/区域设置由桌面端写在 [desktop] 中。
             // profile 底稿是历史快照，不能在切换供应商时覆盖用户当前设置；
             // 这里显式保留语言字段，避免后续合并规则调整时回退为英文。
@@ -1072,6 +1086,11 @@ mod tests {
         let disk = r#"
 model_provider = "custom"
 model = "deepseek-v4-flash"
+approval_policy = "on-request"
+approval_mode = "on-request"
+approvals_reviewer = "auto_review"
+sandbox_mode = "workspace-write"
+network_access = true
 
 [model_providers.custom]
 name = "DeepSeek"
@@ -1135,6 +1154,11 @@ enabled = true
             text.contains("localeOverride = \"zh-CN\""),
             "中转切换不应把 Codex 界面语言回退为英文: {text}"
         );
+        assert!(text.contains("approval_policy = \"on-request\""));
+        assert!(text.contains("approval_mode = \"on-request\""));
+        assert!(text.contains("approvals_reviewer = \"auto_review\""));
+        assert!(text.contains("sandbox_mode = \"workspace-write\""));
+        assert!(text.contains("network_access = true"));
 
         std::env::remove_var("CODEX_HOME");
         let _ = std::fs::remove_dir_all(&home);
