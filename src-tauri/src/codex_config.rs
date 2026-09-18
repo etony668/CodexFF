@@ -5,6 +5,7 @@
 //! - auth.json 是凭证物理隔离的关键: 官方凭证只在官方 profile 激活时出现
 //! - sessions/ 目录仅由显式“会话统一”开关管理；关闭时保留官方/第三方归属
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -503,74 +504,282 @@ fn set_codex_model_catalog_field(doc: &mut DocumentMut, enable: bool) {
     }
 }
 
-/// 落盘 DeepSeek 官方模型目录 (models.json 拷贝, 与官方一键脚本同源)。
-/// 没有它 Codex 不认识 deepseek-v4-flash, 桌面端模型选择器回退显示内置 gpt-5.6。
+/// 模型能力 (从 slug 推断; 供应商声明与用户手动覆盖优先)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    /// 支持图片输入 (原生多模态)
+    pub vision: bool,
+    /// 支持完整思考档位 (low…max)
+    pub full_reasoning: bool,
+}
+
+/// 从模型 slug 推断能力。供应商 /models 大多只返回模型名, 没有能力字段,
+/// 因此这里按命名规律做保守推断; 供应商声明的能力 (declared_vision) 与
+/// 用户在供应商编辑页的手动勾选 (vision_overrides) 优先于推断结果,
+/// 新模型无需改代码。
+pub fn infer_model_capabilities(slug: &str) -> ModelCapabilities {
+    let s = slug.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return ModelCapabilities::default();
+    }
+    let tokens: Vec<&str> = s
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let token = |t: &str| tokens.contains(&t);
+
+    let mut vision = token("vision")
+        || token("vl")
+        || token("vlm")
+        || token("multimodal")
+        || token("omni")
+        || token("image")
+        || token("images")
+        || token("visual")
+        || token("ocr");
+    // 常见多模态家族 (名称里不带 vision/vl 关键词)
+    vision |= s.starts_with("gpt-4o")
+        || s.starts_with("gpt-4.1")
+        || ((s.starts_with("gpt-5") || s.starts_with("gpt-6")) && !s.starts_with("gpt-image"))
+        || (s.contains("gemini") && !s.contains("gemini-1.0"))
+        || s == "o3"
+        || s.starts_with("o3-")
+        || s == "o4"
+        || s.starts_with("o4-")
+        || (s.contains("claude")
+            && (s.contains("3")
+                || s.contains("4")
+                || s.contains("sonnet")
+                || s.contains("opus")
+                || s.contains("haiku")))
+        || s.starts_with("grok-4")
+        || s.contains("grok-2-vision")
+        || s.contains("pixtral")
+        || s.contains("llava")
+        || s.contains("internvl")
+        || s.contains("minicpm-v")
+        || s.contains("glm-4v")
+        || s.contains("glm-4.5v")
+        || s.contains("glm-4.6v")
+        || (s.contains("qwen") && (token("vl") || token("omni")))
+        || s.contains("step-1v")
+        || s.contains("yi-vl")
+        || s.contains("phi-3-vision")
+        || s.contains("phi-4-multimodal")
+        || s.starts_with("llama-4")
+        // DeepSeek 新一代原生多模态 flash 家族 (deepseek-flash / deepseek-flash-*),
+        // 与纯文本的 deepseek-v4-flash 区分。
+        || s == "deepseek-flash"
+        || s.starts_with("deepseek-flash-");
+    if s.starts_with("gpt-image") {
+        vision = false;
+    }
+
+    let full_reasoning =
+        (s.starts_with("gpt-5") || s.starts_with("gpt-6")) && !s.starts_with("gpt-image");
+    ModelCapabilities {
+        vision,
+        full_reasoning,
+    }
+}
+
+fn lookup_vision(overrides: &BTreeMap<String, bool>, slug: &str) -> Option<bool> {
+    if overrides.is_empty() {
+        return None;
+    }
+    let key = slug.trim().to_ascii_lowercase();
+    overrides.get(&key).copied().or_else(|| {
+        overrides
+            .iter()
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(&key))
+            .map(|(_, v)| *v)
+    })
+}
+
+/// 目录条目采用的能力: 用户手动覆盖 > 供应商声明 > 模板声明 > 命名推断。
+fn effective_vision(
+    slug: &str,
+    overrides: &BTreeMap<String, bool>,
+    declared: &BTreeMap<String, bool>,
+    template_declared: Option<bool>,
+) -> bool {
+    lookup_vision(overrides, slug)
+        .or_else(|| lookup_vision(declared, slug))
+        .or(template_declared)
+        .unwrap_or_else(|| infer_model_capabilities(slug).vision)
+}
+
+/// 读取模板条目里声明的图片输入能力 (无 input_modalities 字段 → None)。
+fn declared_vision_of_entry(entry: &Value) -> Option<bool> {
+    let modalities = entry.get("input_modalities")?.as_array()?;
+    Some(modalities.iter().any(|m| {
+        m.as_str()
+            .map(|s| s.eq_ignore_ascii_case("image") || s.eq_ignore_ascii_case("vision"))
+            .unwrap_or(false)
+    }))
+}
+
+/// 用模板条目构造目录条目, 覆盖 slug / 名称 / 上下文窗口 / 图片能力。
+fn build_catalog_entry(
+    base: &Value,
+    slug: &str,
+    display_name: &str,
+    description: &str,
+    window: u64,
+    compact: u64,
+    vision: bool,
+) -> Result<Value, CodexConfigError> {
+    let mut entry = base.clone();
+    let obj = entry.as_object_mut().ok_or_else(|| {
+        CodexConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "模型模板不是对象",
+        ))
+    })?;
+    obj.insert("slug".into(), Value::String(slug.to_string()));
+    obj.insert(
+        "display_name".into(),
+        Value::String(display_name.to_string()),
+    );
+    obj.insert("description".into(), Value::String(description.to_string()));
+    obj.insert("context_window".into(), Value::from(window));
+    obj.insert("max_context_window".into(), Value::from(window));
+    obj.insert("auto_compact_token_limit".into(), Value::from(compact));
+    if vision {
+        obj.insert(
+            "input_modalities".into(),
+            serde_json::json!(["text", "image"]),
+        );
+        obj.insert("supports_image_detail_original".into(), Value::Bool(true));
+    } else {
+        obj.insert("input_modalities".into(), serde_json::json!(["text"]));
+        obj.insert("supports_image_detail_original".into(), Value::Bool(false));
+    }
+    Ok(entry)
+}
+
+/// 落盘 DeepSeek 官方模型目录。
+///
+/// `supported_models` 是最近一次 `/models` 拉取的实时清单:
+/// - 有实时数据 → 以它为准完整替换 (下架模型不再出现), 模板命中的保留展示
+///   信息, 新模型按能力推断生成条目;
+/// - 未知 → 退回内置模板 + 历史实验性 Vision 条目, 兼容旧配置。
 fn write_deepseek_model_catalog(
     context_window: Option<u64>,
     auto_compact_limit: Option<u64>,
+    supported_models: Option<&[String]>,
+    vision_overrides: &BTreeMap<String, bool>,
+    declared_vision: &BTreeMap<String, bool>,
 ) -> Result<(), CodexConfigError> {
     let path = codex_config_dir().join(CODEXFF_MODEL_CATALOG_FILENAME);
-    let mut root: Value = serde_json::from_str(include_str!(
+    let template_root: Value = serde_json::from_str(include_str!(
         "resources/codex_deepseek_catalog_template.json"
     ))?;
-    if let Some(models) = root.get_mut("models").and_then(Value::as_array_mut) {
-        for model in models.iter_mut() {
-            let Some(obj) = model.as_object_mut() else {
-                continue;
-            };
-            let template_window = obj
-                .get("context_window")
-                .and_then(Value::as_u64)
-                .unwrap_or(1_048_576);
-            let window = context_window.unwrap_or(template_window);
-            let compact = auto_compact_limit.unwrap_or(window.saturating_mul(80) / 100);
-            obj.insert("context_window".into(), Value::from(window));
-            obj.insert("max_context_window".into(), Value::from(window));
-            obj.insert("auto_compact_token_limit".into(), Value::from(compact));
-        }
+    let template_models: Vec<Value> = template_root
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let fallback = template_models.first().cloned().ok_or_else(|| {
+        CodexConfigError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "模型目录模板为空",
+        ))
+    })?;
+    let template_for = |slug: &str| -> Option<Value> {
+        template_models
+            .iter()
+            .find(|m| {
+                m.get("slug")
+                    .and_then(Value::as_str)
+                    .map(|s| s.eq_ignore_ascii_case(slug))
+                    .unwrap_or(false)
+            })
+            .cloned()
+    };
 
-        // DeepSeek 官方目录模板保留稳定的文本模型条目；实验性视觉模型
-        // 单独由应用注入，避免把实验模型设为默认，也避免旧模板覆盖它。
-        if !models.iter().any(|model| {
-            model.get("slug").and_then(Value::as_str) == Some("deepseek-v4-flash-vision-exp")
-        }) {
-            if let Some(template) = models
-                .iter()
-                .find(|model| {
-                    model.get("slug").and_then(Value::as_str) == Some("deepseek-v4-flash")
-                })
-                .cloned()
-            {
-                let mut vision = template;
-                if let Some(obj) = vision.as_object_mut() {
-                    let window = context_window.unwrap_or(1_048_576);
-                    let compact = auto_compact_limit.unwrap_or(window.saturating_mul(80) / 100);
-                    obj.insert(
-                        "slug".into(),
-                        Value::String("deepseek-v4-flash-vision-exp".into()),
-                    );
-                    obj.insert(
-                        "display_name".into(),
-                        Value::String("DeepSeek-V4-Flash-Vision-Exp".into()),
-                    );
-                    obj.insert(
-                        "description".into(),
-                        Value::String("Experimental DeepSeek multimodal vision model.".into()),
-                    );
-                    obj.insert(
-                        "input_modalities".into(),
-                        serde_json::json!(["text", "image"]),
-                    );
-                    obj.insert("supports_image_detail_original".into(), Value::Bool(true));
-                    obj.insert("context_window".into(), Value::from(window));
-                    obj.insert("max_context_window".into(), Value::from(window));
-                    obj.insert("auto_compact_token_limit".into(), Value::from(compact));
-                    obj.insert("priority".into(), Value::from(3));
-                }
-                models.push(vision);
-            }
+    let live: Vec<String> = supported_models
+        .unwrap_or_default()
+        .iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    let mut slugs: Vec<String> = if live.is_empty() {
+        // 兼容旧配置: 模板模型 + 实验性 Vision 条目
+        let mut legacy: Vec<String> = template_models
+            .iter()
+            .filter_map(|m| m.get("slug").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        if !legacy
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("deepseek-v4-flash-vision-exp"))
+        {
+            legacy.push("deepseek-v4-flash-vision-exp".to_string());
         }
+        legacy
+    } else {
+        live
+    };
+    let mut seen: Vec<String> = Vec::new();
+    slugs.retain(|slug| {
+        let slug = slug.trim();
+        if slug.is_empty() || seen.iter().any(|s| s.eq_ignore_ascii_case(slug)) {
+            return false;
+        }
+        seen.push(slug.to_string());
+        true
+    });
+
+    let mut entries: Vec<Value> = Vec::new();
+    for (idx, slug) in slugs.iter().enumerate() {
+        let template = template_for(slug);
+        let base = template.as_ref().unwrap_or(&fallback);
+        let template_window = base
+            .get("context_window")
+            .and_then(Value::as_u64)
+            .unwrap_or(1_048_576);
+        let window = context_window.unwrap_or(template_window);
+        let compact = auto_compact_limit.unwrap_or(window.saturating_mul(80) / 100);
+        let vision = effective_vision(
+            slug,
+            vision_overrides,
+            declared_vision,
+            template.as_ref().and_then(declared_vision_of_entry),
+        );
+        let display_name = template
+            .as_ref()
+            .and_then(|t| t.get("display_name").and_then(Value::as_str))
+            .map(str::to_string)
+            .or_else(|| {
+                (slug.eq_ignore_ascii_case("deepseek-v4-flash-vision-exp"))
+                    .then(|| "DeepSeek-V4-Flash-Vision-Exp".to_string())
+            })
+            .unwrap_or_else(|| slug.clone());
+        let description = template
+            .as_ref()
+            .and_then(|t| t.get("description").and_then(Value::as_str))
+            .map(str::to_string)
+            .or_else(|| {
+                (slug.eq_ignore_ascii_case("deepseek-v4-flash-vision-exp"))
+                    .then(|| "Experimental DeepSeek multimodal vision model.".to_string())
+            })
+            .unwrap_or_else(|| format!("{slug}（DeepSeek）"));
+        let mut entry = build_catalog_entry(
+            base,
+            slug,
+            &display_name,
+            &description,
+            window,
+            compact,
+            vision,
+        )?;
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("priority".into(), Value::from((idx + 1) as u64));
+            obj.insert("visibility".into(), Value::String("list".into()));
+        }
+        entries.push(entry);
     }
+    let root = serde_json::json!({ "models": entries });
     let content = serde_json::to_string_pretty(&root)?;
     vault::atomic_write_bytes(&path, content.as_bytes()).map_err(CodexConfigError::Vault)
 }
@@ -610,38 +819,45 @@ fn remove_our_model_catalog() -> Result<(), CodexConfigError> {
 
 /// 为任意中转写模型目录（桌面端模型选择器只显示该中转真实支持的模型）。
 /// 以 DeepSeek 官方目录的模型条目为模板，覆盖 slug / 名称 / 上下文窗口 /
-/// 思考档位，避免桌面端因为缺字段而解析失败。
+/// 思考档位 / 图片能力，避免桌面端因为缺字段而解析失败。
 pub fn write_relay_model_catalog(
     models: &[String],
+    vision_overrides: &BTreeMap<String, bool>,
+    declared_vision: &BTreeMap<String, bool>,
     context_window: Option<u64>,
     auto_compact_limit: Option<u64>,
 ) -> Result<(), CodexConfigError> {
     let template_text = include_str!("resources/codex_deepseek_catalog_template.json");
-    let mut root: Value = serde_json::from_str(template_text)?;
-    let Some(template) = root
-        .get_mut("models")
-        .and_then(|m| m.as_array_mut())
+    let root: Value = serde_json::from_str(template_text)?;
+    let template = root
+        .get("models")
+        .and_then(Value::as_array)
         .and_then(|arr| arr.first().cloned())
-    else {
-        return Err(CodexConfigError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "模型目录模板为空",
-        )));
-    };
-    let mut entries = Vec::new();
+        .ok_or_else(|| {
+            CodexConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "模型目录模板为空",
+            ))
+        })?;
+    let mut entries: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for (idx, slug) in models.iter().enumerate() {
-        if slug.trim().is_empty() {
+        let slug = slug.trim();
+        if slug.is_empty() || seen.iter().any(|s| s.eq_ignore_ascii_case(slug)) {
             continue;
         }
-        let normalized = slug.trim().to_ascii_lowercase();
-        let inferred_window =
-            if normalized.starts_with("gpt-5.6") || normalized.starts_with("gpt-5.5") {
-                1_000_000
-            } else if normalized.starts_with("deepseek-v4") {
-                1_048_576
-            } else {
-                128_000
-            };
+        seen.push(slug.to_string());
+        let normalized = slug.to_ascii_lowercase();
+        let inferred_window = if normalized.starts_with("gpt-5.6")
+            || normalized.starts_with("gpt-5.5")
+        {
+            1_000_000
+        } else if normalized.starts_with("deepseek-v4") || normalized.starts_with("deepseek-flash")
+        {
+            1_048_576
+        } else {
+            128_000
+        };
         let ctx = context_window.unwrap_or(inferred_window);
         let compact = auto_compact_limit.unwrap_or_else(|| {
             let default = ctx.saturating_mul(80) / 100;
@@ -651,45 +867,26 @@ pub fn write_relay_model_catalog(
                 default
             }
         });
-        let mut m = template.clone();
+        let caps = infer_model_capabilities(&normalized);
+        let vision = effective_vision(slug, vision_overrides, declared_vision, None);
+        let mut m = build_catalog_entry(
+            &template,
+            slug,
+            slug,
+            &format!("{slug}（第三方网关）"),
+            ctx,
+            compact,
+            vision,
+        )?;
         let obj = m.as_object_mut().ok_or_else(|| {
             CodexConfigError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "模型模板不是对象",
             ))
         })?;
-        obj.insert("slug".to_string(), Value::String(slug.trim().to_string()));
-        obj.insert(
-            "display_name".to_string(),
-            Value::String(slug.trim().to_string()),
-        );
-        obj.insert(
-            "description".to_string(),
-            Value::String(format!("{slug}（第三方网关）")),
-        );
-        obj.insert("context_window".to_string(), Value::from(ctx));
-        obj.insert("max_context_window".to_string(), Value::from(ctx));
-        obj.insert("auto_compact_token_limit".to_string(), Value::from(compact));
-        let is_gpt_reasoning =
-            normalized.starts_with("gpt-5.") && !normalized.starts_with("gpt-image-");
-        // GPT-6 Astra is a multimodal reasoning model exposed by relay
-        // providers. Keep this explicit rather than treating every future
-        // gpt-* slug as vision-capable until the provider declares it.
-        let is_gpt6_astra = normalized == "gpt-6-astra";
-        let is_deepseek_vision = normalized == "deepseek-v4-flash-vision-exp";
-        if is_gpt_reasoning || is_gpt6_astra || is_deepseek_vision {
-            obj.insert(
-                "input_modalities".to_string(),
-                serde_json::json!(["text", "image"]),
-            );
-            obj.insert(
-                "supports_image_detail_original".to_string(),
-                Value::Bool(true),
-            );
-        }
         obj.insert(
             "supported_reasoning_levels".to_string(),
-            if is_gpt_reasoning || is_gpt6_astra {
+            if caps.full_reasoning {
                 serde_json::json!([
                     {"effort": "low", "description": "Fast responses with lighter reasoning"},
                     {"effort": "medium", "description": "Balanced reasoning depth"},
@@ -713,8 +910,9 @@ pub fn write_relay_model_catalog(
         obj.insert("visibility".to_string(), Value::String("list".into()));
         entries.push(m);
     }
-    root["models"] = Value::Array(entries);
-    let content = serde_json::to_string_pretty(&root)?;
+    let mut out = root;
+    out["models"] = Value::Array(entries);
+    let content = serde_json::to_string_pretty(&out)?;
     let path = codex_config_dir().join(CODEXFF_MODEL_CATALOG_FILENAME);
     vault::atomic_write_bytes(&path, content.as_bytes()).map_err(CodexConfigError::Vault)
 }
@@ -817,6 +1015,8 @@ pub fn write_relay_config(
     model_auto_compact_token_limit: Option<u64>,
     custom_config: Option<&str>,
     supported_models: Option<&[String]>,
+    vision_overrides: &BTreeMap<String, bool>,
+    declared_vision: &BTreeMap<String, bool>,
 ) -> Result<(), CodexConfigError> {
     let (ctx_w, ctx_c) = effective_ctx(model, model_context_window, model_auto_compact_token_limit);
     let mut doc = build_relay_config(
@@ -831,24 +1031,27 @@ pub fn write_relay_config(
         custom_config,
     )?;
     let has_supported = supported_models.map(|m| !m.is_empty()).unwrap_or(false);
-    // DeepSeek 官方网关: 落盘模型目录文件 (字段已由 apply_relay_fields 注入)
+    // DeepSeek 官方网关: 落盘模型目录文件 (字段已由 apply_relay_fields 注入)。
+    // 有实时 /models 清单时以实时清单为准, 下架模型不再出现在 Codex 模型列表。
     if is_deepseek_official_gateway(base_url, wire_api) {
-        write_deepseek_model_catalog(ctx_w, ctx_c)?;
+        write_deepseek_model_catalog(
+            ctx_w,
+            ctx_c,
+            supported_models,
+            vision_overrides,
+            declared_vision,
+        )?;
         set_codex_model_catalog_field(&mut doc, true);
     } else if has_supported {
         // 任意中转: 只显示它真实支持的模型, 避免选了不支持的模型提交才报错
-        let mut relay_models = supported_models.unwrap_or_default().to_vec();
-        // 旧版保存的 DeepSeek profile 可能没有实验性 Vision 模型；
-        // 切换供应商时仍需让 Codex 主模型选择器看到它。供应商名称是
-        // 稳定标识，Base URL 可能已被本地路由接管。
-        if display_name.to_ascii_lowercase().contains("deepseek")
-            && !relay_models
-                .iter()
-                .any(|model| model.eq_ignore_ascii_case("deepseek-v4-flash-vision-exp"))
-        {
-            relay_models.push("deepseek-v4-flash-vision-exp".to_string());
-        }
-        write_relay_model_catalog(&relay_models, ctx_w, ctx_c)?;
+        let relay_models = supported_models.unwrap_or_default().to_vec();
+        write_relay_model_catalog(
+            &relay_models,
+            vision_overrides,
+            declared_vision,
+            ctx_w,
+            ctx_c,
+        )?;
         set_codex_model_catalog_field(&mut doc, true);
     } else {
         // 未知模型清单: 移除我们的目录文件, 避免下拉残留上一个供应商的模型
@@ -856,6 +1059,44 @@ pub fn write_relay_config(
         set_codex_model_catalog_field(&mut doc, false);
     }
     write_config_text(&doc.to_string())
+}
+
+/// 只重写模型目录文件, 不改 config.toml。
+///
+/// 用于切换后的后台模型清单刷新: 激活期间 config.toml 的 base_url 可能已被
+/// 本地路由改写, 重新写 config 会把路由接管覆盖掉, 因此这里只更新
+/// Codex 模型选择器读取的目录文件。清单为空时不做任何事, 保留现有目录。
+pub fn write_relay_model_catalog_only(
+    base_url: &str,
+    wire_api: Option<&str>,
+    model: &str,
+    supported_models: &[String],
+    vision_overrides: &BTreeMap<String, bool>,
+    declared_vision: &BTreeMap<String, bool>,
+    model_context_window: Option<u64>,
+    model_auto_compact_token_limit: Option<u64>,
+) -> Result<(), CodexConfigError> {
+    if supported_models.is_empty() {
+        return Ok(());
+    }
+    let (ctx_w, ctx_c) = effective_ctx(model, model_context_window, model_auto_compact_token_limit);
+    if is_deepseek_official_gateway(base_url, wire_api) {
+        write_deepseek_model_catalog(
+            ctx_w,
+            ctx_c,
+            Some(supported_models),
+            vision_overrides,
+            declared_vision,
+        )
+    } else {
+        write_relay_model_catalog(
+            supported_models,
+            vision_overrides,
+            declared_vision,
+            ctx_w,
+            ctx_c,
+        )
+    }
 }
 
 /// 当前 config.toml 顶层字段 (model, model_reasoning_effort, disable_response_storage)
@@ -1033,6 +1274,10 @@ pub enum CurrentProfile {
 mod tests {
     use super::*;
 
+    fn no_vision_maps() -> (BTreeMap<String, bool>, BTreeMap<String, bool>) {
+        (BTreeMap::new(), BTreeMap::new())
+    }
+
     #[test]
     fn effective_ctx_defaults_by_model() {
         // 显式值优先
@@ -1175,8 +1420,11 @@ enabled = true
         std::fs::create_dir_all(&home).expect("create home");
         std::env::set_var("CODEX_HOME", &home);
 
+        let (manual, declared) = no_vision_maps();
         write_relay_model_catalog(
             &["gpt-5.6-luna".into(), "deepseek-v4-flash".into()],
+            &manual,
+            &declared,
             Some(200_000),
             Some(160_000),
         )
@@ -1228,8 +1476,15 @@ enabled = true
         std::fs::create_dir_all(&home).expect("create home");
         std::env::set_var("CODEX_HOME", &home);
 
-        write_relay_model_catalog(&["gpt-6-astra".into(), "gpt-6-unknown".into()], None, None)
-            .expect("write catalog");
+        let (manual, declared) = no_vision_maps();
+        write_relay_model_catalog(
+            &["gpt-6-astra".into(), "mystery-model".into()],
+            &manual,
+            &declared,
+            None,
+            None,
+        )
+        .expect("write catalog");
         let root: Value = serde_json::from_slice(
             &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
         )
@@ -1250,9 +1505,10 @@ enabled = true
         assert!(efforts.iter().any(|e| e["effort"] == "xhigh"));
         assert!(efforts.iter().any(|e| e["effort"] == "max"));
 
+        // 未识别族名保持纯文本, 不会被误判为多模态
         let unknown = models
             .iter()
-            .find(|m| m["slug"] == "gpt-6-unknown")
+            .find(|m| m["slug"] == "mystery-model")
             .expect("unknown model");
         assert_eq!(unknown["input_modalities"], serde_json::json!(["text"]));
         assert_eq!(
@@ -1277,7 +1533,8 @@ enabled = true
         std::fs::create_dir_all(&home).expect("create home");
         std::env::set_var("CODEX_HOME", &home);
 
-        write_deepseek_model_catalog(None, None).expect("write catalog");
+        let (manual, declared) = no_vision_maps();
+        write_deepseek_model_catalog(None, None, None, &manual, &declared).expect("write catalog");
         let root: Value = serde_json::from_slice(
             &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
         )
@@ -1300,6 +1557,183 @@ enabled = true
     }
 
     #[test]
+    fn relay_catalog_infers_new_multimodal_models() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("codexff-vision-infer-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        let (manual, declared) = no_vision_maps();
+        write_relay_model_catalog(
+            &[
+                "deepseek-flash".into(),
+                "deepseek-v4-flash".into(),
+                "my-vl-model".into(),
+                "plain-text-model".into(),
+            ],
+            &manual,
+            &declared,
+            None,
+            None,
+        )
+        .expect("write catalog");
+        let root: Value = serde_json::from_slice(
+            &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
+        )
+        .expect("parse catalog");
+        let models = root["models"].as_array().expect("models");
+        let by_slug = |slug: &str| {
+            models
+                .iter()
+                .find(|m| m["slug"] == slug)
+                .unwrap_or_else(|| panic!("missing {slug}"))
+        };
+
+        // 新发布的原生多模态模型无需改代码即可识别
+        assert_eq!(
+            by_slug("deepseek-flash")["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(
+            by_slug("deepseek-flash")["supports_image_detail_original"],
+            Value::Bool(true)
+        );
+        // 纯文本的同名家族成员不受影响
+        assert_eq!(
+            by_slug("deepseek-v4-flash")["input_modalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            by_slug("my-vl-model")["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(
+            by_slug("plain-text-model")["input_modalities"],
+            serde_json::json!(["text"])
+        );
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn deepseek_catalog_follows_live_model_list() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("codexff-deepseek-live-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        let live = vec![
+            "deepseek-flash".to_string(),
+            "deepseek-v4-flash".to_string(),
+        ];
+        let (manual, declared) = no_vision_maps();
+        write_deepseek_model_catalog(None, None, Some(&live), &manual, &declared)
+            .expect("write catalog");
+        let root: Value = serde_json::from_slice(
+            &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
+        )
+        .expect("parse catalog");
+        let models = root["models"].as_array().expect("models");
+        let slugs: Vec<&str> = models.iter().filter_map(|m| m["slug"].as_str()).collect();
+
+        // 实时清单完整替换: 模板里的下架模型与实验性 Vision 条目不再出现
+        assert_eq!(slugs, vec!["deepseek-flash", "deepseek-v4-flash"]);
+        let flash = models
+            .iter()
+            .find(|m| m["slug"] == "deepseek-flash")
+            .expect("new flash model");
+        assert_eq!(
+            flash["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(flash["supports_image_detail_original"], Value::Bool(true));
+        // 模板命中的模型保留展示名与能力声明
+        let v4 = models
+            .iter()
+            .find(|m| m["slug"] == "deepseek-v4-flash")
+            .expect("v4 flash model");
+        assert_eq!(
+            v4["display_name"],
+            Value::String("DeepSeek-V4-Flash".into())
+        );
+        assert_eq!(v4["input_modalities"], serde_json::json!(["text"]));
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn vision_overrides_beat_inference_and_declarations() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "codexff-vision-override-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        let mut manual = BTreeMap::new();
+        // 用户手动关掉推断出来的多模态
+        manual.insert("deepseek-flash".to_string(), false);
+        // 用户手动开启名称无法推断的模型
+        manual.insert("plain-text-model".to_string(), true);
+        let mut declared = BTreeMap::new();
+        // 供应商声明优先于名称推断
+        declared.insert("mystery-model".to_string(), true);
+        declared.insert("plain-text-model".to_string(), false);
+        write_relay_model_catalog(
+            &[
+                "deepseek-flash".into(),
+                "plain-text-model".into(),
+                "mystery-model".into(),
+            ],
+            &manual,
+            &declared,
+            None,
+            None,
+        )
+        .expect("write catalog");
+        let root: Value = serde_json::from_slice(
+            &std::fs::read(home.join(CODEXFF_MODEL_CATALOG_FILENAME)).expect("read catalog"),
+        )
+        .expect("parse catalog");
+        let models = root["models"].as_array().expect("models");
+        let by_slug = |slug: &str| {
+            models
+                .iter()
+                .find(|m| m["slug"] == slug)
+                .unwrap_or_else(|| panic!("missing {slug}"))
+        };
+        assert_eq!(
+            by_slug("deepseek-flash")["input_modalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            by_slug("plain-text-model")["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(
+            by_slug("mystery-model")["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn relay_catalog_infers_large_context_per_model() {
         let _guard = crate::test_util::ENV_LOCK
             .lock()
@@ -1310,6 +1744,7 @@ enabled = true
         std::fs::create_dir_all(&home).expect("create home");
         std::env::set_var("CODEX_HOME", &home);
 
+        let (manual, declared) = no_vision_maps();
         write_relay_model_catalog(
             &[
                 "gpt-5.6-luna".into(),
@@ -1317,6 +1752,8 @@ enabled = true
                 "deepseek-v4-flash".into(),
                 "unknown-model".into(),
             ],
+            &manual,
+            &declared,
             None,
             None,
         )

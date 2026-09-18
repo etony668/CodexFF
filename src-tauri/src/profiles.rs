@@ -83,6 +83,19 @@ pub struct RelayProfile {
     /// 空 = 未获取/未知，切换时尝试在线拉取。
     #[serde(default)]
     pub supported_models: Vec<String>,
+    /// 模型图片能力显式覆盖 (slug → 是否支持图片输入)。
+    /// 来源: 用户在供应商编辑页的手动勾选 (最高优先级)。
+    /// 未覆盖的模型按名称自动推断 (见 codex_config::infer_model_capabilities)。
+    #[serde(default)]
+    pub vision_overrides: std::collections::BTreeMap<String, bool>,
+    /// 供应商 /models 元数据声明的图片能力 (slug → 是否支持图片输入)。
+    /// 每次测试连接/切换自动刷新, 优先级低于用户手动覆盖。
+    #[serde(default)]
+    pub declared_vision: std::collections::BTreeMap<String, bool>,
+    /// 最近一次在线刷新模型清单的时间 (毫秒); None = 从未刷新。
+    /// 切换后的后台刷新用它做时间窗, 避免每次切换都请求上游。
+    #[serde(default)]
+    pub models_refreshed_at: Option<i64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +120,13 @@ pub enum ProfilesError {
 
 fn default_true() -> bool {
     true
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// 同步文件事务串行化。Tauri 层另有覆盖完整 async 切换流程的全局锁；
@@ -522,22 +542,110 @@ pub fn list_relay_profiles() -> Result<Vec<RelayProfile>, ProfilesError> {
 }
 
 /// 回填某个中转的模型清单（切换/预览时在线拉取成功后保存，
-/// 下次切换不用再拉）。
+/// 下次切换不用再拉）。返回清单是否发生变化。
 pub fn update_relay_supported_models(
     profile_id: &str,
     models: Vec<String>,
-) -> Result<(), ProfilesError> {
+) -> Result<bool, ProfilesError> {
+    let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut profiles = load_profiles()?;
     let Some(profile) = profiles.relays.iter_mut().find(|p| p.id == profile_id) else {
         return Err(ProfilesError::NotFound(profile_id.to_string()));
     };
-    profile.supported_models = models
+    let is_pikaqiu = profile.base_url.contains("sub.pikaqiu.shop");
+    let next: Vec<String> = models
         .into_iter()
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
-        .filter(|m| !(profile.base_url.contains("sub.pikaqiu.shop") && m == "gpt-5.6-luna"))
+        .filter(|m| !(is_pikaqiu && m == "gpt-5.6-luna"))
         .collect();
-    save_profiles(&profiles)
+    let changed = profile.supported_models != next;
+    profile.supported_models = next;
+    profile.models_refreshed_at = Some(now_ms());
+    save_profiles(&profiles)?;
+    Ok(changed)
+}
+
+/// 合并某个中转的“供应商声明图片能力” (供应商 /models 元数据自动识别结果)。
+/// 只覆盖识别到能力的模型, 用户手动勾选保持不变 (手动优先级更高)。
+/// 返回声明能力是否发生变化。
+pub fn update_relay_declared_vision(
+    profile_id: &str,
+    capabilities: &std::collections::BTreeMap<String, bool>,
+) -> Result<bool, ProfilesError> {
+    if capabilities.is_empty() {
+        return Ok(false);
+    }
+    let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut profiles = load_profiles()?;
+    let Some(profile) = profiles.relays.iter_mut().find(|p| p.id == profile_id) else {
+        return Err(ProfilesError::NotFound(profile_id.to_string()));
+    };
+    let mut changed = false;
+    for (slug, vision) in capabilities {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            continue;
+        }
+        let key = slug.to_ascii_lowercase();
+        if profile.declared_vision.get(&key) != Some(vision) {
+            changed = true;
+        }
+        profile.declared_vision.insert(key, *vision);
+    }
+    if !changed {
+        return Ok(false);
+    }
+    save_profiles(&profiles)?;
+    Ok(true)
+}
+
+/// 模型清单后台刷新后重写 Codex 模型目录文件。
+///
+/// 只写目录文件, **不改 config.toml** —— 激活期间 config 里的 base_url 可能
+/// 已被本地路由改写, 重写 config 会把路由接管覆盖掉。
+/// 只有该 profile 仍是当前激活供应商时才写, 避免切走后写错目录。
+pub fn refresh_active_relay_catalog(profile_id: &str) -> Result<bool, ProfilesError> {
+    let _guard = ACTIVATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let profiles = load_profiles()?;
+    let Some(profile) = profiles.relays.iter().find(|p| p.id == profile_id) else {
+        return Err(ProfilesError::NotFound(profile_id.to_string()));
+    };
+    let still_active = matches!(
+        &profiles.active,
+        Some(ActiveSelection::Relay { profile_id: id }) if id == profile_id
+    );
+    if !still_active || !matches!(codex_config::current_profile_kind()?, CurrentProfile::Relay) {
+        return Ok(false);
+    }
+    if profile.supported_models.is_empty() {
+        return Ok(false);
+    }
+    codex_config::write_relay_model_catalog_only(
+        &profile.base_url,
+        profile.wire_api.as_deref(),
+        &profile.model,
+        &profile.supported_models,
+        &profile.vision_overrides,
+        &profile.declared_vision,
+        profile.model_context_window,
+        profile.model_auto_compact_token_limit,
+    )?;
+    Ok(true)
+}
+
+/// 归一化能力覆盖表: slug 统一小写、去空白。
+fn normalize_vision_overrides(
+    overrides: Option<std::collections::BTreeMap<String, bool>>,
+) -> std::collections::BTreeMap<String, bool> {
+    overrides
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(slug, vision)| {
+            let slug = slug.trim().to_ascii_lowercase();
+            (!slug.is_empty()).then_some((slug, vision))
+        })
+        .collect()
 }
 
 /// 当前激活状态 (按磁盘实际状态推断, 不信任 profiles.json)
@@ -597,6 +705,10 @@ pub struct RelayProfileInput {
     pub usage_timeout_secs: Option<u64>,
     /// add 保存测试到的模型列表; update None = 不修改
     pub supported_models: Option<Vec<String>>,
+    /// 模型图片能力覆盖 (slug → 是否支持图片); update None = 不修改
+    pub vision_overrides: Option<std::collections::BTreeMap<String, bool>>,
+    /// 供应商 /models 声明的图片能力; update None = 不修改 (替换整张表)
+    pub declared_vision: Option<std::collections::BTreeMap<String, bool>>,
 }
 
 /// 归一化 + 校验供应商输入 (add/update 共用):
@@ -734,6 +846,8 @@ pub fn import_from_text(text: &str) -> Result<RelayProfile, ProfilesError> {
         usage_user_id: req.usage_user_id,
         usage_timeout_secs: req.usage_auto_interval,
         supported_models: None,
+        vision_overrides: None,
+        declared_vision: None,
     })
 }
 
@@ -759,6 +873,8 @@ pub fn add_relay_profile(input: RelayProfileInput) -> Result<RelayProfile, Profi
     }
 
     let id = uuid::Uuid::new_v4().to_string();
+    // 添加时若已带测试到的模型清单, 以保存时间为最近刷新时间
+    let models_refreshed_at = input.supported_models.as_ref().map(|_| now_ms());
     let profile = RelayProfile {
         id,
         name,
@@ -834,6 +950,9 @@ pub fn add_relay_profile(input: RelayProfileInput) -> Result<RelayProfile, Profi
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
             .collect(),
+        vision_overrides: normalize_vision_overrides(input.vision_overrides),
+        declared_vision: normalize_vision_overrides(input.declared_vision),
+        models_refreshed_at,
     };
 
     // 整组机密一次加密落盘，任一字段失败都不留下半份 profile。
@@ -989,6 +1108,14 @@ pub fn update_relay_profile(
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
             .collect();
+        // 用户手动测试连接并保存的清单算一次刷新, 后台刷新按时间窗跳过
+        profiles.relays[index].models_refreshed_at = Some(now_ms());
+    }
+    if let Some(overrides) = input.vision_overrides {
+        profiles.relays[index].vision_overrides = normalize_vision_overrides(Some(overrides));
+    }
+    if let Some(declared) = input.declared_vision {
+        profiles.relays[index].declared_vision = normalize_vision_overrides(Some(declared));
     }
     profiles.relays[index].use_common_config = input.use_common_config;
     let mut secret_updates = vec![
@@ -1050,6 +1177,8 @@ pub fn update_relay_profile(
                 profile.model_auto_compact_token_limit,
                 profile.config_toml.as_deref(),
                 Some(profile.supported_models.as_slice()),
+                &profile.vision_overrides,
+                &profile.declared_vision,
             )?;
             if key_updated || input.auth_json.is_some() {
                 vault::write_relay_auth(id, profile.auth_json.as_deref())?;
@@ -1390,6 +1519,8 @@ pub fn activate_relay_with_progress(
         profile.model_auto_compact_token_limit,
         profile.config_toml.as_deref(),
         Some(profile.supported_models.as_slice()),
+        &profile.vision_overrides,
+        &profile.declared_vision,
     ) {
         // 回滚: 恢复 config + auth.json 按切换前状态归位 (官方凭证或旧中转 key)
         restore_config_or_remove(&backup);

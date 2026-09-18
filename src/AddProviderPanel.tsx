@@ -42,27 +42,12 @@ interface Form {
   authJson: string;
   configToml: string;
   useCommonConfig: boolean;
+  /** 用户手动标记的图片能力 (slug → 是否支持图片输入) */
+  visionOverrides: Record<string, boolean>;
 }
 
 /** 官方模型默认上下文窗口 (GPT-5.6 Codex, 400K) — cc-switch 对齐 */
 const OFFICIAL_DEFAULT_CTX = 400000;
-const DEEPSEEK_V4_MODELS = [
-  "deepseek-v4-flash",
-  "deepseek-v4-pro",
-  "deepseek-v4-flash-vision-exp",
-];
-
-function isDeepSeekOfficialBase(baseUrl: string, name = "") {
-  // 预设/旧配置有时会先经过本地路由地址，不能只靠当前 Base URL
-  // 判断；DeepSeek 厂商名称也是稳定的能力提示。
-  if (name.trim().toLowerCase().includes("deepseek")) return true;
-  try {
-    const host = new URL(baseUrl).hostname.toLowerCase();
-    return host === "api.deepseek.com" || host.endsWith(".deepseek.com");
-  } catch {
-    return baseUrl.toLowerCase().includes("deepseek.com");
-  }
-}
 /** 默认压缩阈值 = 90% 窗口 (cc-switch 同比例: 1000000/900000) */
 function defaultCompactLimit(ctx: number) {
   return Math.round(ctx * 0.9);
@@ -85,6 +70,7 @@ const emptyForm: Form = {
   authJson: "",
   configToml: "",
   useCommonConfig: false,
+  visionOverrides: {},
 };
 
 function fromProfile(p: RelayProfile): Form {
@@ -105,6 +91,7 @@ function fromProfile(p: RelayProfile): Form {
     authJson: p.auth_json ?? "",
     configToml: p.config_toml ?? "",
     useCommonConfig: p.use_common_config,
+    visionOverrides: { ...(p.vision_overrides ?? {}) },
   };
 }
 
@@ -224,6 +211,7 @@ export function AddProviderPanel({
       authJson: JSON.stringify({ OPENAI_API_KEY: "" }),
       configToml,
       useCommonConfig: false,
+      visionOverrides: {},
     });
     setStage("form");
   }
@@ -273,6 +261,15 @@ export function AddProviderPanel({
       );
       if (result.ok) {
         setTestResult(result);
+        // 最新列表完整替换旧清单；原默认模型已下架时清空，避免继续用已下架模型
+        if (form.model && !result.models.includes(form.model)) {
+          setForm((f) => (f.model === form.model ? { ...f, model: "" } : f));
+          onToast?.({
+            title: "模型列表已更新",
+            message: `原默认模型 ${form.model} 已不在最新列表中，已重置为供应商默认模型`,
+            kind: "info",
+          });
+        }
       } else {
         setTestResult(null);
         onToast?.({
@@ -323,17 +320,16 @@ export function AddProviderPanel({
         config_toml: form.configToml || null,
         anthropic_auth_field: form.anthropicAuthField || null,
         use_common_config: form.useCommonConfig,
+        // 测试成功 → 用最新 /models 清单完整替换（下架模型不再保留）
         supported_models:
           testResult && testResult.ok && testResult.models.length > 0
-            ? Array.from(
-                new Set([
-                  ...testResult.models,
-                  ...(isDeepSeekOfficialBase(form.baseUrl, form.name) ? DEEPSEEK_V4_MODELS : []),
-                ]),
-              )
-            : isDeepSeekOfficialBase(form.baseUrl, form.name)
-              ? DEEPSEEK_V4_MODELS
-              : null,
+            ? Array.from(new Set(testResult.models))
+            : null,
+        // 用户手动标记的图片能力
+        vision_overrides: form.visionOverrides,
+        // 供应商 /models 声明的图片能力：最近一次测试成功的结果替换旧声明
+        declared_vision:
+          testResult && testResult.ok ? testResult.model_capabilities : null,
       };
       await onSave(input);
       onSaved();
@@ -352,15 +348,46 @@ export function AddProviderPanel({
 
   if (!open) return null;
 
+  // 测试成功后用最新列表完整替换；未测试时用已保存清单，都没有则退回手填。
+  const fetchedModels =
+    testResult && testResult.ok && testResult.models.length > 0 ? testResult.models : null;
+  const cachedModels = !fetchedModels && editing?.supported_models?.length
+    ? editing.supported_models
+    : [];
   const modelChoices = Array.from(
     new Set([
-      ...(testResult?.models ?? editing?.supported_models ?? []),
-      ...(isDeepSeekOfficialBase(form.baseUrl, form.name) ? DEEPSEEK_V4_MODELS : []),
-      ...(form.model ? [form.model] : []),
+      ...(fetchedModels ?? cachedModels),
+      ...(fetchedModels ? [] : form.model ? [form.model] : []),
     ]),
   ).filter(Boolean);
 
-  const set = (patch: Partial<Form>) =>
+  const visionKey = form.model.trim().toLowerCase();
+  const visionOverride = visionKey ? form.visionOverrides[visionKey] : undefined;
+  const declaredVision = visionKey
+    ? testResult?.model_capabilities?.[visionKey]
+    : undefined;
+  const visionChecked = visionOverride ?? declaredVision ?? false;
+  const declaredVisionNames =
+    testResult && testResult.ok
+      ? Object.entries(testResult.model_capabilities ?? {})
+          .filter(([, vision]) => vision)
+          .map(([slug]) => slug)
+      : [];
+  const setVisionOverride = (slug: string, vision: boolean) => {
+    const key = slug.trim().toLowerCase();
+    if (!key) return;
+    setForm((f) => {
+      const next = { ...f.visionOverrides };
+      next[key] = vision;
+      return { ...f, visionOverrides: next };
+    });
+  };
+
+  const set = (patch: Partial<Form>) => {
+    // 地址 / 密钥变了，旧测试结果与模型清单不再对应当前供应商
+    if (("baseUrl" in patch || "key" in patch) && testResult) {
+      setTestResult(null);
+    }
     setForm((f) => {
       const next = { ...f, ...patch };
       // 字段级修改且 configToml 来自预设 → 清空回程序化生成 (底稿已过时)
@@ -370,6 +397,7 @@ export function AddProviderPanel({
       }
       return next;
     });
+  };
 
   return (
     <div className="panel-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
@@ -612,6 +640,25 @@ export function AddProviderPanel({
                     {testing ? "测试中…" : "测试连接并刷新模型列表"}
                   </button>
                 </div>
+
+                <label className="checkbox-label provider-setting-row">
+                  <input
+                    type="checkbox"
+                    checked={visionChecked}
+                    disabled={!form.model}
+                    onChange={(e) => setVisionOverride(form.model, e.target.checked)}
+                  />
+                  当前默认模型支持图片输入（多模态）
+                </label>
+                <span className="hint provider-setting-row">
+                  {!form.model
+                    ? "选择默认模型后可手动标记图片能力。"
+                    : visionOverride != null
+                      ? `已手动标记：${visionOverride ? "支持" : "不支持"}图片输入，优先于自动识别。`
+                      : declaredVision != null
+                        ? `供应商声明：${declaredVision ? "支持" : "不支持"}图片输入。`
+                        : "供应商未声明能力，按模型名称自动识别；识别有误时可手动勾选覆盖。"}
+                </span>
               </div>
               {commonOpen && (
                 <div className="common-editor">
@@ -641,6 +688,11 @@ export function AddProviderPanel({
                               }`
                             : ""
                         }`
+                        + (declaredVisionNames.length
+                          ? ` · 声明支持图片: ${declaredVisionNames.slice(0, 3).join(", ")}${
+                              declaredVisionNames.length > 3 ? " …" : ""
+                            }`
+                          : "")
                       : `✗ ${testResult.error}`}
                   </span>
                 )}

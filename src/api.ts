@@ -29,6 +29,10 @@ export interface RelayProfile {
   use_common_config: boolean;
   /** 该中转 /models 返回的真实模型列表（空 = 未知/未获取） */
   supported_models: string[];
+  /** 模型图片能力覆盖 (slug → 是否支持图片输入); 未覆盖的按名称自动推断 */
+  vision_overrides: Record<string, boolean>;
+  /** 最近一次在线刷新模型清单的时间 (毫秒); null = 从未刷新 */
+  models_refreshed_at: number | null;
 }
 
 /** 供应商表单全量入参 (add/update 共用) */
@@ -53,12 +57,18 @@ export interface RelayProfileInput {
   use_common_config: boolean;
   /** add 保存测试到的模型列表; update null = 不修改 */
   supported_models: string[] | null;
+  /** 模型图片能力覆盖; update null = 不修改 */
+  vision_overrides: Record<string, boolean> | null;
+  /** 供应商 /models 声明的图片能力; update null = 不修改 (替换整张表) */
+  declared_vision: Record<string, boolean> | null;
 }
 
 export interface RelayTestResult {
   ok: boolean;
   model_count: number | null;
   models: string[];
+  /** 供应商 /models 明确声明的图片能力 (slug → 是否支持图片输入) */
+  model_capabilities: Record<string, boolean>;
   error: string | null;
   status_code: number | null;
 }

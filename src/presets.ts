@@ -98,7 +98,7 @@ export const codexffPresets: CodexffPreset[] = [
     "iconColor": "#1E88E5",
     "contextWindow": 1048576,
     "baseUrl": "https://api.deepseek.com",
-    "model": "deepseek-v4-flash",
+    "model": "deepseek-flash",
     "reasoningEffort": "high"
   },
   {

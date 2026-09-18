@@ -53,6 +53,7 @@ const FALLBACK_MODELS = [
   "gpt-5.6-terra",
   "gpt-5.2-codex-mini",
   "gpt-5.2-codex",
+  "deepseek-flash",
   "deepseek-v4-flash",
   "deepseek-v4-pro",
   "deepseek-v4-flash-vision-exp",
