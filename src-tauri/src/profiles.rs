@@ -1473,7 +1473,6 @@ pub fn activate_relay_with_progress(
     }
     // 切换前状态 — 回滚时按它恢复 auth.json (relay→relay 失败要重写旧中转 key)
     let prev_active = profiles.active.clone();
-    let relay_state_before = vault::load_relay_state();
     let profile = profile.clone();
 
     progress("备份当前配置…");
@@ -1508,7 +1507,7 @@ pub fn activate_relay_with_progress(
 
     // 2. 写中转 config (共享 custom 桶)
     progress("写入中转配置与凭证…");
-    if let Err(e) = codex_config::write_relay_config(
+    if let Err(e) = codex_config::write_relay_config_preserving_current_settings(
         &profile.name,
         &profile.base_url,
         &profile.model,
@@ -1556,62 +1555,12 @@ pub fn activate_relay_with_progress(
         )));
     }
 
-    let project_scope_changed = !matches!(prev_active, Some(ActiveSelection::Relay { .. }));
-    if project_scope_changed {
-        if let Err(e) = crate::session_manager::sync_recents_visibility_for(false) {
-            restore_config_or_remove(&backup);
-            let auth_ok = rollback_auth(&prev_active);
-            let _ = vault::save_relay_state(&relay_state_before);
-            return Err(ProfilesError::RolledBack(format!(
-                "第三方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
-            )));
-        }
-        progress("同步第三方项目索引…");
-        if let Err(e) = crate::session_unify::sync_project_visibility(
-            crate::codex_config::SHARED_MODEL_PROVIDER,
-        ) {
-            restore_config_or_remove(&backup);
-            let auth_ok = rollback_auth(&prev_active);
-            let _ = vault::save_relay_state(&relay_state_before);
-            return Err(ProfilesError::RolledBack(format!(
-                "第三方项目索引同步失败: {e}; 凭证回滚={auth_ok}"
-            )));
-        }
-    }
-    // Recents/最近不是只在官方↔第三方变化时才需要校正：第三方
-    // DeepSeek↔PixelAPI 热切换也可能期间产生了新的官方索引行，
-    // 或 Codex 更新后重新写回了旧索引。因此每次切换供应商都执行
-    // 同一份可逆投影，不能用 project_scope_changed 跳过。
-    if !project_scope_changed {
-        if let Err(e) = crate::session_manager::sync_recents_visibility_for(false) {
-            restore_config_or_remove(&backup);
-            let auth_ok = rollback_auth(&prev_active);
-            let _ = vault::save_relay_state(&relay_state_before);
-            return Err(ProfilesError::RolledBack(format!(
-                "第三方最近会话索引同步失败: {e}; 凭证回滚={auth_ok}"
-            )));
-        }
-    }
-
     profiles.active = Some(ActiveSelection::Relay {
         profile_id: profile_id.to_string(),
     });
     if let Err(e) = save_profiles(&profiles) {
         restore_config_or_remove(&backup);
         let auth_ok = rollback_auth(&prev_active);
-        let _ = vault::save_relay_state(&relay_state_before);
-        let previous_provider = match &prev_active {
-            Some(ActiveSelection::Official) => crate::codex_config::OFFICIAL_MODEL_PROVIDER,
-            Some(ActiveSelection::Relay { .. }) => crate::codex_config::SHARED_MODEL_PROVIDER,
-            None => "",
-        };
-        if project_scope_changed && !previous_provider.is_empty() {
-            let _ = crate::session_unify::sync_project_visibility(previous_provider);
-        }
-        let _ = crate::session_manager::sync_recents_visibility_for(matches!(
-            prev_active,
-            Some(ActiveSelection::Official)
-        ));
         return Err(ProfilesError::RolledBack(format!(
             "保存第三方切换状态失败: {e}; 凭证回滚={auth_ok}"
         )));

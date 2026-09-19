@@ -1061,6 +1061,112 @@ pub fn write_relay_config(
     write_config_text(&doc.to_string())
 }
 
+/// 激活中转时只更新供应商接管所需字段，完整保留当前 Codex 配置。
+///
+/// 供应商 profile 中保存的 `config_toml` 可能是旧快照，不能在切换时
+/// 用它覆盖当前 Codex 的语言、审批、沙盒、网络权限及其它运行时设置。
+/// 这里始终从当前磁盘配置开始，只替换 model/provider/custom 供应商表和
+/// CodexFF 自己的模型目录字段。
+#[allow(clippy::too_many_arguments)]
+pub fn write_relay_config_preserving_current_settings(
+    display_name: &str,
+    base_url: &str,
+    model: &str,
+    wire_api: Option<&str>,
+    model_reasoning_effort: Option<&str>,
+    disable_response_storage: bool,
+    model_context_window: Option<u64>,
+    model_auto_compact_token_limit: Option<u64>,
+    custom_config: Option<&str>,
+    supported_models: Option<&[String]>,
+    vision_overrides: &BTreeMap<String, bool>,
+    declared_vision: &BTreeMap<String, bool>,
+) -> Result<(), CodexConfigError> {
+    let current = parse_or_default(&read_config_text()?)?;
+    let current_effort = current.get("model_reasoning_effort").and_then(Item::as_str);
+    let effective_effort = current_effort.or(model_reasoning_effort);
+    let effective_disable_storage = current
+        .get("disable_response_storage")
+        .and_then(Item::as_bool)
+        .unwrap_or(disable_response_storage);
+    let (ctx_w, ctx_c) = effective_ctx(model, model_context_window, model_auto_compact_token_limit);
+    let mut doc = build_relay_config(
+        display_name,
+        base_url,
+        model,
+        wire_api,
+        effective_effort,
+        effective_disable_storage,
+        ctx_w,
+        ctx_c,
+        custom_config,
+    )?;
+    const ROUTING_KEYS: &[&str] = &[
+        "model_provider",
+        "model",
+        "model_reasoning_effort",
+        "disable_response_storage",
+        "model_catalog_json",
+        "model_providers",
+    ];
+    for (key, item) in current.iter() {
+        if !ROUTING_KEYS.contains(&key) {
+            doc[key] = item.clone();
+        }
+    }
+    if let Some(current_providers) = current.get("model_providers").and_then(Item::as_table) {
+        let providers = doc
+            .entry("model_providers")
+            .or_insert(Item::Table(Table::new()));
+        let providers = providers
+            .as_table_like_mut()
+            .ok_or_else(|| CodexConfigError::TomlParse("model_providers 不是表".into()))?;
+        for (key, item) in current_providers {
+            if key != SHARED_MODEL_PROVIDER {
+                providers.insert(key, item.clone());
+            }
+        }
+    }
+    apply_relay_fields(
+        &mut doc,
+        display_name,
+        base_url,
+        model,
+        wire_api,
+        effective_effort,
+        effective_disable_storage,
+        ctx_w,
+        ctx_c,
+        false,
+    )?;
+    let has_supported = supported_models
+        .map(|models| !models.is_empty())
+        .unwrap_or(false);
+    if is_deepseek_official_gateway(base_url, wire_api) {
+        write_deepseek_model_catalog(
+            ctx_w,
+            ctx_c,
+            supported_models,
+            vision_overrides,
+            declared_vision,
+        )?;
+        set_codex_model_catalog_field(&mut doc, true);
+    } else if has_supported {
+        write_relay_model_catalog(
+            supported_models.unwrap_or_default(),
+            vision_overrides,
+            declared_vision,
+            ctx_w,
+            ctx_c,
+        )?;
+        set_codex_model_catalog_field(&mut doc, true);
+    } else {
+        remove_our_model_catalog()?;
+        set_codex_model_catalog_field(&mut doc, false);
+    }
+    write_config_text(&doc.to_string())
+}
+
 /// 只重写模型目录文件, 不改 config.toml。
 ///
 /// 用于切换后的后台模型清单刷新: 激活期间 config.toml 的 base_url 可能已被
@@ -1404,6 +1510,74 @@ enabled = true
         assert!(text.contains("approvals_reviewer = \"auto_review\""));
         assert!(text.contains("sandbox_mode = \"workspace-write\""));
         assert!(text.contains("network_access = true"));
+
+        std::env::remove_var("CODEX_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn relay_activation_preserves_current_codex_settings() {
+        let _guard = crate::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "codexff-relay-activation-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::env::set_var("CODEX_HOME", &home);
+
+        std::fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "openai"
+model = "gpt-6-astra"
+approval_policy = "on-request"
+approval_mode = "on-request"
+approvals_reviewer = "auto_review"
+sandbox_mode = "workspace-write"
+network_access = true
+
+[desktop]
+localeOverride = "zh-CN"
+selected-avatar-id = "custom:pet"
+
+[model_providers.custom]
+name = "旧供应商"
+base_url = "https://old.example/v1"
+codexff_relay = true
+"#,
+        )
+        .expect("write current config");
+
+        let (manual, declared) = no_vision_maps();
+        write_relay_config_preserving_current_settings(
+            "新供应商",
+            "https://new.example/v1",
+            "gpt-5.6-luna",
+            Some("responses"),
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            &manual,
+            &declared,
+        )
+        .expect("write relay activation config");
+        let text = read_config_text().expect("read config");
+
+        assert!(text.contains("model = \"gpt-5.6-luna\""));
+        assert!(text.contains("model_provider = \"custom\""));
+        assert!(text.contains("base_url = \"https://new.example/v1\""));
+        assert!(text.contains("localeOverride = \"zh-CN\""));
+        assert!(text.contains("approval_policy = \"on-request\""));
+        assert!(text.contains("approvals_reviewer = \"auto_review\""));
+        assert!(text.contains("sandbox_mode = \"workspace-write\""));
+        assert!(text.contains("selected-avatar-id = \"custom:pet\""));
+        assert!(!text.contains("https://old.example/v1"));
 
         std::env::remove_var("CODEX_HOME");
         let _ = std::fs::remove_dir_all(&home);
