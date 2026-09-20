@@ -3,7 +3,7 @@
   "productName": "CodexFF",
   "mainBinaryName": "codexff",
   "version": "1.3.16",
-  "identifier": "com.codexff.pro",
+  "identifier": "com.codexff.free",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
